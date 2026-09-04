@@ -18,7 +18,7 @@ fn main() -> eframe::Result {
     };
 
     eframe::run_native(
-        "RustMoku",
+        "RustMoku V0.2",
         options,
         Box::new(|_creation_context| Ok(Box::new(RustMokuApp::default()))),
     )
@@ -83,8 +83,9 @@ impl RustMokuApp {
         }
 
         let result = self.engine.search(self.game.position(), self.search_limits);
+        let best_move = result.best_move;
         self.last_search = Some(result);
-        let Some(best_move) = result.best_move else {
+        let Some(best_move) = best_move else {
             self.message = Some(String::from("The engine found no legal move."));
             return;
         };
@@ -108,7 +109,7 @@ impl RustMokuApp {
     }
 
     fn controls(&mut self, ui: &mut egui::Ui) {
-        ui.heading("RustMoku V0.1");
+        ui.heading("RustMoku V0.2");
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             ui.label("Play as:");
@@ -128,11 +129,32 @@ impl RustMokuApp {
                 ui.colored_label(Color32::from_rgb(190, 45, 40), message);
             }
         });
-        if let Some(search) = self.last_search {
+        if let Some(search) = &self.last_search {
             ui.label(format!(
-                "AI search: depth {}/{}  |  nodes {}  |  score {}",
-                search.reached_depth, search.requested_depth, search.nodes, search.score
+                "AI search: depth {}/{}  |  seldepth {}  |  nodes {}  |  score {}",
+                search.completed_depth,
+                search.requested_depth,
+                search.seldepth,
+                search.statistics.nodes,
+                search.score
             ));
+            ui.label(format!(
+                "TT: hits {}  |  cutoffs {}  |  probes {}  |  stores {}",
+                search.statistics.tt_hits,
+                search.statistics.tt_cutoffs,
+                search.statistics.tt_probes,
+                search.statistics.tt_stores,
+            ));
+            ui.horizontal_wrapped(|ui| {
+                ui.label("PV:");
+                if search.principal_variation.is_empty() {
+                    ui.monospace("(empty)");
+                } else {
+                    for at in &search.principal_variation {
+                        ui.monospace(format!("{}({},{})", at.index(), at.row(), at.column()));
+                    }
+                }
+            });
         } else {
             ui.label("AI search: no search yet");
         }

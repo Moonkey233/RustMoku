@@ -46,7 +46,8 @@ The workspace is divided into independent layers.
 * move ordering;
 * evaluation;
 * search;
-* future transposition tables and tactical solvers.
+* deterministic Zobrist hashing and the transposition table;
+* future tactical solvers.
 
 `rustmoku-native` owns desktop presentation and interaction.
 
@@ -69,7 +70,7 @@ Do not expose unrestricted mutable access to Position internals.
 
 State changes must go through invariant-preserving operations such as `make_move` and `unmake_move`.
 
-A search call receives an immutable caller-owned Position. It may create one working copy at the search root, but recursive search must use make/unmake rather than cloning Position at every node.
+A search call receives an immutable caller-owned Position. The engine itself is mutable because it owns persistent search state. It may create one working Position copy at the search root, but recursive search must use make/unmake rather than cloning Position at every node. Engine-private hashes and caches belong in a search-side state, not in `rustmoku-core::Position`.
 
 ## 4. Domain Types
 
@@ -101,6 +102,8 @@ Evaluation scores are always documented with an explicit perspective. The initia
 
 Terminal win/loss values use mate-distance semantics so the engine prefers faster wins and delays forced losses.
 
+Transposition-table probes may use a score or bound only when the stored depth is sufficient and the full Zobrist key matches. Mate scores must be normalized by ply when stored and denormalized when probed. Cached moves must be validated before use.
+
 Do not use `i32::MAX` or `i32::MIN` directly as search infinity values when arithmetic or negation may be applied.
 
 Do not add selective pruning techniques merely because they exist in chess or another engine. Any future pruning technique must have:
@@ -121,7 +124,9 @@ Given the same:
 * search limits;
 * software version;
 
-the engine should produce the same result.
+the engine should produce the same semantic result: best move and score. Root equal-score selection must use the canonical lower move index.
+
+Persistent transposition state may change nodes, hit counts, and wall time between cold and warm searches. Use a fresh engine or explicitly clear the table for reproducible performance measurements. Zobrist generation and TT replacement must remain deterministic.
 
 Move ordering must have a deterministic tie-break rule.
 
@@ -277,6 +282,8 @@ cargo test --workspace --all-features
 
 Also run any feature-specific or project-specific tests relevant to the change.
 
+Search-infrastructure changes must also run the Release engine tests and the fixed-position benchmark documented in `docs/PERFORMANCE.md`.
+
 Do not claim a command passed unless it was actually executed successfully.
 
 ## 17. Scope Discipline
@@ -293,7 +300,6 @@ In particular, do not prematurely add:
 * server APIs;
 * async runtimes;
 * multithreaded search;
-* transposition tables;
 * opening books;
 * Renju rules;
 * Swap/Swap2;

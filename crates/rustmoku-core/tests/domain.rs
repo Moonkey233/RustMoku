@@ -93,6 +93,67 @@ fn make_and_unmake_restore_the_exact_position() {
 }
 
 #[test]
+fn winning_move_sets_and_unmake_restores_cached_winner() {
+    let mut position = Position::default();
+    for column in 0..4 {
+        play(&mut position, 7, column);
+        play(&mut position, 0, column);
+    }
+    let before_win = position.clone();
+
+    let undo = position
+        .make_move(move_at(7, 4))
+        .expect("fifth stone must be legal");
+    assert_eq!(position.winner(), Some(Stone::Black));
+    assert!(matches!(
+        position.make_move(move_at(8, 8)),
+        Err(MoveError::GameOver)
+    ));
+
+    position.unmake_move(undo);
+    assert_eq!(position.winner(), None);
+    assert_eq!(position, before_win);
+}
+
+#[test]
+fn long_make_unmake_sequence_restores_exact_position() {
+    let mut position = Position::default();
+    let original = position.clone();
+    let sequence = [
+        (7, 7),
+        (6, 7),
+        (8, 8),
+        (7, 8),
+        (8, 7),
+        (6, 8),
+        (9, 6),
+        (5, 9),
+        (9, 8),
+        (5, 7),
+        (6, 9),
+        (8, 6),
+        (10, 5),
+        (4, 10),
+        (10, 9),
+        (4, 6),
+    ];
+    let mut undos = Vec::with_capacity(sequence.len());
+
+    for (row, column) in sequence {
+        undos.push(
+            position
+                .make_move(move_at(row, column))
+                .expect("test sequence must remain legal"),
+        );
+    }
+    while let Some(undo) = undos.pop() {
+        position.unmake_move(undo);
+    }
+
+    assert_eq!(position, original);
+}
+
+#[test]
 fn detects_horizontal_five() {
     let mut game = Game::default();
     for column in 0..4 {

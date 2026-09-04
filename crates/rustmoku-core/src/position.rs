@@ -10,6 +10,7 @@ pub struct Position {
     rules: RuleSet,
     move_count: usize,
     last_move: Option<Move>,
+    winner: Option<Stone>,
 }
 
 /// Opaque state required to reverse exactly one successful move.
@@ -18,6 +19,7 @@ pub struct MoveUndo {
     played: Move,
     stone: Stone,
     previous_last_move: Option<Move>,
+    previous_winner: Option<Stone>,
 }
 
 impl Position {
@@ -29,6 +31,7 @@ impl Position {
             rules,
             move_count: 0,
             last_move: None,
+            winner: None,
         }
     }
 
@@ -59,7 +62,7 @@ impl Position {
 
     #[must_use]
     pub fn is_legal(&self, at: Move) -> bool {
-        self.cells[at.index()].is_none() && self.move_count < CELL_COUNT && self.winner().is_none()
+        self.cells[at.index()].is_none() && self.move_count < CELL_COUNT && self.winner.is_none()
     }
 
     #[must_use]
@@ -74,7 +77,7 @@ impl Position {
     /// Returns [`MoveError::GameOver`] for a terminal position and
     /// [`MoveError::Occupied`] when `at` already contains a stone.
     pub fn make_move(&mut self, at: Move) -> Result<MoveUndo, MoveError> {
-        if self.winner().is_some() || self.is_full() {
+        if self.winner.is_some() || self.is_full() {
             return Err(MoveError::GameOver);
         }
         if self.cell(at).is_some() {
@@ -86,36 +89,40 @@ impl Position {
             played: at,
             stone,
             previous_last_move: self.last_move,
+            previous_winner: self.winner,
         };
         self.cells[at.index()] = Some(stone);
         self.move_count += 1;
         self.last_move = Some(at);
         self.side_to_move = stone.opponent();
+        self.winner = self.has_five_from(at, stone).then_some(stone);
         Ok(undo)
     }
 
     /// Reverses the most recent move.
     ///
-    /// `MoveUndo` is intentionally non-cloneable and this method consumes it.
-    /// Passing a token to a different position or using tokens out of LIFO order
-    /// is a programmer error and triggers an assertion before mutation.
+    /// `MoveUndo` is opaque and intentionally non-cloneable. It must be applied
+    /// to its corresponding logical position in strict LIFO order. Violating
+    /// that contract is a programmer error; debug builds detect common misuse,
+    /// but tokens do not carry enough identity to detect every cross-position
+    /// misuse.
     pub fn unmake_move(&mut self, undo: MoveUndo) {
-        assert_eq!(
+        debug_assert_eq!(
             self.last_move,
             Some(undo.played),
             "moves must be unmade in LIFO order"
         );
-        assert_eq!(
+        debug_assert_eq!(
             self.cell(undo.played),
             Some(undo.stone),
             "undo token does not match the board"
         );
-        assert_eq!(
+        debug_assert_eq!(
             self.side_to_move,
             undo.stone.opponent(),
             "undo token does not match the side to move"
         );
-        assert!(
+        debug_assert!(
             self.move_count > 0,
             "a non-empty undo token requires a played move"
         );
@@ -124,14 +131,13 @@ impl Position {
         self.move_count -= 1;
         self.last_move = undo.previous_last_move;
         self.side_to_move = undo.stone;
+        self.winner = undo.previous_winner;
     }
 
     /// Returns the winner created by the last move, if any.
     #[must_use]
-    pub fn winner(&self) -> Option<Stone> {
-        let last_move = self.last_move?;
-        let stone = self.cell(last_move)?;
-        self.has_five_from(last_move, stone).then_some(stone)
+    pub const fn winner(&self) -> Option<Stone> {
+        self.winner
     }
 
     /// Tests whether placing `stone` at an empty location would win under the

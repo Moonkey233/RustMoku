@@ -1,23 +1,11 @@
-# RustMoku V0.1 Architecture
+# RustMoku V0.2 Architecture
 
-RustMoku V0.1 is a vertical slice from domain rules through deterministic search
-to a native desktop adapter. Its boundaries are intentionally small: extension
-points are documented where an interface already has a current user, while
-future subsystems are not scaffolded in advance.
+RustMoku V0.2 extends the complete V0.1 vertical slice with stateful search
+infrastructure. Domain rules remain independent of AI state, and the GUI remains
+an adapter. The new hashing, cache, iterative-deepening, PV, and statistics code
+is private to the engine unless it forms part of the public search boundary.
 
 ## Crate dependency graph
-
-```text
-rustmoku-core
-    ^       ^
-    |       |
-rustmoku-engine
-    ^
-    |
-rustmoku-native
-```
-
-More precisely:
 
 ```text
 rustmoku-engine -> rustmoku-core
@@ -25,133 +13,215 @@ rustmoku-native -> rustmoku-core
 rustmoku-native -> rustmoku-engine
 ```
 
-`rustmoku-core` has no third-party dependencies and owns all Gomoku semantics.
-`rustmoku-engine` has no presentation dependency. `rustmoku-native` is an adapter:
-it draws public state, maps pointer coordinates to validated `Move` values, calls
-`Game::play_move`, and invokes `SearchEngine` with `Game::position()`.
+`rustmoku-core` has no third-party dependencies and owns Gomoku semantics.
+`rustmoku-engine` does not depend on presentation code. `rustmoku-native` draws
+public state, maps clicks to validated moves, calls `Game`, and invokes the
+engine. No reverse dependency exists.
 
-## Core domain
+## Core domain invariants
 
-### Move invariants
+### Move
 
-`Move` is a compact newtype with a private `u8` representation. The only public
-constructors validate a row/column pair or an index, so values 225 through 255
-cannot enter the domain. No sentinel move exists; move absence is `Option<Move>`.
-`Move::all()` enumerates exactly the 225 legal board coordinates and
-`Move::CENTER` identifies the center intersection.
+`Move` is a compact validated type with a private `u8`. Public constructors
+accept only a board index in `0..225` or zero-based row and column in `0..15`.
+`Move::all()` enumerates all 225 points and `Move::CENTER` is the center. There is
+no sentinel move; absence is `Option<Move>`.
 
-### Position invariants
+### Position
 
-`Position` owns exactly 225 `Option<Stone>` cells plus the side to move, `RuleSet`,
-move count, and last move. All fields are private. Read-only access is exposed by
-value or immutable reference, and callers cannot obtain mutable access to the
-cell array.
+`Position` owns 225 `Option<Stone>` cells, side to move, `RuleSet`, move count,
+last move, and a cached `Option<Stone>` winner. Its fields are private and it
+provides no unrestricted mutable board access.
 
-A successfully constructed or transitioned position maintains:
+Every legal state maintains:
 
-- every stored move is on the board;
 - move count equals board occupancy;
-- Black moves first and the side changes after every move;
-- `last_move` is `None` exactly for the initial position and otherwise points to
-  the most recently placed stone;
-- occupied intersections and terminal positions reject further moves;
-- the active `RuleSet` travels with the position consumed by search.
+- Black starts and side to move switches after each move;
+- `last_move` identifies the latest placed stone, or is `None` initially;
+- `winner` is `None` initially and otherwise identifies the winner created by
+  the latest legal move;
+- occupied, full, and already-won positions reject another move;
+- the active rule set travels with the position.
 
-`Stone` contains only `Black` and `White`; emptiness is represented independently
-as `Option<Stone>`.
+`make_move` updates the winner only by checking the new stone along the four
+relevant axes. Consequently `winner()` is O(1); a full-board draw remains a
+separate `is_full()` condition.
 
-### Make/unmake model
+### Make/unmake
 
-`Position::make_move` is the sole forward mutation operation. It returns an
-opaque, non-cloneable `MoveUndo` containing the previous state required for an
-exact reversal. `Position::unmake_move` consumes this token and requires LIFO
-order. It checks token/state agreement before mutation. Search creates one
-working `Position` clone at its root, then all recursive nodes reuse it through
-make/unmake; recursive position cloning is forbidden.
+`Position::make_move` returns an opaque, non-cloneable `MoveUndo` containing the
+state required to reverse that transition, including the previous last move and
+winner. `unmake_move` consumes the token and restores the exact prior position.
 
-### Rules and game flow
+An undo token must be used on its corresponding logical state in strict LIFO
+order. Violation is programmer error. Debug builds detect common state/token
+mismatches, but the token deliberately carries no global identity and cannot
+guarantee detection of arbitrary cross-position misuse. These audit checks are
+`debug_assert` operations and do not burden Release search nodes.
 
-`RuleSet` is currently a one-variant enum, `Freestyle`. A line of five or more
-contiguous stones wins. Win detection begins at `last_move` and counts in both
-directions along horizontal, vertical, backslash-diagonal, and slash-diagonal
-axes. It does not rescan the full board.
+### Rules and Game
 
-Opening protocols are not board rules and are not represented by `RuleSet`.
-`Game` wraps a `Position` and owns actual-play status (`Ongoing`, `Won`, or
-`Draw`). Search accepts `&Position`, never `Game` or UI state.
+`RuleSet::Freestyle` is the only implemented ruleset. Five or more contiguous
+stones wins; horizontal, vertical, backslash diagonal, and slash diagonal are
+checked. There are no forbidden moves or Swap protocols.
 
-## Engine
+`Game` owns real-game status (`Ongoing`, `Won`, or `Draw`) separately from
+`Position`. Search consumes `&Position`, never `Game` or GUI state.
 
-### Evaluation
+## Engine boundary and ownership
 
-`Evaluator` is the narrow engine boundary used today by `AlphaBetaEngine`.
-`ClassicalEvaluator` scans all four line directions and scores contiguous FIVE,
-OPEN_FOUR, CLOSED_FOUR, OPEN_THREE, CLOSED_THREE, OPEN_TWO, and CLOSED_TWO runs.
-Weights remain private implementation details.
+The intentionally small public surface is `Evaluator`, `ClassicalEvaluator`,
+`SearchEngine`, `AlphaBetaEngine`, `EngineConfig`, `SearchLimits`,
+`SearchResult`, and `SearchStatistics`. Candidate lists, ordering, hashes,
+search-side state, TT entries, and PV tables remain private.
 
-Every evaluator score is from the side-to-move perspective: positive favors the
-player about to move and negative favors the opponent.
+`SearchEngine::search` takes `&mut self` because `AlphaBetaEngine` owns a mutable,
+persistent transposition table and generation counter. The caller still supplies
+an immutable `&Position`, which search never mutates. No interior mutability,
+synchronization primitive, background task, or global cache is involved.
 
-V0.1 evaluation deliberately does not recognize broken threes, broken fours,
-compound threats, or deeper shape interactions. It is a correctness-oriented
-baseline, not a complete Gomoku pattern evaluator.
+## SearchState and Zobrist hashing
 
-### Candidate generation and ordering
+At the public search boundary, `SearchState` clones the caller's `Position`
+exactly once and computes a full 64-bit key by scanning the 225 cells once.
+Recursive search mutates this working position in place with make/unmake and
+updates its key with O(1) XOR operations. There is no recursive position clone.
 
-An empty position generates only `Move::CENTER`. Otherwise candidates are unique,
-legal empty cells within Chebyshev distance two of any stone. Generation uses a
-fixed 225-entry boolean marker array and a fixed-capacity `MoveList`; it uses no
-`HashSet` and performs no heap allocation.
+Zobrist data is generated deterministically at compile time from a fixed seed
+using SplitMix64. Separate keys represent every `(Stone, Move)` occupancy,
+Black/White side to move, and the Freestyle rule set. Exhaustive matches map
+domain enums rather than relying on numeric discriminants. There is no runtime
+random or mutable global state. Rule and side components are part of the key even
+though V0.2 currently implements one ruleset.
 
-Ordering classifies immediate wins first, blocks of an opponent's immediate win
-second, and ordinary moves third. A small neighborhood/center heuristic orders
-moves inside each class. Ascending move index is the final tie-break, making the
-entire ordering deterministic.
+The engine-private sidecar is the concrete extension point for future measured
+incremental candidate or evaluation state; neither is implemented in V0.2.
 
-### Search semantics
+## Transposition table
 
-`AlphaBetaEngine` directly implements fixed-depth Negamax with fail-soft
-Alpha-Beta pruning. It does not contain evaluator weights. The public boundary is:
+`AlphaBetaEngine` owns a contiguous `Vec<Bucket>`. Bucket count is a power of two,
+the low key bits select a bucket, and each four-way bucket verifies the full
+64-bit key before accepting a hit. The default 64 MiB table has 1,048,576
+buckets and 4,194,304 entries.
 
-- `SearchLimits`: requested fixed maximum depth only;
-- `SearchEngine`: immutable `&Position` input;
-- `SearchResult`: optional best move, score, requested/reached depth, and node
-  count.
+An entry stores the full key, normalized `i32` score, optional packed best move,
+`u8` depth, bound, and `u8` generation. `PackedMove` privately encodes validated
+`Move.index() + 1` in `NonZeroU8`, so `Option<PackedMove>` uses Rust's safe niche
+representation without a public sentinel. On the current supported target,
+`TtEntry` is 16 bytes and a four-entry bucket is 64 bytes; regression tests pin
+these cache-local dimensions without unsafe layout tricks.
 
-Terminal scores use finite constants separated from static evaluation and from
-search infinity. Mate distance is included in terminal values, so shorter forced
-wins score higher and longer forced losses score higher than immediate losses.
-No arithmetic uses `i32::MAX` or `i32::MIN` as infinity.
+Each public search advances one generation; all iterative depths within it share
+that generation and table. The table persists between searches. On generation
+counter exhaustion the table is cleared before reuse. Replacement is
+deterministic: same full key first, then empty slot, then older generation, then
+shallower depth, with slot index as the final tie-break. A shallow/weaker update
+does not trivially overwrite a deeper exact entry for the same key.
 
-For a fixed position, limits, and software version, search is deterministic. It
-uses no random source, implicit seed, time cutoff, concurrency, or unordered hash
-collection.
+`AlphaBetaEngine::clear_transposition_table` provides an explicit cold-cache
+reset for reproducible experiments.
 
-## Native application
+### Bound correctness
 
-The eframe/egui application draws the board and stones, highlights the last move,
-maps clicks to `Move::from_row_col`, displays `GameStatus`, lets the human select
-Black or White, starts a new game, and displays the last AI search's depth, node
-count, and score. When the human selects White, a new game synchronously asks the
-engine to play Black's first move.
+Every Negamax node retains its original alpha and beta. A matching entry's legal
+best move may influence ordering at any stored depth, but its score can affect
+the result only when stored depth is sufficient:
 
-The UI does not detect wins, decide legality, inspect evaluator internals, or
-mutate `Position`. V0.1 search runs synchronously on the UI thread by design.
+- `Exact` returns the stored score;
+- `Lower` returns only when score is at least beta;
+- `Upper` returns only when score is at most alpha;
+- otherwise normal search continues.
 
-## Explicit V0.1 non-goals
+After search, a result at or below original alpha is stored as `Upper`, a result
+at or above beta as `Lower`, and an in-window result as `Exact`. Beta-cutoff
+nodes therefore retain useful lower bounds. Root entries are stored exact after
+root comparison.
 
-V0.1 contains no Zobrist hashing, transposition table, iterative deepening,
-aspiration windows, PVS, killer/history heuristic, LMR, quiescence search,
-VCF/VCT/TSS/DFPN, NNUE, MCTS, neural runtime, opening book, random play,
-multithreaded search, async runtime, cancellation, time control, streaming,
-AI-vs-AI arena, persistence, position import/export, undo UI, Renju, Standard
-Gomoku, forbidden moves, Swap/Swap2, or server API.
+### Mate-distance normalization
 
-## Real future extension points
+Search scores are always from the side-to-move perspective. `MATE_SCORE` is
+100,000,000, static evaluation is clamped to +/-10,000,000, and finite search
+infinity is 200,000,000. The mate threshold reserves the top 225 score points,
+leaving a wide gap from ordinary evaluator values.
 
-The existing `RuleSet` enum can gain separately tested board-rule variants.
-`Evaluator` permits another concrete evaluator to be selected without changing
-Negamax. `Position` mutation already centralizes future incremental caches behind
-make/unmake. Search limits and results form the boundary where later, concrete
-milestones can add capabilities. None of those future implementations are
-present in V0.1.
+TT storage removes root-ply dependence: positive mate scores add the current
+ply and negative mate scores subtract it. Probe performs the inverse adjustment
+for its current ply. Faster wins therefore remain preferable and delayed losses
+remain preferable even when the same position is reached at another depth.
+
+## Move generation and ordering
+
+An empty board generates only the center. Otherwise generation visits unique,
+empty points within Chebyshev distance two of an existing stone. `MoveList` is a
+fixed `[Move; 225]` plus logical length; unused slots contain a valid center move
+and are never part of the logical slice. Generation uses a fixed marker array,
+not a hash collection or heap allocation.
+
+The logical slice is sorted in place with allocation-free `sort_unstable_by` and
+a total deterministic order:
+
+1. immediate win;
+2. immediate opponent-win block;
+3. TT move within the same tactical class;
+4. local neighborhood/center heuristic;
+5. ascending move index.
+
+Root and exact ordinary-node comparisons explicitly prefer the smaller move
+index on equal exact scores. If a root child only returns an alpha-bound equal to
+the incumbent and has a smaller index, it is re-searched with a full window
+before changing the canonical result. Thus a warm TT may reorder work but cannot
+arbitrarily change the semantic root choice.
+
+## Iterative Negamax, PV, and statistics
+
+Search runs complete full-window iterations from depth 1 through
+`SearchLimits::max_depth`. V0.2 has no interrupting limit, so a non-terminal
+positive-depth search completes the requested nominal depth. All iterations
+share the same TT and generation.
+
+`SearchResult` distinguishes:
+
+- `requested_depth`: the caller's maximum;
+- `completed_depth`: the last fully completed iteration;
+- `seldepth`: maximum ply visited anywhere in the public search;
+- `principal_variation`: a legal searched prefix whose first move equals
+  `best_move` when one exists.
+
+A fixed 225-ply PV table is updated in place during recursion. It allocates no
+`Vec` per node; the final public PV vector is constructed once. TT cutoffs may
+shorten the reported line, so PV is guaranteed to be a valid prefix rather than
+always the full nominal depth.
+
+`SearchStatistics` counts all iterations in one public search: visited nodes,
+static evaluations, beta cutoffs, TT probes, full-key hits, TT cutoffs, and
+successful TT stores. Wall time is intentionally excluded from deterministic
+engine statistics and measured externally by the benchmark utility.
+
+## Determinism contract
+
+Zobrist generation, candidate traversal, move ordering, replacement, and
+equal-score selection are deterministic; no random source or unordered
+collection participates. For identical semantic input, configuration, and
+software version, semantic output means the same best move and score.
+
+The persistent table is an optimization state. Warm and cold searches may have
+different node, TT-hit, and wall-time measurements while retaining the same
+semantic result. Reproducible performance experiments must use a fresh engine or
+call the explicit table-clear method.
+
+## Native adapter
+
+The synchronous eframe/egui application draws the board, highlights the latest
+move, maps clicks through validated `Move` construction, displays `GameStatus`,
+supports side selection/New Game, and shows depth, seldepth, nodes, score, TT
+statistics, and PV. It contains no win detection, move legality, evaluator, hash,
+or search implementation.
+
+## Explicit V0.2 non-goals
+
+V0.2 does not implement aspiration windows, PVS, killer/history/continuation
+heuristics, LMR/LMP, futility or null-move pruning, quiescence, VCF/VCT/TSS/DFPN,
+bitboards, incremental candidate frontiers, incremental/broken-pattern
+evaluation, NNUE, MCTS, opening books, randomization, time/node limits,
+cancellation, multithreaded or async search, server APIs, AI arenas, Renju, or
+Swap/Swap2. `ClassicalEvaluator` remains the stable V0.1 reference evaluator.
