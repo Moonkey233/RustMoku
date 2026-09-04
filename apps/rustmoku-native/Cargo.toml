@@ -1,0 +1,11 @@
+[package]
+name = "rustmoku-native"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+eframe = { version = "0.36.1", default-features = false, features = ["default_fonts", "glow"] }
+rustmoku-core.workspace = true
+rustmoku-engine.workspace = true
