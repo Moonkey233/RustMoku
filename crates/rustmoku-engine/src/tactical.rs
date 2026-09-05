@@ -30,15 +30,12 @@ pub(crate) fn immediate_tactic(patterns: &PatternState, side: Stone) -> Immediat
     let Some(second) = threats.next() else {
         return ImmediateTactic::ForcedBlock(first);
     };
-    // Every legal move loses in two. Canonical selection includes all empty
-    // cells here, since this exact result does not rely on the local frontier.
-    let at = patterns
-        .empty_cells()
-        .iter()
-        .next()
-        .expect("winning points are empty");
-    let reply = if at == first { second } else { first };
-    ImmediateTactic::Loss { at, reply }
+    // Exact loss-in-two: resist at a real winning point before applying the
+    // canonical index tie-break. Another immediate point remains terminal.
+    ImmediateTactic::Loss {
+        at: first,
+        reply: second,
+    }
 }
 
 impl ImmediateTactic {

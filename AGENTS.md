@@ -60,6 +60,9 @@ Dependencies must remain one-way:
 * `rustmoku-engine` must not depend on GUI or application code.
 
 Do not move domain rules into the UI or search implementation for convenience.
+Played-game history and opaque undo tokens belong to Game, never Position.
+Human notation and record/opening replay semantics belong to Core. Native owns
+I/O and its human-decision undo floor; imports/openings use legal Game replay.
 
 ## 3. Position Is the Engine Boundary
 
@@ -114,6 +117,12 @@ Do not add selective pruning techniques merely because they exist in chess or an
 3. fixed-position benchmarks;
 4. engine-vs-engine evidence when it can affect playing strength.
 
+A public lifecycle interruption must preserve the last fully completed iteration's
+move, score, PV and seldepth. Recursive stops are explicit results; restore every
+make/unmake sidecar before propagating them and never cache interrupted work as
+an ordinary bound or tactical disproof. Global work limits include normal/qsearch
+and tactical proof/certificate visits; local proof exhaustion is distinct.
+
 ## 7. Determinism
 
 The baseline engine is deterministic.
@@ -125,7 +134,9 @@ Given the same:
 * search limits;
 * software version;
 
-the engine should produce the same semantic result: best move and score. Root equal-score selection must use the canonical lower move index.
+the engine should produce the same semantic result: best move and score. Ordinary searched root equal-score selection must use the canonical lower move
+index. An exact known-loss tactical shortcut first prefers resistance at real
+opponent winning points, then applies canonical index order within those points.
 
 Persistent transposition state may change nodes, hit counts, and wall time between cold and warm searches. Use a fresh engine or explicitly clear the table for reproducible performance measurements. Zobrist generation and TT replacement must remain deterministic.
 
@@ -149,7 +160,9 @@ Avoid inside ordinary search nodes:
 * dynamic dispatch where a stable static implementation is already known;
 * synchronization primitives.
 
-Use reversible make/unmake state transitions.
+Use reversible make/unmake state transitions. Cross-thread cancellation may use
+one Arc<AtomicBool> token per request with Relaxed polling at a fixed coarse
+stride; do not clone the Arc or read the clock at every node.
 
 Hot search state should be incrementally maintained when the affected region is naturally bounded and differential correctness tests exist.
 
@@ -185,7 +198,10 @@ It must not:
 * duplicate evaluator logic;
 * mutate Position internals directly.
 
-Do not introduce threading, async runtimes, channels, or synchronization into the first version unless required by the current task.
+Native search runs on one persistent standard-library worker that owns the engine.
+Do not wrap the engine in Arc<Mutex<_>>. The UI must cancel and advance its request
+ID on invalidation, reject every stale event, and cancel/shutdown/join on drop.
+Application scheduling stays outside Core and Engine search semantics.
 
 ## 11. Unsafe Rust
 

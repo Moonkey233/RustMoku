@@ -104,7 +104,10 @@ impl ThreatDescriptor {
             .intersection(empty);
         // Called only after immediate facts: an untouched OpenThree has no
         // winning point yet and can win in exactly three attacker-turn plies.
-        // Outside the witness/counter-threat set every reply has that distance.
+        // An omitted quiet stone changes no active five-window dependency and
+        // creates no defender Four+. The preserved forcing continuation wins
+        // before that irrelevant stone can change initiative. Outside this
+        // witness/counter-threat set every reply has the same exact distance.
         // One canonical representative preserves the slowest-defense PV tie.
         if let Some(at) = empty.and_not(responses).iter().next() {
             responses.set(at);

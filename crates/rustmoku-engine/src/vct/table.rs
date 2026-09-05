@@ -56,7 +56,10 @@ impl TacticalKey {
     fn index(self, mask: usize) -> usize {
         (self.position
             ^ self.context.rotate_left(23)
-            ^ (self.attacker as u64)
+            ^ match self.attacker {
+                Stone::Black => 0,
+                Stone::White => 1,
+            }
             ^ u64::from(self.defender)) as usize
             & mask
     }
@@ -151,6 +154,15 @@ impl Table {
         if same.is_some() && bucket[slot].numbers.solved() && !numbers.solved() {
             return;
         }
+        // A fresh inspection carries no progress. Preserve an explored entry
+        // for this exact context/depth; do not attempt to merge proof numbers.
+        if same.is_some()
+            && numbers == Numbers::UNKNOWN
+            && !bucket[slot].numbers.solved()
+            && (bucket[slot].numbers != Numbers::UNKNOWN || bucket[slot].best_move.is_some())
+        {
+            return;
+        }
         bucket[slot] = Entry {
             key,
             generation: self.generation,
@@ -166,6 +178,27 @@ impl Table {
 mod tests {
     use super::*;
     use crate::{bitboard::BitBoard256, pattern::ThreatProfile};
+
+    #[test]
+    fn fresh_unknown_preserves_partial_progress_and_solved_entries() {
+        let board = BoardState::new(&rustmoku_core::Position::default());
+        let key = TacticalKey::new(&board, Stone::Black, None);
+        let mut table = Table::new(0);
+        table.begin_search();
+        let partial = Numbers {
+            proof: 3,
+            disproof: 7,
+        };
+        table.store(key, 5, partial, Some(Move::CENTER), None);
+        table.store(key, 5, Numbers::UNKNOWN, None, None);
+        assert_eq!(table.probe(key, 5).unwrap().numbers, partial);
+        assert_eq!(table.probe(key, 5).unwrap().best_move, Some(Move::CENTER));
+        table.store(key, 5, Numbers::WIN, Some(Move::CENTER), Some(5));
+        table.store(key, 5, partial, None, None);
+        assert_eq!(table.probe(key, 5).unwrap().distance, Some(5));
+        table.store(key, 3, Numbers::UNKNOWN, None, None);
+        assert_eq!(table.probe(key, 3).unwrap().numbers, Numbers::UNKNOWN);
+    }
 
     #[test]
     fn context_depth_full_key_and_generation_isolate_entries() {

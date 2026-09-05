@@ -21,6 +21,7 @@ mod principal_variation;
 mod proof_table;
 mod score;
 mod search;
+mod search_control;
 mod search_heuristics;
 mod search_state;
 mod tactical;
@@ -33,7 +34,8 @@ pub use config::{EngineConfig, ProofLimits, TacticalConfig};
 pub use evaluation::{ClassicalEvaluator, Evaluator, PatternEvaluator};
 pub use pattern_state::PatternState;
 pub use search::{
-    AlphaBetaEngine, SearchEngine, SearchLimits, SearchResult, SearchStatistics, TacticalProof,
-    TacticalProofKind,
+    AlphaBetaEngine, SearchEngine, SearchInfo, SearchLimits, SearchObserver, SearchResult,
+    SearchStatistics, TacticalProof, TacticalProofKind,
 };
+pub use search_control::{CancellationToken, SearchTermination};
 pub use transposition_table::TranspositionTableStatistics;

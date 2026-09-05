@@ -101,12 +101,7 @@ impl fmt::Display for MoveError {
             Self::IndexOutOfBounds { index } => {
                 write!(formatter, "board index {index} is out of bounds")
             }
-            Self::Occupied { at } => write!(
-                formatter,
-                "board location ({}, {}) is occupied",
-                at.row(),
-                at.column()
-            ),
+            Self::Occupied { at } => write!(formatter, "board location {at} is occupied"),
             Self::GameOver => formatter.write_str("the game is already over"),
         }
     }

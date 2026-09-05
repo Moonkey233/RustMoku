@@ -1,9 +1,10 @@
-# RustMoku V0.7 Architecture
+# RustMoku V0.8 Architecture
 
-V0.7 builds on official V0.6 `aff61e4ba303e9145e87b7ca32832d6d82b64886` with
-bound-aware LMR validity and independent exact VCT / threat-space / DFPN proofs.
+V0.8 builds on official V0.7 `d1d97088ea418b80df1ba7759958f30dc64aef53` with
+VCT hardening, shared search lifecycle control, a headless Arena and an async
+native adapter. Classical search itself remains single-threaded.
 Core remains authoritative for legality and wins; Native remains an adapter.
-All first-party crates forbid unsafe code. No dependency or thread is added.
+All first-party crates forbid unsafe code. Concurrency uses only the standard library.
 Milestone scope and future work live in [ROADMAP.md](ROADMAP.md).
 
 ## Crate dependency graph
@@ -12,6 +13,7 @@ Milestone scope and future work live in [ROADMAP.md](ROADMAP.md).
 rustmoku-engine -> rustmoku-core
 rustmoku-native -> rustmoku-core
 rustmoku-native -> rustmoku-engine
+rustmoku-arena -> rustmoku-core + rustmoku-engine
 ```
 
 `rustmoku-core` has no third-party dependencies and owns Gomoku semantics.
@@ -69,12 +71,40 @@ checked. There are no forbidden moves or Swap protocols.
 `Game` owns real-game status (`Ongoing`, `Won`, or `Draw`) separately from
 `Position`. Search consumes `&Position`, never `Game` or GUI state.
 
+Game owns a private Vec of played Move plus opaque MoveUndo, appended only after
+a legal transition. `history()` is a read-only chronological Move iterator.
+`undo()` consumes the last token; `undo_plies(n)` removes up to n plies and safely
+stops at empty. Position, side, last move and winner are restored by Core undo;
+the predecessor of every accepted game move was Ongoing, so status restores to
+Ongoing. Tokens remain private record implementation data and are never exported.
+History allocation occurs only for played/imported games, never in search nodes.
+
+Move's Display/FromStr codec uses A..O (including I), rows 1..15 from bottom to top:
+A1 maps to internal (14,0), O15 to (0,14), H8 to (7,7). Formatting is uppercase;
+parsing accepts lowercase, rejecting out-of-range or malformed coordinates.
+Internal coordinates, Zobrist and pattern geometry are unchanged. Every adapter
+uses this codec; even board-axis labels derive from formatted Moves.
+
+Records contain `RustMoku 1`, `rules=freestyle` and `moves=` followed by the complete
+ordered sequence. Core's Game::from_record creates a fresh Game and calls
+play_move for every token. Version/rules/syntax/coordinate errors and illegal
+replay errors include the relevant line or ply. Formatting is deterministic with
+a final newline. Native owns clipboard/editor/file I/O; Core has no filesystem
+or UI dependency. Invalid import cannot mutate the current game.
+
+The shared OPENINGS slice contains twelve hand-authored Freestyle test starts,
+each with stable id/name, rules and validated Move sequence. Opening::game replays
+through Game and can report a legality error; no direct Position writes exist.
+There is no official balance provenance, RNG, balance score, D4 deduplication or
+opening database. Native selection/cycling and Arena use the same stable order.
+
 ## Engine boundary and ownership
 
 The intentionally small public surface includes `Evaluator`, `ClassicalEvaluator`,
 `PatternEvaluator`, opaque `PatternState`,
 `SearchEngine`, `AlphaBetaEngine`, `EngineConfig`, `TacticalConfig`, `ProofLimits`, `SearchLimits`,
-`SearchResult`, `TacticalProof`, `TacticalProofKind`, `SearchStatistics`, and
+`SearchResult`, `SearchInfo`, `SearchObserver`, `CancellationToken`,
+`SearchTermination`, `TacticalProof`, `TacticalProofKind`, `SearchStatistics`, and
 `TranspositionTableStatistics`. `PatternUndo` is private; the public PatternState
 API debt is deferred to the NNUE/custom-evaluator milestone. Candidate lists,
 ordering, hashes, search-side state, TT entries, and PV tables remain private.
@@ -82,7 +112,8 @@ ordering, hashes, search-side state, TT entries, and PV tables remain private.
 `SearchEngine::search` takes `&mut self` because `AlphaBetaEngine` owns a mutable,
 persistent transposition table and generation counter. The caller still supplies
 an immutable `&Position`, which search never mutates. No interior mutability,
-synchronization primitive, background task, or global cache is involved.
+shared engine lock, or global cache is involved. Native's worker owns its engine;
+the only shared search state is a one-way cancellation atomic.
 
 ## BoardState and SearchState: coordinated incremental ownership
 
@@ -105,7 +136,7 @@ No recursive Position or PatternState copies, dynamic dispatch, or locks exist.
 `SearchState::prove_vcf` / `prove_vct` lend only its private board to the concrete solver and
 returns an owned result after restoration. No mutable board getter or arbitrary
 callback can expose a board/accumulator mismatch. The solver cannot access the
-evaluator or E::State. Proven, NotProven, and BudgetExceeded paths all unwind
+evaluator or E::State. Proven, NotProven, BudgetExceeded and outer-interrupted paths all unwind
 board transitions; tests compare every field against a rebuilt board.
 
 ### Stateful evaluation
@@ -351,8 +382,8 @@ are resolved by an infinity-window child search before replacing an exact best.
 Depth >= 2 starts at previous score +/- 10,000. Fail-low/high doubles the delta
 until a result falls strictly inside the window, capped at full search infinity.
 Previous or newly discovered mate scores bypass further narrow windows. Finite
-infinity and saturating endpoint arithmetic prevent overflow. No interrupted
-iterations are introduced.
+infinity and saturating endpoint arithmetic prevent overflow. Interrupted retries
+propagate an explicit stop and never publish their partial score or PV.
 
 ### Exact immediate tactics
 
@@ -362,8 +393,10 @@ It reads cached winning bitsets and at most two set bits, never scans the board:
 1. Own winning point: choose the lowest index and return `MATE - (ply + 1)`.
 2. No own win and one enemy winning point: search only that forced block.
 3. No own win and multiple enemy winning points: return `-MATE + (ply + 2)`.
-   Every legal move loses in two, so choose the lowest empty index and a distinct
-   remaining enemy winning point for a legal two-move PV prefix.
+   Every legal move loses in two. Prefer meaningful resistance: block the lowest
+   enemy winning point, then use the next canonical winning point as the terminal
+   reply. More than two threats still select the first two points. This changes
+   neither score nor distance and does not invoke Alpha-Beta.
 
 Own wins take priority because the game ends before any opponent reply. These
 facts bypass TT scores; direct results are not stored because the cached bitset
@@ -385,7 +418,7 @@ After stand-pat beta cutoff and alpha update, noisy moves are generated directly
 as `CandidateFrontier bits & own profile bits >= Four`, then ascending set-bit
 iteration materializes a fixed-capacity ordered list. No scan of ordinary
 candidates, ordinary Three/OpenThree/DoubleThree expansion, or optional enemy
-non-immediate defensive points is included in V0.7.
+non-immediate defensive points is included in V0.8.
 
 The expansion cap remains six qplies. At/after it, only exact immediate facts and
 forced-block chains continue; each reply fills a cell, so the 225-cell board is
@@ -442,7 +475,7 @@ Nonterminal attacker depths are 1,3,5,...; defender depths are 2,4,6,... .
 Zero is reserved for already-terminal facts, so impossible parities cost no nodes.
 Ascending move order at every attack selects the canonical smaller index among
 equal-length proofs. The first successful iteration is shortest within VCF.
-The PV includes the final attacker win, using a canonical legal defender reply
+The PV includes the final attacker win, using a canonical blocking defender reply
 for the double-winning-cell fact. Root score is MATE_SCORE minus terminal plies
 (root absolute ply is zero); proof scores never enter the ordinary TT.
 
@@ -471,12 +504,12 @@ generation exhaustion clears before restarting at one, preventing stale aliases.
 
 EngineConfig defaults to 11 proof plies and 2,000 proof nodes. Each visited proof
 node costs one, including depth-zero nodes and accepted cache hits. Bounded
-certificate replay has no branches and costs no expansion nodes (at most the
-proof depth transitions), like constructing an immediate tactical PV. Depth is
+certificate replay has no branches and costs no local expansion nodes (at most
+the proof depth transitions). V0.8 charges each replay visit to global work. Depth is
 also clamped to remaining board cells. Zero in either config field disables the
-root attempt. No wall-clock control or generic configuration framework exists.
+root attempt. The shared lifecycle independently enforces outer work/time/cancel limits.
 
-V0.7 calls VCF after exact root facts and before VCT/iterative deepening, only for nonterminal,
+The engine calls VCF after exact root facts and before VCT/iterative deepening, only for nonterminal,
 positive nominal-depth roots with own Four+ candidates. NotProven/BudgetExceeded
 continues existing search. ProvenWin returns exact proof metadata and terminal
 PV with completed_depth=0 and seldepth=proof plies. Zero nominal-depth calls
@@ -495,7 +528,7 @@ and `vcf_budget_exhausted` report proof work separately from Alpha-Beta nodes/qn
   `best_move` when one exists.
 
 A fixed 225-ply PV table is updated in place during recursion. It allocates no
-`Vec` per node; the final public PV vector is constructed once. TT cutoffs may
+`Vec` per node; owned public PV snapshots allocate only at completed root events. TT cutoffs may
 shorten the reported line, so PV is guaranteed to be a valid prefix rather than
 always the full nominal depth.
 
@@ -559,6 +592,12 @@ are never carried through a defense. A test-only all-legal scan audits dependenc
 preservation and lack of counter-wins for omitted moves on bounded fixtures.
 A separate shallow minimax oracle enumerates every legal defender reply and uses
 Core immediate-win detection to compare proof status, distance, and canonical PV.
+The differential regression generates 48 deterministic candidates and filters tactical states
+from rotated/reflected/shifted seeds plus legal perturbations, for both attacker
+colors and caps 3/5. Production and the all-legal oracle agree exactly on bounded
+proof status, distance and canonical PV; no counterexample was found. An omitted
+quiet response changes no active dependency and creates no defender Four+, so
+the preserved forcing continuation wins before that stone changes initiative.
 Production never scans all legal defender moves.
 
 ### DFPN traversal and cache
@@ -585,8 +624,11 @@ A 16 MiB request rounds down to 65,536 buckets / 262,144 entries / 12 MiB. This
 holds substantially more AND/OR work than the 384 KiB VCF table without changing
 ordinary TT layout. Replacement uses same key/depth, then stale generation,
 then unsolved/shallow entries, ties by slot. A one-bucket minimum remains correct.
-Probes never reuse a different proof depth or an old public generation. Generation
-wrap clears before reuse. Interrupted work cannot become a solved disproof.
+Probes never reuse a different proof depth or an old public generation. A fresh
+UNKNOWN write cannot replace useful same-key/same-depth partial numbers or a
+best move; solved entries stay protected. No proof-number merge is attempted.
+Attacker bucket salt uses an exhaustive Stone mapping. Generation wrap clears
+before reuse. Interrupted work cannot become a solved disproof.
 Evicted certificates are reconstructed under budget; no truncated proof is emitted.
 
 ### Distance, budget, and root integration
@@ -604,8 +646,9 @@ Defaults retain 11/2,000 for VCF and use 9/4,000 for VCT. Depth is clamped by em
 cells. VCT charges every node inspection, including child initialization, cache
 hits, and certificate visits, to one dedicated remaining-node budget. Only fixed
 immediate prefixes and final PV copying are outside that accounting. VCF retains
-its documented uncharged, nonbranching certificate replay. Neither max_nodes is
-a count of individual CPU instructions. Statistics never determine validity.
+its locally uncharged, nonbranching certificate replay, which does consume global
+work. Neither limit counts individual CPU instructions. Statistics never determine
+validity.
 
 Positive-depth root order is exact immediate facts, VCF, enabled VCT with an own
 OpenThree-or-stronger candidate, then normal Alpha-Beta. Exact immediate roots
@@ -629,17 +672,137 @@ different node, TT-hit, and wall-time measurements while retaining the same
 semantic result. Reproducible performance experiments must use a fresh engine or
 call the explicit table-clear method.
 
-## Native adapter
+## Search lifecycle and completed snapshots
 
-The synchronous eframe/egui application draws the board, highlights the latest
-move, maps clicks through validated `Move` construction, displays `GameStatus`,
-supports side selection/New Game, and shows depth, seldepth, nodes, score, TT
-statistics, PV, and `VCF/VCT proven, N plies` when proof metadata is present. It contains no win detection, move legality, evaluator, hash,
-or search implementation.
+`SearchLimits::new(max_depth)` retains convenient fixed-depth search. Builders
+`with_max_nodes(u64)` and `with_move_time(Duration)` set optional per-public-search
+limits. Both apply to root tactical solving and normal iterations. Core contains
+no clock, budget, channel or scheduling state. `SearchEngine::search_controlled`
+accepts the same Position/limits plus an owned cancellation token and a borrowed
+`dyn SearchObserver`; the ordinary `search` supplies a fresh token and no-op
+observer. This contract is independent of Alpha-Beta and can serve future backends.
 
-## Explicit V0.7 non-goals
+`CancellationToken` is a cloneable `Arc<AtomicBool>`, using Relaxed loads/stores:
+it transports no other data. Cancellation is one-way; there is no reset or token
+reuse protocol. `SearchBudget` is a single mutable engine-internal value borrowed
+by Alpha-Beta/qsearch resources and by VCF/VCT proof resources. It owns start time,
+optional elapsed Duration, work count, node cap, token and latched stop reason.
+Elapsed time avoids overflow for large Duration inputs. No Arc clones occur in
+recursion and no engine Mutex/RwLock exists.
 
-No new selective pruning, NNUE, MCTS, opening book, SearchInfo streaming,
-randomization, time/deadline control, cancellation, parallel/async search, server
-API, Arena, Renju, Swap/Swap2, unsafe, or SIMD. Native stays synchronous. Core's
-backing storage stays at 225 cells. Future scope is in [ROADMAP.md](ROADMAP.md).
+One work unit admits one normal node (qnodes included once), VCF visit, VCF
+certificate replay visit, or VCT/DFPN inspection/certificate visit. VCT child
+initialization and accepted cache hits consume work. Fixed immediate PV prefixes,
+root state construction, static fallback evaluation and snapshot copies are not
+extra nodes. Exact root facts count as one admitted normal visit when possible;
+if admission is already stopped their known exact answer remains usable without
+exceeding the cap. Existing subsystem counters remain separate; global work can
+exceed nodes + vcf_nodes + vct_nodes because VCF replay is locally uncharged.
+
+The integer cap is checked exactly on admission: N admits at most N visits.
+The atomic and optional clock are polled before the first charge, every 256
+charges, before root solvers, between solver stages/depths, and before publishing
+an iteration/proof. Polls do not charge nodes. Reaching the node count exactly at
+the requested final result can still mean Completed; NodeLimit means additional
+work was denied. Cancellation takes precedence over time at a poll, and the first
+observed reason is latched. Local proof exhaustion means BudgetExceeded and may
+fall through; an outer stop is a distinct Interrupted/Stopped result, never a
+cached NoProof/NotProven. A caller's slow evaluator/observer can delay polling;
+these are cooperative deadlines, not hard real-time guarantees.
+
+Alpha-Beta and qsearch return `Result<_, Stopped>`. Child re-searches are enclosed
+in a fallible scope, then Position, hash, frontier, PatternState and evaluator
+undo are restored before `?` propagates. Proof recursion uses the same
+restore-before-propagate rule, including interrupted VCF cached certificate
+replay. No panic/unwind cancellation is used. Interrupted ancestors perform no
+TT stores; valid completed descendants may retain their normal bounds.
+
+`SearchTermination` is Completed, NodeLimit, TimeLimit or Cancelled. A stopped
+iteration, including any aspiration retry, cannot replace the last completed
+move, score, PV, nominal depth or seldepth. Final statistics include all work,
+including a discarded iteration; SearchInfo statistics reflect the completion
+instant. Before any nominal iteration completes, positive-depth fallback is the
+lowest candidate index (center if empty), static side-to-move score and one-move
+PV, with completed_depth=0. It is not a completed minimax evaluation. Zero-depth
+analysis keeps no move/PV and uses its completed qsearch score if available.
+Immediate exact facts remain valid; VCF/VCT certificates are accepted only after
+complete reconstruction and a boundary poll, with tactical_proof and nominal
+depth zero.
+
+`SearchInfo` owns completed depth, seldepth, best move, root-side score, PV,
+statistics and optional tactical proof. An observer receives snapshots only after
+completed depths or exact tactical root events, never per node. It may send them
+over channels; engine callers are not required to manage channels. The observer
+must return promptly, since its elapsed time belongs to this search. Warm ordinary
+TT history can affect which depths fit a node/time limit: fixed-depth semantic
+determinism does not promise identical interrupted output across different cache
+histories. Fresh engines and node limits provide reproducible Arena experiments.
+
+## Native adapter and worker ownership
+
+The eframe/egui UI draws public Game/Position state, translates validated Moves,
+and displays completed depth, seldepth, total work, qnodes, score, TT statistics,
+PV and proof distance. Depth (1..12) and optional move time (0 = unlimited) apply
+to the next request. No search, rules or evaluator logic lives in presentation.
+
+One persistent standard-library thread constructs and exclusively owns its
+AlphaBetaEngine. An mpsc request carries a monotonically increasing u64 ID, owned
+Position snapshot, limits and fresh token. A separate mpsc channel returns tagged
+SearchInfo and SearchResult events. Request payloads are boxed once off the hot
+path; channels never block the search on UI consumption, and events are coarse.
+The ordinary TT allocation/history survives consecutive moves.
+
+The UI-side SearchWorker owns the matching token clone and current ID. New Game,
+side change, Undo, successful import, a human move starting a request and shutdown cancel the old token
+and advance the ID without wrapping. One admission gate rejects every stale ID
+and any duplicate final event after the active request ends. Only a current,
+non-cancelled result can call Game::play_move, with an ongoing game and AI turn.
+Input cannot enqueue duplicate AI moves. While searching, UI frames poll events
+and request repaint every 16 ms; New Game invalidates immediately, regardless
+of when the old worker search notices cancellation. Drop cancels, sends Shutdown
+and joins; no engine lock, async runtime or detached thread exists.
+
+### Native local-game session and stable layout
+
+The UI stores an undo_floor separate from Game/Position. Selecting an opening
+sets it to that replayed history length; importing a record starts with floor
+zero. Human-decision Undo locates the last human stone after the floor and undoes
+it and subsequent replies. A pending AI reply means one ply is removed; a finished
+reply normally means two. Terminal states use the same rule. There is no prior
+human decision behind an initial AI move, so Undo is disabled there. The UI
+cancels/advances its ID before mutation, clears displayed search state, and checks
+whether the restored side requires a new AI request. None of these operations
+clears/resizes the worker's ordinary TT.
+
+A fixed 238-point top controls panel and fixed 180-point history panel isolate
+the remaining board rectangle. PV is one horizontal scroll row, and history is
+vertically bounded. Live proof/PV/error text cannot resize the board. Board labels
+occupy existing margins; click geometry stays shared with stone rendering. Move
+numbers are an optional overlay derived from chronological Game history, and the
+last-move marker remains. A separate record editor window supports canonical
+export/copy, legal import and explicit standard-library file load/save.
+
+## Headless Arena
+
+`rustmoku-arena` depends only on Core and Engine. It runs sequentially and replays
+one of twelve shared fixed legal opening prefixes through Game for each paired leg: A is
+Black then White on the same board. Both engines are fresh per game; their
+ordinary TTs persist between that game's moves. Player-specific EngineConfig and
+Pattern/Classical evaluator selection use concrete variants, dispatched once per
+move with static recursive search. Common positive depth and optional global
+node limits apply per move. The board fills or Core declares a winner; there is
+no heuristic adjudication or arbitrary move cutoff.
+
+CSV records pair/opening id/leg, A color, winner, plies, searched moves and total work.
+Configuration and summary go to stderr. A win earns one point, a draw half; A's
+paired score is reported out of two points per pair, alongside A/B wins, draws
+and average work per searched move. Identical version, opening order, player
+configs and limits reproduce the run. There are no random openings, parallel
+matches, Elo estimates or tournament infrastructure.
+
+## Explicit V0.8 non-goals
+
+No parallel Alpha-Beta, shared concurrent TT, new selective pruning, NNUE, MCTS,
+opening book, randomization, server API, full-game clocks, SPRT/Elo framework,
+Renju, Swap/Swap2, unsafe or SIMD. Core's backing storage remains 225 cells.
+Future scope is in [ROADMAP.md](ROADMAP.md).

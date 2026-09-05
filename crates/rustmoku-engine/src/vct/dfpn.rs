@@ -11,10 +11,14 @@ use super::{
     table::{INFINITY, Numbers, Table, TacticalKey},
     threat::ThreatDescriptor,
 };
+use crate::search_control::{ProofResources, SearchBudget};
 use crate::{board_state::BoardState, move_generation::MoveList, principal_variation::PvTable};
 
 #[derive(Clone, Copy, Debug)]
-pub(super) struct Exhausted;
+pub(super) enum Exhausted {
+    Local,
+    Outer,
+}
 
 pub(crate) struct VctSolver {
     table: Table,
@@ -41,23 +45,45 @@ impl VctSolver {
         self.statistics
     }
 
+    #[cfg(test)]
     pub(crate) fn solve(
         &mut self,
         board: &mut BoardState,
         attacker: Stone,
         max_plies: u8,
     ) -> VctResult {
+        self.solve_controlled(board, attacker, max_plies, &mut SearchBudget::default())
+    }
+
+    pub(crate) fn solve_controlled(
+        &mut self,
+        board: &mut BoardState,
+        attacker: Stone,
+        max_plies: u8,
+        budget: &mut SearchBudget,
+    ) -> VctResult {
         let available = (CELL_COUNT - board.position().move_count()) as u8;
         let max_plies = max_plies.min(available);
         let mut pv = PvTable::new();
-        let outcome = self.canonical(board, attacker, None, max_plies, 0, &mut pv);
+        let outcome = self.canonical(
+            board,
+            attacker,
+            None,
+            max_plies,
+            0,
+            &mut ProofResources {
+                pv: &mut pv,
+                budget,
+            },
+        );
         let status = match outcome {
             Ok(Some(plies)) => {
                 self.statistics.proven += 1;
                 VctStatus::ProvenWin { plies }
             }
             Ok(None) => VctStatus::NoProof,
-            Err(Exhausted) => {
+            Err(Exhausted::Outer) => VctStatus::Interrupted,
+            Err(Exhausted::Local) => {
                 self.statistics.budget_exhausted += 1;
                 VctStatus::BudgetExceeded
             }
@@ -73,10 +99,11 @@ impl VctSolver {
         }
     }
 
-    fn charge(&mut self) -> Result<(), Exhausted> {
+    fn charge(&mut self, budget: &mut SearchBudget) -> Result<(), Exhausted> {
         if self.remaining_nodes == 0 {
-            return Err(Exhausted);
+            return Err(Exhausted::Local);
         }
+        budget.charge().map_err(|_| Exhausted::Outer)?;
         self.remaining_nodes -= 1;
         self.statistics.nodes += 1;
         Ok(())
@@ -90,8 +117,9 @@ impl VctSolver {
         attacker: Stone,
         active: Option<ThreatDescriptor>,
         depth: u8,
+        budget: &mut SearchBudget,
     ) -> Result<Numbers, Exhausted> {
-        self.charge()?;
+        self.charge(budget)?;
         // Actual immediate facts precede cache and proof-depth cutoffs.
         if let Some(fact) = fact(board, attacker, depth) {
             return Ok(fact.numbers());
@@ -115,8 +143,9 @@ impl VctSolver {
         active: Option<ThreatDescriptor>,
         depth: u8,
         threshold: Numbers,
+        budget: &mut SearchBudget,
     ) -> Result<Numbers, Exhausted> {
-        let mut value = self.inspect(board, attacker, active, depth)?;
+        let mut value = self.inspect(board, attacker, active, depth, budget)?;
         if value.solved() || value.proof >= threshold.proof || value.disproof >= threshold.disproof
         {
             return Ok(value);
@@ -140,7 +169,7 @@ impl VctSolver {
                 None
             };
             let undo = board.make_move(at).expect("tactical response is legal");
-            let result = self.inspect(board, attacker, next, depth - 1);
+            let result = self.inspect(board, attacker, next, depth - 1, budget);
             board.unmake_move(undo);
             *child = result?;
         }
@@ -158,7 +187,7 @@ impl VctSolver {
                 None
             };
             let undo = board.make_move(at).expect("most-proving child is legal");
-            let result = self.dfpn(board, attacker, next, depth - 1, child_threshold);
+            let result = self.dfpn(board, attacker, next, depth - 1, child_threshold, budget);
             board.unmake_move(undo);
             // Interrupted subtrees are never converted into solved disproofs.
             children[selected] = result?;
@@ -182,12 +211,12 @@ impl VctSolver {
         active: Option<ThreatDescriptor>,
         cap: u8,
         ply: u8,
-        pv: &mut PvTable,
+        resources: &mut ProofResources<'_>,
     ) -> Result<Option<u8>, Exhausted> {
-        self.charge()?;
-        pv.clear(ply);
+        self.charge(resources.budget)?;
+        resources.pv.clear(ply);
         if let Some(fact) = fact(board, attacker, cap) {
-            fact.write_pv(ply, pv);
+            fact.write_pv(ply, resources.pv);
             return Ok(fact.distance);
         }
         let is_or = board.position().side_to_move() == attacker;
@@ -206,6 +235,7 @@ impl VctSolver {
                         proof: INFINITY,
                         disproof: INFINITY,
                     },
+                    resources.budget,
                 )?;
                 if numbers.proof == 0 {
                     shortest = Some(depth);
@@ -214,7 +244,7 @@ impl VctSolver {
                 if !numbers.solved() {
                     // Saturated unsolved numbers are still Unknown. With the
                     // practical node limits this numerical ceiling is remote.
-                    return Err(Exhausted);
+                    return Err(Exhausted::Local);
                 }
             }
         }
@@ -230,7 +260,7 @@ impl VctSolver {
                 None
             };
             let undo = board.make_move(at).expect("certificate move is legal");
-            let child = self.canonical(board, attacker, next, depth - 1, ply + 1, pv);
+            let child = self.canonical(board, attacker, next, depth - 1, ply + 1, resources);
             board.unmake_move(undo);
             match child? {
                 Some(child_distance) => {
@@ -238,7 +268,7 @@ impl VctSolver {
                     if chosen.is_none() || candidate > distance {
                         distance = candidate;
                         chosen = Some(at);
-                        pv.update(ply, at);
+                        resources.pv.update(ply, at);
                     }
                     if is_or {
                         break;
@@ -319,6 +349,42 @@ fn select(children: &[Numbers], is_or: bool, threshold: Numbers) -> (usize, Numb
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn outer_stop_in_dfpn_or_certificate_is_not_a_cached_disproof() {
+        let mut position = rustmoku_core::Position::default();
+        for index in [110, 0, 111, 14, 82, 210, 97, 224] {
+            position
+                .make_move(rustmoku_core::Move::from_index(index).unwrap())
+                .unwrap();
+        }
+        let mut board = BoardState::new(&position);
+        let mut solver = VctSolver::new(1);
+        solver.begin_search(100_000);
+        let complete = solver.solve(&mut board, Stone::Black, 5);
+        let nodes = solver.statistics().nodes;
+        for cap in [1, 20, nodes - 1] {
+            solver.begin_search(100_000);
+            let mut budget = SearchBudget::new(
+                crate::SearchLimits::new(1).with_max_nodes(cap),
+                crate::CancellationToken::new(),
+            );
+            let result = solver.solve_controlled(&mut board, Stone::Black, 5, &mut budget);
+            assert_eq!(result.status, VctStatus::Interrupted);
+            assert!(result.principal_variation.is_empty());
+            assert_eq!(solver.statistics().budget_exhausted, 0);
+            assert_eq!(board, BoardState::new(&position));
+            assert!(
+                solver
+                    .table
+                    .probe(TacticalKey::new(&board, Stone::Black, None), 5)
+                    .is_none_or(|entry| entry.numbers.disproof != 0)
+            );
+            let resumed = solver.solve(&mut board, Stone::Black, 5);
+            assert_eq!(resumed.status, complete.status);
+            assert_eq!(resumed.principal_variation, complete.principal_variation);
+        }
+    }
 
     #[test]
     fn proof_numbers_thresholds_and_saturation_follow_and_or_semantics() {

@@ -527,3 +527,112 @@ external Four counter-threats, AND refutations, threat-context isolation,
 DFPN thresholds, interruption during search/certification, a shallow all-legal
 minimax oracle, min/max distance, canonical ties, terminal PV replay, exact board
 restoration, and public root integration. Existing tests remain in the suite.
+
+
+## V0.8 lifecycle / Arena / async Native lean check (2026-09-06)
+
+The baseline is official V0.7 `d1d97088ea418b80df1ba7759958f30dc64aef53`.
+Its Release benchmark executable was saved before implementation and the four
+baseline workloads were measured then. Work resumed from the preserved V0.8
+working tree without repair or reset. Because host timing changed across the
+interruption, the saved unmodified V0.7 executable and final V0.8 executable were
+measured consecutively again on the same host for each workload below. These
+paired measurements, rather than historical timings, are the comparison basis.
+
+Both use the repository Rust toolchain, Release, PatternEvaluator, a 64 MiB TT,
+default proof settings, one untimed warm-up and seven cold repetitions. Allocation
+and TT clearing are outside timing. No time/node limit is active. Times are
+medians; quick sums its five medians. Sub-millisecond proof times remain noisy.
+No historical matrix, TT sweep, assembly inspection, WPR, or large match was run.
+
+| Workload | Requested / completed / seldepth | Best index / score | AB nodes / qnodes | VCF / VCT nodes | Total work | V0.7 ms | V0.8 ms | Time change |
+|---|---|---|---:|---:|---:|---:|---:|---:|
+| Quick aggregate (five fixtures) | 4 / varies / varies | All unchanged | 16,383 / 10,932 | 11 / 805 | 17,199 | 14.675 | 15.196 | +3.6% |
+| opening | 6 / 6 / 10 | 129 / 19,180 | 123,374 / 75,116 | 0 / 330 | 123,704 | 112.330 | 111.623 | -0.6% |
+| forced_defense | 6 / 6 / 10 | 112 / -243,380 | 189,211 / 140,782 | 0 / 0 | 189,211 | 175.192 | 176.776 | +0.9% |
+| vct_win | 4 / 0 / 5 | 112 / 99,999,995 | 0 / 0 | 0 / 915 | 915 | 0.530 | 0.525 | -0.9% |
+
+All common deterministic statistics, best moves and scores are unchanged in
+these workloads. Quick best/score pairs are opening 96/780, balanced_midgame
+142/99,999,995, tactical_attack 107/99,999,999, forced_defense 112/-243,120,
+and transposition_rich 96/99,999,997. Depth-six AB NPS is 1,105,270 for opening
+and 1,070,346 for forced_defense. No ordinary workload exceeds the 5–10%
+investigation threshold; the fixed 256-work-node atomic/clock poll stride needs
+no further tuning. This is overhead evidence, not a strength claim.
+
+`search_bench` retains existing subsystem counters and AB NPS and now also emits
+`work_nodes` and `termination`. Work includes AB nodes (qnodes counted once), VCF
+visits/replay and VCT inspections/certificates. Local proof caps are independent.
+Exact-known-loss PV leaves intentionally change from an unrelated lowest empty
+cell to the first opponent winning point, followed by the next winning point;
+mate score/distance are preserved. The all-legal VCT oracle follows that explicit
+resistance policy and continues comparing complete bounded certificates.
+
+Reproduction of the only four performance workloads:
+
+```powershell
+cargo run --release -p rustmoku-engine --example search_bench -- --suite quick --repeats 7
+cargo run --release -p rustmoku-engine --example search_bench -- --depth 6 --fixture opening --repeats 7
+cargo run --release -p rustmoku-engine --example search_bench -- --depth 6 --fixture forced_defense --repeats 7
+cargo run --release -p rustmoku-engine --example search_bench -- --fixture vct_win --repeats 7
+```
+
+### Arena smoke only
+
+```powershell
+cargo run --release -p rustmoku-arena -- --pairs 2 --depth 2 --nodes 2000 --b-vct-nodes 0
+```
+
+A uses default configuration; B disables only VCT. The shared suite's first two
+openings are `diagonal` (H8 H9 I7 I8) and `cross` (H8 I8 H7 I9). Each uses the
+identical legal prefix for both color-swapped legs; each game has fresh engines
+with ordinary TT state retained between its moves.
+
+| Opening | A color | Winner | Total plies | Searched moves | Work |
+|---|---|---|---:|---:|---:|
+| diagonal | Black | B | 22 | 18 | 19,068 |
+| diagonal | White | B | 33 | 29 | 34,261 |
+| cross | Black | A | 41 | 37 | 41,391 |
+| cross | White | B | 23 | 19 | 8,971 |
+
+A wins 1, B wins 3, draws 0. A scores 1.0/4 points (0.5 points per pair).
+The 103 searched moves consume 103,691 work nodes, averaging 1,006.7 per move.
+This verifies legal completion, configuration, paired colors, accounting and CSV
+output only. It does not establish superiority, Elo, or opening balance.
+
+### Focused validation
+
+The generated VCT regression uses 48 deterministic seed transformations and
+legal perturbations, filters OpenThree-or-stronger tactical states, and compares
+production with the all-legal defender oracle at caps 3/5. It found no counterexample.
+The oracle retains every AND defense; it can stop an ascending OR enumeration
+once a three-ply proof reaches the independently established minimum distance.
+This saves test work without weakening proof status, distance or canonical-PV
+agreement. Production defender compression remains compact and unchanged.
+
+Additional focused coverage exercises exact global limits, last-completed-depth
+semantics, cancellation/deadlines, full state restoration, proof interruption
+without cached disproof, local-budget fallthrough, observer snapshots, paired
+Arena accounting, stale worker events and shutdown. Local-game tests cover
+history/undo/terminal restoration, notation, record replay/rejection, every built-in
+opening, human-decision undo floors and Undo/import request invalidation. The
+known-loss regression covers two and multiple winning threats with exact score,
+legal terminal PV and deterministic meaningful resistance.
+
+
+Final validation completed successfully from the workspace root:
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all -- --check` | Passed |
+| `cargo check --workspace --all-targets` | Passed |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | Passed, no warnings |
+| `cargo test --workspace --all-features` | Passed: 148 tests (18 Core, 124 Engine, 2 Arena, 4 Native) |
+| `cargo test --release -p rustmoku-engine` | Passed: 124 tests |
+| `cargo build --release -p rustmoku-native` | Passed |
+| `cargo build --release -p rustmoku-arena` | Passed |
+
+The native validation is behavioral/session and worker testing, not a manual
+visual acceptance run. Cooperative deadlines can overshoot with an expensive
+evaluator/observer or OS scheduling. The opening suite has no measured balance
+provenance, and this Arena smoke sample supplies no strength estimate.

@@ -195,7 +195,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Err("unknown fixture".into());
     }
     println!(
-        "fixture,evaluator,tt_mib,repeats,requested_depth,completed_depth,seldepth,best_index,score,nodes,qnodes,pvs_researches,lmr_reductions,lmr_researches,aspiration_fail_low,aspiration_fail_high,static_evaluations,tt_probes,tt_hits,tt_cutoffs,tt_stores,tt_replacements,vcf_nodes,vcf_cache_hits,vcf_probes,vcf_proven,vcf_budget_exhausted,vct_nodes,vct_cache_hits,vct_proven,vct_budget_exhausted,capacity_bytes,buckets,entries,hashfull_per_mille,median_ms,nps"
+        "fixture,evaluator,tt_mib,repeats,requested_depth,completed_depth,seldepth,best_index,score,nodes,qnodes,pvs_researches,lmr_reductions,lmr_researches,aspiration_fail_low,aspiration_fail_high,static_evaluations,tt_probes,tt_hits,tt_cutoffs,tt_stores,tt_replacements,vcf_nodes,vcf_cache_hits,vcf_probes,vcf_proven,vcf_budget_exhausted,vct_nodes,vct_cache_hits,vct_proven,vct_budget_exhausted,capacity_bytes,buckets,entries,hashfull_per_mille,median_ms,nps,work_nodes,termination"
     );
     for fixture in fixtures.iter().chain(&proof_fixtures) {
         if fixture_filter.is_none() && proof_fixtures.iter().any(|f| f.name == fixture.name) {
@@ -246,7 +246,7 @@ fn benchmark<E: Evaluator>(
     let tt = engine.transposition_table_statistics(); // Sampling outside timed region.
     let nps = stats.nodes as f64 / elapsed.as_secs_f64();
     println!(
-        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:.3},{:.0}",
+        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:.3},{:.0},{},{:?}",
         fixture.name,
         name,
         memory_mib,
@@ -285,7 +285,9 @@ fn benchmark<E: Evaluator>(
         tt.entry_count,
         tt.hashfull_per_mille,
         elapsed.as_secs_f64() * 1000.0,
-        nps
+        nps,
+        stats.work_nodes,
+        result.termination
     );
 }
 

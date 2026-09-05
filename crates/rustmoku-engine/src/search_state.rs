@@ -53,8 +53,9 @@ impl<E: Evaluator> SearchState<E> {
         solver: &mut VcfSolver,
         attacker: Stone,
         max_plies: u8,
+        budget: &mut crate::search_control::SearchBudget,
     ) -> VcfResult {
-        solver.solve(&mut self.board, attacker, max_plies)
+        solver.solve_controlled(&mut self.board, attacker, max_plies, budget)
     }
 
     pub(crate) fn prove_vct(
@@ -62,8 +63,9 @@ impl<E: Evaluator> SearchState<E> {
         solver: &mut crate::vct::VctSolver,
         attacker: Stone,
         max_plies: u8,
+        budget: &mut crate::search_control::SearchBudget,
     ) -> crate::vct::VctResult {
-        solver.solve(&mut self.board, attacker, max_plies)
+        solver.solve_controlled(&mut self.board, attacker, max_plies, budget)
     }
 
     pub(crate) fn make_move(
@@ -208,7 +210,7 @@ mod tests {
                 * crate::pattern::ThreatProfile::COUNT
                 * std::mem::size_of::<crate::bitboard::BitBoard256>()
         );
-        println!("SearchState<PatternEvaluator>: V0.4=3768, V0.5={size} bytes");
+        println!("SearchState<PatternEvaluator>: {size} bytes");
     }
 
     #[test]

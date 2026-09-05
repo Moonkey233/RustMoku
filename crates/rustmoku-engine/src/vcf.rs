@@ -5,6 +5,7 @@ use crate::{
     board_state::BoardState,
     principal_variation::PvTable,
     proof_table::{CachedProof, ProofTable, solver_key},
+    search_control::{ProofResources, SearchBudget, Stopped},
     tactical::{ImmediateTactic, forcing_moves, immediate_tactic},
 };
 
@@ -16,6 +17,7 @@ pub(crate) enum VcfStatus {
     /// No proof within the continuous-four definition and requested depth.
     NotProven,
     BudgetExceeded,
+    Interrupted,
 }
 
 #[derive(Debug)]
@@ -58,12 +60,23 @@ impl VcfSolver {
         self.statistics
     }
 
-    /// Every return path restores all board fields; the evaluator is absent.
+    #[cfg(test)]
     pub(crate) fn solve(
         &mut self,
         board: &mut BoardState,
         attacker: Stone,
         max_plies: u8,
+    ) -> VcfResult {
+        self.solve_controlled(board, attacker, max_plies, &mut SearchBudget::default())
+    }
+
+    /// Every return path restores all board fields; the evaluator is absent.
+    pub(crate) fn solve_controlled(
+        &mut self,
+        board: &mut BoardState,
+        attacker: Stone,
+        max_plies: u8,
+        budget: &mut SearchBudget,
     ) -> VcfResult {
         self.statistics.probes += 1;
         let mut pv = PvTable::new();
@@ -81,7 +94,16 @@ impl VcfSolver {
             2
         };
         for depth in (first..=max_plies).step_by(2) {
-            status = self.visit(board, attacker, depth, 0, &mut pv);
+            status = self.visit(
+                board,
+                attacker,
+                depth,
+                0,
+                &mut ProofResources {
+                    pv: &mut pv,
+                    budget,
+                },
+            );
             if status != VcfStatus::NotProven {
                 break;
             }
@@ -96,7 +118,7 @@ impl VcfSolver {
                 self.statistics.budget_exhausted += 1;
                 Vec::new()
             }
-            VcfStatus::NotProven => Vec::new(),
+            VcfStatus::NotProven | VcfStatus::Interrupted => Vec::new(),
         };
         VcfResult {
             status,
@@ -110,13 +132,16 @@ impl VcfSolver {
         attacker: Stone,
         depth: u8,
         ply: u8,
-        pv: &mut PvTable,
+        resources: &mut ProofResources<'_>,
     ) -> VcfStatus {
-        pv.clear(ply);
+        resources.pv.clear(ply);
         // This dedicated remaining budget controls work; counters only observe it.
         // A visit, including a cache hit or a depth-zero node, costs one node.
         if self.remaining_nodes == 0 {
             return VcfStatus::BudgetExceeded;
+        }
+        if resources.budget.charge().is_err() {
+            return VcfStatus::Interrupted;
         }
         self.remaining_nodes -= 1;
         self.statistics.nodes += 1;
@@ -130,23 +155,27 @@ impl VcfSolver {
                 CachedProof::ProvenWin { plies } if plies <= depth => {
                     // A collision may have evicted descendants. Never return a
                     // partial certificate: missing links fall back to search.
-                    if self.replay(board, attacker, depth, ply, pv) == Some(plies) {
-                        self.statistics.cache_hits += 1;
-                        return VcfStatus::ProvenWin { plies };
+                    match self.replay(board, attacker, depth, ply, resources) {
+                        Ok(Some(distance)) if distance == plies => {
+                            self.statistics.cache_hits += 1;
+                            return VcfStatus::ProvenWin { plies };
+                        }
+                        Err(Stopped) => return VcfStatus::Interrupted,
+                        Ok(_) => {}
                     }
-                    pv.clear(ply);
+                    resources.pv.clear(ply);
                 }
                 _ => {}
             }
         }
-        let result = self.expand(board, attacker, depth, ply, pv);
+        let result = self.expand(board, attacker, depth, ply, resources);
         let cached = match result {
             VcfStatus::ProvenWin { plies } => CachedProof::ProvenWin { plies },
             VcfStatus::NotProven => CachedProof::NotProven,
-            VcfStatus::BudgetExceeded => return result,
+            VcfStatus::BudgetExceeded | VcfStatus::Interrupted => return result,
         };
         self.table
-            .store(key, depth, cached, pv.line(ply).first().copied());
+            .store(key, depth, cached, resources.pv.line(ply).first().copied());
         result
     }
 
@@ -156,9 +185,9 @@ impl VcfSolver {
         attacker: Stone,
         depth: u8,
         ply: u8,
-        pv: &mut PvTable,
+        resources: &mut ProofResources<'_>,
     ) -> VcfStatus {
-        if let Some(fact) = resolve_fact(board, attacker, depth, ply, pv) {
+        if let Some(fact) = resolve_fact(board, attacker, depth, ply, resources.pv) {
             return fact;
         }
         if depth == 0 {
@@ -169,12 +198,12 @@ impl VcfSolver {
             else {
                 return VcfStatus::NotProven;
             };
-            return self.continue_at(board, attacker, at, depth, ply, pv);
+            return self.continue_at(board, attacker, at, depth, ply, resources);
         }
         for at in forcing_moves(board.patterns(), attacker).iter() {
             // The defender node rechecks actual resulting winning cells, with
             // defender counter-wins first. Pre-move profiles alone prove nothing.
-            let result = self.continue_at(board, attacker, at, depth, ply, pv);
+            let result = self.continue_at(board, attacker, at, depth, ply, resources);
             if result != VcfStatus::NotProven {
                 return result;
             }
@@ -189,14 +218,14 @@ impl VcfSolver {
         at: Move,
         depth: u8,
         ply: u8,
-        pv: &mut PvTable,
+        resources: &mut ProofResources<'_>,
     ) -> VcfStatus {
         let undo = board.make_move(at).expect("tactical bitset move is legal");
-        let child = self.visit(board, attacker, depth - 1, ply + 1, pv);
+        let child = self.visit(board, attacker, depth - 1, ply + 1, resources);
         board.unmake_move(undo);
         match child {
             VcfStatus::ProvenWin { plies } => {
-                pv.update(ply, at);
+                resources.pv.update(ply, at);
                 VcfStatus::ProvenWin { plies: plies + 1 }
             }
             other => other,
@@ -204,7 +233,7 @@ impl VcfSolver {
     }
 
     /// Bounded certificate reconstruction, not expansion: at most `depth`
-    /// transitions, no branching or budget spending, just like an immediate PV.
+    /// transitions, no branching. Each visit spends global work, but no local expansion budget.
     /// Every link is validated against actual board facts and restored on return.
     fn replay(
         &self,
@@ -212,44 +241,47 @@ impl VcfSolver {
         attacker: Stone,
         depth: u8,
         ply: u8,
-        pv: &mut PvTable,
-    ) -> Option<u8> {
-        pv.clear(ply);
-        if let Some(fact) = resolve_fact(board, attacker, depth, ply, pv) {
-            return match fact {
+        resources: &mut ProofResources<'_>,
+    ) -> Result<Option<u8>, Stopped> {
+        resources.budget.charge()?;
+        resources.pv.clear(ply);
+        if let Some(fact) = resolve_fact(board, attacker, depth, ply, resources.pv) {
+            return Ok(match fact {
                 VcfStatus::ProvenWin { plies } => Some(plies),
                 _ => None,
-            };
+            });
         }
         if depth == 0 {
-            return None;
+            return Ok(None);
         }
-        let entry = self.table.probe(solver_key(board.key(), attacker))?;
+        let Some(entry) = self.table.probe(solver_key(board.key(), attacker)) else {
+            return Ok(None);
+        };
         let CachedProof::ProvenWin { plies } = entry.proof else {
-            return None;
+            return Ok(None);
         };
         if plies > depth {
-            return None;
+            return Ok(None);
         }
-        let at = entry
-            .best_move
-            .filter(|&at| board.position().is_legal(at))?;
+        let Some(at) = entry.best_move.filter(|&at| board.position().is_legal(at)) else {
+            return Ok(None);
+        };
         if board.position().side_to_move() == attacker {
             if !forcing_moves(board.patterns(), attacker).test(at) {
-                return None;
+                return Ok(None);
             }
         } else if immediate_tactic(board.patterns(), attacker.opponent()).forced_block() != Some(at)
         {
-            return None;
+            return Ok(None);
         }
         let undo = board.make_move(at).expect("validated cached move");
-        let child = self.replay(board, attacker, depth - 1, ply + 1, pv);
+        let child = self.replay(board, attacker, depth - 1, ply + 1, resources);
         board.unmake_move(undo);
-        if child.is_some_and(|distance| distance + 1 == plies) {
-            pv.update(ply, at);
-            Some(plies)
+        if child?.is_some_and(|distance| distance + 1 == plies) {
+            resources.pv.update(ply, at);
+            Ok(Some(plies))
         } else {
-            None
+            Ok(None)
         }
     }
 }
@@ -305,6 +337,59 @@ mod tests {
 
     // 111 forces 112; 96 then creates two independent vertical winning cells.
     const CHAIN: &[usize] = &[108, 107, 109, 0, 110, 2, 66, 4, 81, 6];
+
+    #[test]
+    fn outer_interruption_and_cached_replay_restore_board_without_disproofs() {
+        let position = fixture(CHAIN);
+        let mut board = BoardState::new(&position);
+        let mut solver = VcfSolver::new();
+        for cap in [1, 5, 18] {
+            solver.begin_search(100_000);
+            let mut budget = SearchBudget::new(
+                SearchLimits::new(1).with_max_nodes(cap),
+                crate::CancellationToken::new(),
+            );
+            let result = solver.solve_controlled(&mut board, Stone::Black, 5, &mut budget);
+            assert_eq!(result.status, VcfStatus::Interrupted);
+            assert_eq!(solver.statistics().budget_exhausted, 0);
+            assert_eq!(board, BoardState::new(&position));
+            assert!(
+                solver
+                    .table
+                    .probe(solver_key(board.key(), Stone::Black))
+                    .is_none_or(|entry| entry.depth < 5 || entry.proof != CachedProof::NotProven)
+            );
+            // Same generation, so a false cached disproof would remain visible.
+            verify(
+                &position,
+                &solver.solve(&mut board, Stone::Black, 5),
+                5,
+                111,
+            );
+        }
+        let mut budget = SearchBudget::new(
+            SearchLimits::new(1).with_max_nodes(2),
+            crate::CancellationToken::new(),
+        );
+        let status = solver.visit(
+            &mut board,
+            Stone::Black,
+            5,
+            0,
+            &mut ProofResources {
+                pv: &mut PvTable::new(),
+                budget: &mut budget,
+            },
+        );
+        assert_eq!(status, VcfStatus::Interrupted);
+        assert_eq!(board, BoardState::new(&position));
+        verify(
+            &position,
+            &solver.solve(&mut board, Stone::Black, 5),
+            5,
+            111,
+        );
+    }
 
     fn at(index: usize) -> Move {
         Move::from_index(index).unwrap()
@@ -374,7 +459,16 @@ mod tests {
         let before = solver.statistics();
         let mut cached_pv = PvTable::new();
         assert_eq!(
-            solver.visit(&mut board, Stone::Black, 5, 0, &mut cached_pv),
+            solver.visit(
+                &mut board,
+                Stone::Black,
+                5,
+                0,
+                &mut ProofResources {
+                    pv: &mut cached_pv,
+                    budget: &mut SearchBudget::default()
+                }
+            ),
             VcfStatus::ProvenWin { plies: 5 }
         );
         assert_eq!(cached_pv.root_line(), result.principal_variation);
@@ -409,7 +503,16 @@ mod tests {
         let before = solver.statistics();
         let mut pv = PvTable::new();
         assert_eq!(
-            solver.visit(&mut board, Stone::Black, 9, 0, &mut pv),
+            solver.visit(
+                &mut board,
+                Stone::Black,
+                9,
+                0,
+                &mut ProofResources {
+                    pv: &mut pv,
+                    budget: &mut SearchBudget::default()
+                }
+            ),
             VcfStatus::ProvenWin { plies: 5 }
         );
         assert_eq!(solver.statistics().nodes - before.nodes, 1);
@@ -434,11 +537,29 @@ mod tests {
         solver.begin_search(10_000);
         let mut manual = PvTable::new();
         assert_eq!(
-            solver.visit(&mut board, Stone::Black, 2, 0, &mut manual),
+            solver.visit(
+                &mut board,
+                Stone::Black,
+                2,
+                0,
+                &mut ProofResources {
+                    pv: &mut manual,
+                    budget: &mut SearchBudget::default()
+                }
+            ),
             VcfStatus::NotProven
         );
         assert_eq!(
-            solver.visit(&mut board, Stone::Black, 4, 0, &mut manual),
+            solver.visit(
+                &mut board,
+                Stone::Black,
+                4,
+                0,
+                &mut ProofResources {
+                    pv: &mut manual,
+                    budget: &mut SearchBudget::default()
+                }
+            ),
             VcfStatus::ProvenWin { plies: 4 }
         );
         assert_eq!(solver.statistics().nodes, defender_nodes);
@@ -610,7 +731,14 @@ mod tests {
             solver.begin_search(nodes);
             let mut state = SearchState::new(&position, &InaccessibleEvaluator);
             assert_eq!(
-                state.prove_vcf(&mut solver, Stone::Black, depth).status,
+                state
+                    .prove_vcf(
+                        &mut solver,
+                        Stone::Black,
+                        depth,
+                        &mut SearchBudget::default()
+                    )
+                    .status,
                 expected
             );
             assert_eq!(state.position(), &position);

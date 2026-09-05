@@ -1,10 +1,23 @@
 # RustMoku
 
-RustMoku V0.7 is a deterministic 15 x 15 Freestyle Gomoku program and a small
+RustMoku V0.8 is a deterministic 15 x 15 Freestyle Gomoku program and a small
 research-oriented engine foundation. It prioritizes correct game semantics,
 clear crate boundaries, reproducible results, and measurable search behavior.
 
-## V0.7 - Exact VCT / Threat-Space / DFPN
+## V0.8 - Search Lifecycle, Arena & Async Native
+
+- Per-move depth, total work-node and elapsed-time limits; one-way cancellation.
+- Explicit termination reason and last-completed-iteration score/PV on interruption.
+- Coarse `SearchInfo` observers after completed depths and exact tactical proofs.
+- A persistent native worker owns the engine; cancelled/stale requests cannot play.
+- Single-threaded headless Arena with deterministic openings and paired colors.
+- Game-owned ordered history, repeatable human-decision Undo and opening undo floors.
+- Shared A1..O15 notation, versioned records, coordinates and optional move numbers.
+- Stable board layout with a single scrolling PV row and bounded move history.
+- Generated all-legal VCT defender audit found no counterexample; DFPN preserves
+  useful partial entries against fresh unknown writes.
+
+The established engine foundation remains:
 
 - Exact bounded VCT with attacker OR / defender AND semantics, an explicit threat
   descriptor, and a separate build-generated 512 KiB tactical metadata table.
@@ -73,8 +86,12 @@ The AI defaults to depth 4, a 64 MiB transposition table, and a gated VCF attemp
 limited to 11 proof plies / 2,000 nodes with a separate 384 KiB proof table.
 VCT defaults to 9 plies / 4,000 node inspections and a 16 MiB memory request
 (12 MiB actual bucket allocation). Roots without OpenThree-or-stronger candidates
-spend zero VCT nodes. Search remains
-synchronous, so the window can pause briefly while the AI chooses a move.
+spend zero VCT nodes. A persistent worker owns the engine and ordinary TT. The UI
+remains responsive, displays completed search snapshots, and accepts New Game
+while searching. Depth and optional move time apply to the next request (0 ms
+means unlimited). Each invalidation cancels its token and advances the request
+ID; both old snapshots and old results are ignored. Application drop cancels,
+sends shutdown and joins the worker.
 
 The permanent fixed-position benchmark utility is run with:
 
@@ -101,7 +118,7 @@ use rustmoku_engine::{AlphaBetaEngine, ClassicalEvaluator};
 let mut engine = AlphaBetaEngine::new(ClassicalEvaluator);
 ```
 
-The V0.7 lean performance check against official V0.6 `aff61e4` is recorded in
+The V0.8 lean performance check against official V0.7 `d1d9708` is recorded in
 [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md). Additional fixtures are `vcf_win`,
 `vct_win`, and `non_vct_tactical`; the default quick suite still has five positions.
 Use `--vcf-plies`, `--vcf-nodes`, `--vct-plies`, `--vct-nodes`, and `--vct-mib`.
@@ -118,6 +135,105 @@ let config = EngineConfig::new(64)
     .with_vct_table_memory(16);
 ```
 
+## Local games, Undo and records
+
+Choose Empty Board or one of twelve built-in Freestyle test openings. "Next in
+suite" cycles their fixed order with no hidden RNG. These are hand-authored
+starts, with no official or measured balance claim. Core instantiates every start
+by legal replay, and Arena uses the same suite for both legs of each pair.
+
+"Undo turn" returns to the previous human decision: it removes one human move
+while the AI is thinking, or the human move and completed AI reply. It handles
+terminal games and either human color. An AI's initial move has no earlier human
+decision to undo. Opening moves form the session's undo floor and remain in the
+complete exported history. Core `Game::undo()` / `undo_plies(n)` are generic LIFO
+operations; `Game::history()` exposes only chronological Moves. Position remains
+history-free. Undo/import/New Game invalidate the worker request without clearing
+its persistent ordinary TT.
+
+Coordinates include I: A1 is bottom-left, O15 top-right and H8 center. Move's
+`Display` / `FromStr` implementation is the authoritative codec; parsing also
+accepts lowercase. PV, history, last-move text, board labels, Arena opening text
+and records use it. The fixed controls/history panels keep the board stable
+while live PV changes. PV scrolls horizontally in one row; history scrolls
+vertically. "Move numbers" derives its overlay from Game history.
+
+"Game record..." exports the current complete move sequence, copies text to the
+clipboard, imports pasted text, and loads/saves an explicit file path using the
+standard library. Loaded text is imported only when "Import text" is clicked;
+invalid imports leave the current game untouched. Import starts an editable
+session with undo floor zero and starts the AI if required by the chosen human
+side. Files use deterministic canonical text:
+
+```text
+RustMoku 1
+rules=freestyle
+moves=H8 H9 G8 I8
+```
+
+`Game::from_record` creates a fresh Game and legally replays all moves. Unsupported
+versions/rules, malformed coordinates, repeated occupied moves and moves after
+termination produce contextual errors. `Game::to_record` includes all opening
+and played moves with a final newline; it never serializes Position internals.
+
+## Search lifecycle
+
+```rust
+use std::time::Duration;
+use rustmoku_engine::{AlphaBetaEngine, CancellationToken, SearchEngine, SearchInfo, SearchLimits};
+let mut engine = AlphaBetaEngine::default();
+let position = rustmoku_core::Position::default();
+let limits = SearchLimits::new(8)
+    .with_max_nodes(100_000)
+    .with_move_time(Duration::from_millis(500));
+let token = CancellationToken::new(); // retain a clone on the controlling thread
+let result = engine.search_controlled(&position, limits, token, &mut |info: SearchInfo| {
+    println!("depth {} work {} score {}", info.completed_depth, info.statistics.work_nodes, info.score);
+});
+println!("{:?}", result.termination);
+// Ordinary fixed-depth callers still use engine.search(&position, SearchLimits::new(4)).
+```
+
+`SearchTermination` is `Completed`, `NodeLimit`, `TimeLimit`, or `Cancelled`.
+Interrupted iterations never replace the last completed score, move, PV or
+seldepth. Final statistics include all spent work, including the discarded
+iteration. Before any positive-depth iteration completes, the fallback is the
+lowest candidate index (center on an empty board), a static score and one-move
+PV, with completed depth zero. Zero-depth calls remain analysis-only: no move.
+Known immediate exact tactics and terminal facts remain valid even at a stop;
+VCF/VCT certificates are accepted only when complete. A cancelled GUI result is
+never played.
+
+`statistics.work_nodes` counts normal nodes including qnodes once, VCF visits
+and certificate replay, and VCT/DFPN inspections and certificate visits. A global
+node cap admits at most that many visits across all subsystems. Local proof
+budget exhaustion still allows ordinary search; outer interruption stops it.
+The cancellation atomic and optional clock are polled every 256 work nodes and
+at root-stage/iteration boundaries. Time limits are cooperative per move, not
+full-game clocks; node limits with fresh engines are the reproducible option.
+Observers should return promptly because their time is part of the search.
+
+## Headless Arena
+
+```powershell
+cargo run --release -p rustmoku-arena -- --pairs 2 --depth 2 --nodes 2000 --b-vct-nodes 0
+cargo run --release -p rustmoku-arena -- --help
+```
+
+Each of up to twelve fixed opening prefixes is played twice: A as Black, then A
+as White. Each game starts with fresh engines; each engine retains its TT between
+moves. All moves go through Core `Game`. No randomness, wall-clock adjudication,
+GUI dependency, or parallel search is involved. CSV goes to stdout; configuration
+and A/B wins, draws, A's paired points and average work per move go to stderr.
+A win scores one point and a draw half a point, so each pair has two points.
+
+Player options use `--a-` or `--b-`: `evaluator pattern|classical`, `tt-mib`,
+`vcf-plies`, `vcf-nodes`, `vct-plies`, `vct-nodes`, and `vct-mib`. Common `--depth`
+(default 3) and optional `--nodes` apply per move. Zero proof plies/nodes disables
+a solver. Tiny paired runs validate the harness; they do not establish Elo or
+engine superiority. Reproduce with the same revision, openings, configurations,
+and limits.
+
 ## Full validation
 
 ```powershell
@@ -127,6 +243,7 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 cargo test --release -p rustmoku-engine
 cargo build --release -p rustmoku-native
+cargo build --release -p rustmoku-arena
 cargo run --release -p rustmoku-engine --example search_bench
 ```
 
@@ -136,27 +253,32 @@ cargo run --release -p rustmoku-engine --example search_bench
   cached win state, and game flow.
 - `crates/rustmoku-engine`: evaluation, candidates, ordering, Zobrist hashing,
   transposition table, principal variation, and PVS/threat search.
-- `apps/rustmoku-native`: desktop presentation and interaction adapter.
+- `apps/rustmoku-native`: desktop presentation and persistent search worker.
+- `apps/rustmoku-arena`: deterministic paired engine matches, no GUI dependency.
 
 Dependencies remain one-way: Engine depends on Core; Native depends on Core and
-Engine. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the invariants and
+Engine, as does Arena. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the invariants and
 search contracts.
 
 ## Current limits and roadmap
 
-V0.7 has no additional selective pruning, time control,
-cancellation, threads, NNUE, MCTS, opening book, server API, Renju, or Swap protocol.
+V0.8 has no parallel Alpha-Beta, shared concurrent TT, additional selective
+pruning, NNUE, MCTS, opening book, server API, Renju, or Swap protocol.
 LMR remains heuristic and may miss quiet resources; it does not prove equality
 with full-depth minimax. Quiescence omits ordinary Three expansion and optional
 non-immediate defensive moves, and stops non-immediate forcing continuations at
-the cap. Pattern weights and LMR thresholds are untuned. The Native app remains
-synchronous; fixed-position timings do not establish playing strength.
+the cap. Pattern weights and LMR thresholds are untuned. Cancellation latency
+also depends on evaluator/observer cost; deadlines are not hard real-time guarantees.
+Fixed-position timings do not establish playing strength.
 
 VCF proves continuous-four wins; VCT admits Five, OpenFour, DoubleFour, FourThree,
 DoubleThree, Four, and OpenThree attacks. Ordinary Three and arbitrary quiet
 attacks are excluded. Reported distance is exact within that forcing vocabulary,
 not unrestricted full-game minimax. NoProof/NotProven is not a loss verdict;
-exhaustion remains Unknown and falls through to classical search. Proof numbers
+when two immediate opponent wins already establish an exact loss, the engine
+blocks the first canonical threat point and reports the second as the terminal
+reply. Score/distance stay exact; unrelated top-left moves are no longer chosen.
+Local proof exhaustion remains Unknown and falls through to classical search. Proof numbers
 saturate safely; practical node limits are far below that numerical ceiling.
 Evaluator stays replaceable; its public
 PatternState API debt and future milestones are recorded in

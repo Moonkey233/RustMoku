@@ -46,6 +46,72 @@ fn dfpn_agrees_with_all_legal_reference_on_shallow_proofs_and_refutations() {
 }
 
 #[test]
+fn generated_tactical_states_agree_with_all_legal_defender_oracle() {
+    // A bounded deterministic generator, not a random-game corpus: translate,
+    // reflect and rotate forcing seeds, then add legal nearby/distant stones.
+    // Both colors attack, and shallow caps exercise proofs and refutations.
+    let seeds = [OPEN_THREE, DOUBLE_THREE, &[110, 0, 111, 14, 112, 224][..]];
+    let mut tested = 0;
+    let mut proven = 0;
+    for case in 0..48 {
+        let mut position = Position::default();
+        if case % 2 != 0 {
+            position.make_move(at(32)).unwrap();
+        }
+        for &index in seeds[case % seeds.len()] {
+            let (mut row, mut col) = (index / 15, index % 15);
+            for _ in 0..(case / 3) % 4 {
+                (row, col) = (col, 14 - row);
+            }
+            if case / 12 % 2 != 0 {
+                col = 14 - col;
+            }
+            // Shifting modulo the board also supplies boundary/broken shapes.
+            row = (row + case / 24) % 15;
+            position.make_move(at(row * 15 + col)).unwrap();
+        }
+        for offset in 0..2 * (case / 12) {
+            let start = (case * 37 + offset * 61) % 225;
+            let next = (0..225)
+                .map(|i| at((start + i) % 225))
+                .find(|&m| position.is_legal(m) && !position.would_win(m, position.side_to_move()))
+                .unwrap();
+            position.make_move(next).unwrap();
+        }
+        let mut board = BoardState::new(&position);
+        let attacker = position.side_to_move();
+        if attacks(board.patterns(), attacker).is_empty() {
+            continue;
+        }
+        let depth = if case / 3 % 2 == 0 { 3 } else { 5 };
+        let expected = reference(&mut board, attacker, depth);
+        assert_eq!(board, BoardState::new(&position));
+        let result = solve(&position, depth, 500_000);
+        match expected {
+            Some(expected) => {
+                proven += 1;
+                verify(&position, &result, expected.distance);
+                assert_eq!(result.principal_variation, expected.pv, "case {case}");
+            }
+            None => assert_eq!(result.status, VctStatus::NoProof, "case {case}"),
+        }
+        tested += 1;
+    }
+    assert!(
+        tested >= 40,
+        "insufficient filtered tactical states: {tested}"
+    );
+    assert!(
+        proven >= 8 && proven < tested,
+        "audit must cover both outcomes"
+    );
+    eprintln!(
+        "VCT audit: {tested} tactical states, {proven} proven, {} refuted",
+        tested - proven
+    );
+}
+
+#[test]
 fn open_three_responses_are_audited_against_every_legal_move() {
     // Includes edge and compound witnesses. Omitted moves must preserve the
     // complete witness and leave no immediate defender winning point; playing
@@ -165,7 +231,17 @@ fn attacker_minimizes_and_defender_maximizes_actual_proof_distance() {
     solver.begin_search(500_000);
     let mut pv = PvTable::new();
     let distance = solver
-        .canonical(&mut board, Stone::Black, Some(descriptor), 6, 0, &mut pv)
+        .canonical(
+            &mut board,
+            Stone::Black,
+            Some(descriptor),
+            6,
+            0,
+            &mut crate::search_control::ProofResources {
+                pv: &mut pv,
+                budget: &mut crate::search_control::SearchBudget::default(),
+            },
+        )
         .unwrap();
     assert_eq!(distance, Some(6));
     let slowest = pv.root_line()[0];
@@ -321,14 +397,10 @@ fn reference(board: &mut BoardState, attacker: Stone, depth: u8) -> Option<Refer
         if side == attacker || depth < 2 {
             return None;
         }
-        let at = Move::all()
-            .find(|&at| board.position().is_legal(at))
-            .unwrap();
-        let reply = opponent_wins
-            .iter()
-            .copied()
-            .find(|&win| win != at)
-            .unwrap();
+        // Exact known losses prefer canonical resistance at actual threat
+        // points, matching the public tactical policy without sharing its code.
+        let at = opponent_wins[0];
+        let reply = opponent_wins[1];
         return Some(ReferenceProof {
             distance: 2,
             pv: vec![at, reply],
@@ -369,6 +441,13 @@ fn reference(board: &mut BoardState, attacker: Stone, depth: u8) -> Option<Refer
                 });
                 if replace {
                     best = Some(proof);
+                }
+                // Own immediate wins were already excluded, so three is the
+                // exact lower distance bound. Ascending attacks make this first
+                // three-ply proof canonical; later attacks cannot improve it.
+                // Every AND reply in this certificate was still enumerated.
+                if side == attacker && best.as_ref().is_some_and(|proof| proof.distance == 3) {
+                    return best;
                 }
             }
             None => {}

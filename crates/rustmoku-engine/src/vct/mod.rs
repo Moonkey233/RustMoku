@@ -22,6 +22,7 @@ pub(crate) enum VctStatus {
     ProvenWin { plies: u8 },
     NoProof,
     BudgetExceeded,
+    Interrupted,
 }
 
 pub(crate) struct VctResult {
