@@ -442,3 +442,88 @@ cargo run --release -p rustmoku-engine --example search_bench -- --depth 6 --fix
 cargo run --release -p rustmoku-engine --example search_bench -- --fixture vcf_win --repeats 5
 cargo run --release -p rustmoku-engine --example search_bench -- --fixture non_vcf_tactical --repeats 5
 ```
+
+
+## V0.7: exact VCT / threat-space / DFPN (2026-09-05)
+
+Baseline is the clean official V0.6 commit
+`aff61e4ba303e9145e87b7ca32832d6d82b64886`, measured in this session before edits.
+Both revisions use Release, Rust 1.98.1, PatternEvaluator, 64 MiB ordinary TT,
+one untimed warm-up, then three cold runs on the same Windows host. Times are
+medians; quick aggregate sums the five fixture medians. Table allocation and
+clearing are outside timing. Each timed run asserts identical full results and
+statistics. No historical matrix, arena, WPR, assembly, or NNUE work was rerun.
+
+V0.7 defaults: VCF 11 plies / 2,000 nodes; VCT 9 plies / 4,000 inspections;
+16 MiB VCT table request, 12 MiB allocated (262,144 x 48-byte entries).
+Separate embedded tactical metadata is 512 KiB; hot patterns remain 128 KiB.
+
+| Workload | Nominal / completed / seldepth | Best / score | AB nodes / qnodes | VCF nodes | VCT nodes / hits / proven / exhausted | V0.6 ms | V0.7 ms |
+|---|---|---|---:|---:|---:|---:|---:|
+| Quick aggregate (five fixtures) | 4 / varies / varies | All best/score unchanged | 16,383 / 10,932 | 11 | 805 / 32 / 1 / 0 | 13.604 | 6.701 |
+| opening | 6 / 6 / 10 | 129 / 19,180 | 123,374 / 75,116 | 0 | 330 / 13 / 0 / 0 | 52.231 | 52.195 |
+| forced_defense | 6 / 6 / 10 | 112 / -243,380 | 189,211 / 140,782 | 0 | 0 / 0 / 0 / 0 | 84.013 | 81.908 |
+| vcf_win | 4 / 0 / 5 | 111 / 99,999,995 | 0 / 0 | 19 | 0 / 0 / 0 / 0 | 0.015 | 0.013 |
+| vct_win | 4 / 0 / 5 | 112 / 99,999,995 | 0 / 0 | 0 | 915 / 31 / 1 / 0 | n/a | 0.242 |
+| non_vct_tactical | 4 / 4 / 6 | 95 / 21,120 | 15,397 / 11,031 | 0 | 330 / 13 / 0 / 0 | n/a | 5.403 |
+
+Quick improves 50.7% because balanced_midgame now returns a complete five-ply VCT
+proof, preserving its best move/score while replacing 16,080 Alpha-Beta nodes.
+Opening depth six is effectively unchanged (-0.1%); forced defense improves 2.5%
+with 639 fewer nodes. No ordinary quiet workload regresses by 15-20%, so profiling
+was unnecessary. Sub-millisecond proof timings are noisy; node counts are the
+reproducible evidence. VCF parity removes impossible-depth work: vcf_win visits
+19 instead of 35 nodes. No VCF table micro-optimization was performed.
+
+| Quick fixture | Best / score | Completed / seldepth | V0.6 ms | V0.7 ms |
+|---|---|---|---:|---:|
+| opening | 96 / 780 | 4 / 7 | 3.701 | 3.943 |
+| balanced_midgame | 142 / 99,999,995 | 0 / 5 | 7.447 | 0.123 |
+| tactical_attack | 107 / 99,999,999 | 0 / 1 | 0.013 | 0.009 |
+| forced_defense | 112 / -243,120 | 4 / 8 | 2.421 | 2.616 |
+| transposition_rich | 96 / 99,999,997 | 0 / 3 | 0.022 | 0.010 |
+
+The new proven fixture uses indices `[110,0,111,14,82,210,97,224]`.
+Move 112 makes a DoubleThree; every relevant defense loses, and the canonical
+PV legally reaches a Black win in five plies. The non-proven fixture is
+`[110,0,111,224]`: OpenThree candidates exist but a direct defense defeats each
+bounded attempt. It returns NoProof and completes normal depth four.
+Empty/no-OpenThree roots spend zero VCT nodes. The opening fixture does have
+OpenThree candidates; its complete bounded refutation costs 330 inspections.
+
+AB nodes/qnodes exclude both tactical solvers. VCT inspections include child
+initialization, cache hits, and canonical reconstruction work under the same
+budget. Only fixed immediate prefixes and final PV copying are uncharged.
+VCF retains its bounded, uncharged nonbranching replay. Counts are not claims
+about total CPU operations. Warm public proof caches cannot change budget
+outcomes because each public search advances both tactical generations.
+
+Reproduction (the six workloads executed for this milestone):
+
+```powershell
+cargo run --release -p rustmoku-engine --example search_bench -- --suite quick --repeats 3
+cargo run --release -p rustmoku-engine --example search_bench -- --depth 6 --fixture opening --repeats 3
+cargo run --release -p rustmoku-engine --example search_bench -- --depth 6 --fixture forced_defense --repeats 3
+cargo run --release -p rustmoku-engine --example search_bench -- --fixture vcf_win --repeats 3
+cargo run --release -p rustmoku-engine --example search_bench -- --fixture vct_win --repeats 3
+cargo run --release -p rustmoku-engine --example search_bench -- --fixture non_vct_tactical --repeats 3
+```
+
+
+Validation completed successfully from the workspace root:
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all -- --check` | Passed |
+| `cargo check --workspace --all-targets` | Passed |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | Passed, no warnings |
+| `cargo test --workspace --all-features` | Passed: 128 tests (14 Core, 99 engine unit, 15 engine integration) |
+| `cargo test --release -p rustmoku-engine` | Passed: 114 tests |
+| `cargo build --release -p rustmoku-native` | Passed |
+
+The 14 new focused tests cover directional LMR/TT evidence, VCF parity and wider
+proof-cache reuse, exhaustive metadata generation, response omission audits,
+external Four counter-threats, AND refutations, threat-context isolation,
+DFPN thresholds, interruption during search/certification, a shallow all-legal
+minimax oracle, min/max distance, canonical ties, terminal PV replay, exact board
+restoration, and public root integration. Existing tests remain in the suite.

@@ -18,7 +18,7 @@ fn main() -> eframe::Result {
     };
 
     eframe::run_native(
-        "RustMoku V0.6",
+        "RustMoku V0.7",
         options,
         Box::new(|_creation_context| Ok(Box::new(RustMokuApp::default()))),
     )
@@ -109,7 +109,7 @@ impl RustMokuApp {
     }
 
     fn controls(&mut self, ui: &mut egui::Ui) {
-        ui.heading("RustMoku V0.6");
+        ui.heading("RustMoku V0.7");
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             ui.label("Play as:");
@@ -131,7 +131,11 @@ impl RustMokuApp {
         });
         if let Some(search) = &self.last_search {
             if let Some(proof) = search.tactical_proof {
-                ui.strong(format!("VCF proven, {} plies", proof.plies));
+                let kind = match proof.kind {
+                    rustmoku_engine::TacticalProofKind::Vcf => "VCF",
+                    rustmoku_engine::TacticalProofKind::Vct => "VCT",
+                };
+                ui.strong(format!("{kind} proven, {} plies", proof.plies));
             }
             ui.label(format!(
                 "AI search: depth {}/{}  |  seldepth {}  |  nodes {} (q {})  |  score {}",

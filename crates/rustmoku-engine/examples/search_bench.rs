@@ -72,6 +72,18 @@ const VCF_WIN: &[(usize, usize)] = &[
 ];
 const NON_VCF_TACTICAL: &[(usize, usize)] = &[(7, 3), (7, 2), (7, 4), (0, 0), (7, 5), (0, 2)];
 
+const VCT_WIN: &[(usize, usize)] = &[
+    (7, 5),
+    (0, 0),
+    (7, 6),
+    (0, 14),
+    (5, 7),
+    (14, 0),
+    (6, 7),
+    (14, 14),
+];
+const NON_VCT_TACTICAL: &[(usize, usize)] = &[(7, 5), (0, 0), (7, 6), (14, 14)];
+
 struct Fixture {
     name: &'static str,
     moves: &'static [(usize, usize)],
@@ -86,6 +98,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut fixture_filter = None;
     let mut vcf_plies = EngineConfig::DEFAULT_VCF_MAX_PLIES;
     let mut vcf_nodes = EngineConfig::DEFAULT_VCF_MAX_NODES;
+    let mut vct = EngineConfig::default().tactical().vct;
+    let mut vct_memory = EngineConfig::default().tactical().vct_table_memory_mib;
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -108,6 +122,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             "--repeats" => repeats = args.next().ok_or("missing repeats")?.parse::<usize>()?,
             "--vcf-plies" => vcf_plies = args.next().ok_or("missing VCF plies")?.parse()?,
             "--vcf-nodes" => vcf_nodes = args.next().ok_or("missing VCF nodes")?.parse()?,
+            "--vct-plies" => vct.max_plies = args.next().ok_or("missing VCT plies")?.parse()?,
+            "--vct-nodes" => vct.max_nodes = args.next().ok_or("missing VCT nodes")?.parse()?,
+            "--vct-mib" => vct_memory = args.next().ok_or("missing VCT MiB")?.parse()?,
             "--fixture" => fixture_filter = Some(args.next().ok_or("missing fixture")?),
             _ => return Err(format!("unknown argument: {arg}").into()),
         }
@@ -145,6 +162,16 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let proof_fixtures = [
         Fixture {
+            name: "vct_win",
+            moves: VCT_WIN,
+            depth,
+        },
+        Fixture {
+            name: "non_vct_tactical",
+            moves: NON_VCT_TACTICAL,
+            depth,
+        },
+        Fixture {
             name: "vcf_win",
             moves: VCF_WIN,
             depth,
@@ -155,7 +182,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             depth,
         },
     ];
-    let config = EngineConfig::new(memory_mib).with_vcf_limits(vcf_plies, vcf_nodes);
+    let config = EngineConfig::new(memory_mib)
+        .with_vcf_limits(vcf_plies, vcf_nodes)
+        .with_vct_limits(vct.max_plies, vct.max_nodes)
+        .with_vct_table_memory(vct_memory);
     if fixture_filter.as_ref().is_some_and(|name| {
         !fixtures
             .iter()
@@ -165,7 +195,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Err("unknown fixture".into());
     }
     println!(
-        "fixture,evaluator,tt_mib,repeats,requested_depth,completed_depth,seldepth,best_index,score,nodes,qnodes,pvs_researches,lmr_reductions,lmr_researches,aspiration_fail_low,aspiration_fail_high,static_evaluations,tt_probes,tt_hits,tt_cutoffs,tt_stores,tt_replacements,vcf_nodes,vcf_cache_hits,vcf_probes,vcf_proven,vcf_budget_exhausted,capacity_bytes,buckets,entries,hashfull_per_mille,median_ms,nps"
+        "fixture,evaluator,tt_mib,repeats,requested_depth,completed_depth,seldepth,best_index,score,nodes,qnodes,pvs_researches,lmr_reductions,lmr_researches,aspiration_fail_low,aspiration_fail_high,static_evaluations,tt_probes,tt_hits,tt_cutoffs,tt_stores,tt_replacements,vcf_nodes,vcf_cache_hits,vcf_probes,vcf_proven,vcf_budget_exhausted,vct_nodes,vct_cache_hits,vct_proven,vct_budget_exhausted,capacity_bytes,buckets,entries,hashfull_per_mille,median_ms,nps"
     );
     for fixture in fixtures.iter().chain(&proof_fixtures) {
         if fixture_filter.is_none() && proof_fixtures.iter().any(|f| f.name == fixture.name) {
@@ -216,7 +246,7 @@ fn benchmark<E: Evaluator>(
     let tt = engine.transposition_table_statistics(); // Sampling outside timed region.
     let nps = stats.nodes as f64 / elapsed.as_secs_f64();
     println!(
-        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:.3},{:.0}",
+        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:.3},{:.0}",
         fixture.name,
         name,
         memory_mib,
@@ -246,6 +276,10 @@ fn benchmark<E: Evaluator>(
         stats.vcf_probes,
         stats.vcf_proven,
         stats.vcf_budget_exhausted,
+        stats.vct_nodes,
+        stats.vct_cache_hits,
+        stats.vct_proven,
+        stats.vct_budget_exhausted,
         tt.capacity_bytes,
         tt.bucket_count,
         tt.entry_count,

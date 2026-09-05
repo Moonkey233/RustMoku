@@ -11,6 +11,7 @@ use crate::{
     tactical::{forcing_moves, immediate_tactic},
     transposition_table::{Bound, TranspositionTable, TranspositionTableStatistics, TtEntry},
     vcf::{VcfSolver, VcfStatus},
+    vct::{VctSolver, VctStatus},
 };
 
 const ASPIRATION_DELTA: i32 = 10_000;
@@ -38,7 +39,7 @@ impl Default for SearchLimits {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SearchStatistics {
-    /// Alpha-Beta nodes, including qnodes and re-search work; VCF is separate.
+    /// Alpha-Beta nodes, including qnodes and re-search work; proofs are separate.
     pub nodes: u64,
     pub qnodes: u64,
     pub pvs_researches: u64,
@@ -59,17 +60,22 @@ pub struct SearchStatistics {
     pub vcf_probes: u64,
     pub vcf_proven: u64,
     pub vcf_budget_exhausted: u64,
+    pub vct_nodes: u64,
+    pub vct_cache_hits: u64,
+    pub vct_proven: u64,
+    pub vct_budget_exhausted: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TacticalProofKind {
     Vcf,
+    Vct,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TacticalProof {
     pub kind: TacticalProofKind,
-    /// Exact shortest terminal distance within the continuous-four definition.
+    /// Exact shortest terminal distance within the selected forcing vocabulary.
     pub plies: u8,
 }
 
@@ -95,6 +101,7 @@ pub struct AlphaBetaEngine<E = PatternEvaluator> {
     generation: u8,
     config: EngineConfig,
     vcf: VcfSolver,
+    vct: VctSolver,
 }
 
 impl<E> AlphaBetaEngine<E> {
@@ -111,6 +118,7 @@ impl<E> AlphaBetaEngine<E> {
             generation: 0,
             config,
             vcf: VcfSolver::new(),
+            vct: VctSolver::new(config.tactical().vct_table_memory_mib),
         }
     }
 
@@ -146,6 +154,7 @@ impl<E: Evaluator> SearchEngine for AlphaBetaEngine<E> {
     fn search(&mut self, position: &Position, limits: SearchLimits) -> SearchResult {
         self.begin_search_generation();
         self.vcf.begin_search(self.config.vcf_max_nodes());
+        self.vct.begin_search(self.config.tactical().vct.max_nodes);
         let mut state = SearchState::new(position, &self.evaluator);
         let mut statistics = SearchStatistics::default();
         let mut seldepth = 0;
@@ -174,6 +183,20 @@ impl<E: Evaluator> SearchEngine for AlphaBetaEngine<E> {
         }
 
         let side = state.position().side_to_move();
+        if let Some((at, score)) =
+            immediate_tactic(state.patterns(), side).resolve(0, &mut pv, &mut seldepth)
+        {
+            statistics.nodes = 1;
+            return search_result(
+                Some(at),
+                score,
+                limits,
+                0,
+                seldepth,
+                pv.root_line().to_vec(),
+                statistics,
+            );
+        }
         if self.config.vcf_max_plies() != 0
             && self.config.vcf_max_nodes() != 0
             && !forcing_moves(state.patterns(), side).is_empty()
@@ -197,6 +220,32 @@ impl<E: Evaluator> SearchEngine for AlphaBetaEngine<E> {
                 );
                 result.tactical_proof = Some(TacticalProof {
                     kind: TacticalProofKind::Vcf,
+                    plies,
+                });
+                return result;
+            }
+        }
+
+        let vct_limits = self.config.tactical().vct;
+        if vct_limits.enabled() && !crate::vct::attacks(state.patterns(), side).is_empty() {
+            let proof = state.prove_vct(&mut self.vct, side, vct_limits.max_plies);
+            let vct = self.vct.statistics();
+            statistics.vct_nodes = vct.nodes;
+            statistics.vct_cache_hits = vct.cache_hits;
+            statistics.vct_proven = vct.proven;
+            statistics.vct_budget_exhausted = vct.budget_exhausted;
+            if let VctStatus::ProvenWin { plies } = proof.status {
+                let mut result = search_result(
+                    proof.principal_variation.first().copied(),
+                    MATE_SCORE - i32::from(plies),
+                    limits,
+                    0,
+                    plies,
+                    proof.principal_variation,
+                    statistics,
+                );
+                result.tactical_proof = Some(TacticalProof {
+                    kind: TacticalProofKind::Vct,
                     plies,
                 });
                 return result;
@@ -293,7 +342,10 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
             };
         }
         let forced_block = tactic.forced_block();
-        let mut completeness = Completeness::Complete;
+        let mut validity = BoundValidity {
+            lower: false,
+            upper: true,
+        };
 
         let original_alpha = alpha;
         resources.statistics.tt_probes += 1;
@@ -353,7 +405,7 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
                     resources,
                 );
             }
-            completeness = completeness.combine(result.completeness);
+            validity.include(result.validity, result.score, best_score);
             let score = result.score;
             state.unmake_move(undo, &self.evaluator);
             if score > best_score
@@ -365,6 +417,8 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
             }
             alpha = alpha.max(score);
             if alpha >= beta {
+                // Unsearched siblings prevent an upper bound at this node.
+                validity.upper = false;
                 resources.statistics.beta_cutoffs += 1;
                 resources
                     .heuristics
@@ -375,7 +429,7 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
         if best_move.is_none() {
             best_score = 0;
         }
-        if completeness == Completeness::Complete {
+        if validity.supports(classify_bound(best_score, original_alpha, beta)) {
             self.store_tt(
                 TtStore {
                     key: state.key().value(),
@@ -405,7 +459,11 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
     ) -> NodeResult {
         // Qsearch owns leaf counting and never probes/stores ordinary TT scores.
         if depth == 0 {
-            return NodeResult::complete(self.qsearch(state, alpha, beta, ply, 0, resources));
+            return NodeResult::verified(
+                self.qsearch(state, alpha, beta, ply, 0, resources),
+                alpha,
+                beta,
+            );
         }
         resources.statistics.nodes += 1;
         *resources.seldepth = (*resources.seldepth).max(ply);
@@ -418,12 +476,15 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
             return NodeResult::complete(score);
         }
         let forced_block = tactic.forced_block();
-        let mut completeness = Completeness::Complete;
+        let mut validity = BoundValidity {
+            lower: false,
+            upper: true,
+        };
         let original_alpha = alpha;
         let scout_node = beta == alpha + 1;
         let probe = self.probe_tt(state, depth, alpha, beta, ply, resources.statistics);
         if let Some(score) = probe.cutoff_score {
-            return NodeResult::complete(score);
+            return NodeResult::verified(score, alpha, beta);
         }
         let side = state.position().side_to_move();
         let mut moves = if let Some(at) = forced_block {
@@ -474,7 +535,10 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
                     resources,
                 );
                 if reduced.score <= alpha {
-                    completeness = Completeness::Selective;
+                    validity.upper = false;
+                    if reduced.score > best_score {
+                        validity.lower = false;
+                    }
                     // Heuristic fail-low, not a proof at nominal depth. It
                     // cannot improve alpha/PV or create a nominal TT bound.
                     state.unmake_move(undo, &self.evaluator);
@@ -496,7 +560,7 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
             } else {
                 result = -self.negamax::<PVS>(state, depth - 1, -beta, -alpha, ply + 1, resources);
             }
-            completeness = completeness.combine(result.completeness);
+            validity.include(result.validity, result.score, best_score);
             let score = result.score;
             state.unmake_move(undo, &self.evaluator);
             if score > best_score {
@@ -506,6 +570,8 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
             }
             alpha = alpha.max(score);
             if alpha >= beta {
+                // Unsearched siblings prevent an upper bound at this node.
+                validity.upper = false;
                 resources.statistics.beta_cutoffs += 1;
                 resources
                     .heuristics
@@ -513,9 +579,9 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
                 break;
             }
         }
-        // Only results still affected by an unverified reduced child propagate
-        // incompleteness. A nominal retry replaces the discarded reduced result.
-        if completeness == Completeness::Complete {
+        // Each bound uses only its relevant evidence. Earlier selective fail-lows
+        // cannot invalidate a later verified nominal-depth cutoff child.
+        if validity.supports(classify_bound(best_score, original_alpha, beta)) {
             self.store_tt(
                 TtStore {
                     key: state.key().value(),
@@ -530,7 +596,7 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
         }
         NodeResult {
             score: best_score,
-            completeness,
+            validity,
         }
     }
 
@@ -654,19 +720,36 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
     }
 }
 
-/// Completeness of the returned nominal-depth result, never derived from metrics.
+/// Which directions of the returned nominal-depth score are verified. Negamax
+/// swaps these directions; a cutoff needs only one child's lower bound, whereas
+/// an upper bound needs every relevant child's upper bound.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Completeness {
-    Complete,
-    Selective,
+struct BoundValidity {
+    lower: bool,
+    upper: bool,
 }
 
-impl Completeness {
-    fn combine(self, child: Self) -> Self {
-        if self == Self::Complete && child == Self::Complete {
-            Self::Complete
-        } else {
-            Self::Selective
+impl BoundValidity {
+    const VERIFIED: Self = Self {
+        lower: true,
+        upper: true,
+    };
+
+    fn include(&mut self, child: Self, score: i32, best_score: i32) {
+        self.upper &= child.upper;
+        if score > best_score {
+            self.lower = child.lower;
+        } else if score == best_score {
+            self.lower |= child.lower;
+        }
+    }
+
+    fn supports(self, bound: Bound) -> bool {
+        match bound {
+            Bound::Lower => self.lower,
+            Bound::Upper => self.upper,
+            Bound::Exact => self.lower && self.upper,
+            Bound::Empty => false,
         }
     }
 }
@@ -674,14 +757,25 @@ impl Completeness {
 #[derive(Clone, Copy, Debug)]
 struct NodeResult {
     score: i32,
-    completeness: Completeness,
+    validity: BoundValidity,
 }
 
 impl NodeResult {
+    fn verified(score: i32, alpha: i32, beta: i32) -> Self {
+        let bound = classify_bound(score, alpha, beta);
+        Self {
+            score,
+            validity: BoundValidity {
+                lower: bound != Bound::Upper,
+                upper: bound != Bound::Lower,
+            },
+        }
+    }
+
     fn complete(score: i32) -> Self {
         Self {
             score,
-            completeness: Completeness::Complete,
+            validity: BoundValidity::VERIFIED,
         }
     }
 }
@@ -691,7 +785,10 @@ impl std::ops::Neg for NodeResult {
     fn neg(self) -> Self {
         Self {
             score: -self.score,
-            completeness: self.completeness,
+            validity: BoundValidity {
+                lower: self.validity.upper,
+                upper: self.validity.lower,
+            },
         }
     }
 }
@@ -1327,7 +1424,7 @@ mod tests {
         let result = engine.search(&position, SearchLimits::new(4));
         assert_eq!((result.best_move, result.score), (Some(pv[0]), score));
         assert_eq!(result.principal_variation, pv);
-        assert_eq!((result.statistics.nodes, result.statistics.qnodes), (4, 0));
+        assert_eq!((result.statistics.nodes, result.statistics.qnodes), (1, 0));
         let mut state = SearchState::new(&position, &crate::PatternEvaluator);
         let mut statistics = SearchStatistics::default();
         let mut line = crate::principal_variation::PvTable::new();
@@ -1423,7 +1520,7 @@ mod tests {
             },
         );
         assert_eq!(score.score, -100);
-        assert_eq!(score.completeness, super::Completeness::Complete);
+        assert!(score.validity.upper);
         assert!(statistics.lmr_reductions > 0);
         assert_eq!(statistics.lmr_researches, statistics.lmr_reductions);
         assert!(
@@ -1565,7 +1662,7 @@ mod tests {
             };
             let result = engine.negamax::<true>(&mut state, 3, 0, 1, 0, &mut resources);
             assert_eq!(result.score, 0);
-            assert_eq!(result.completeness, super::Completeness::Selective);
+            assert!(!result.validity.upper);
             assert!(resources.statistics.lmr_reductions > initial_counter);
             assert_eq!(resources.statistics.lmr_researches, 0);
             assert!(engine.table.probe(state.key().value()).is_none());
@@ -1573,6 +1670,94 @@ mod tests {
             engine.search_root::<true>(&mut state, 4, -1, 0, &mut resources);
             assert!(engine.table.probe(state.key().value()).is_none());
             state.assert_consistent(&ZeroEvaluator);
+        }
+    }
+
+    #[test]
+    fn nominal_cutoff_after_selective_siblings_stores_only_valid_lower_bound() {
+        // A scout equality supplies only an upper bound and must not repair
+        // missing lower evidence for an exact result.
+        let mut missing_lower = super::BoundValidity {
+            lower: false,
+            upper: true,
+        };
+        let scout = super::NodeResult::verified(10, 10, 11);
+        missing_lower.include(scout.validity, 10, 10);
+        assert!(!missing_lower.supports(Bound::Exact));
+        use rustmoku_core::Stone;
+        struct LateEvaluator(Move);
+        impl Evaluator for LateEvaluator {
+            type State = ();
+            type Undo = ();
+            fn initialize(&self, _: &Position) {}
+            fn make_move(&self, _: &mut (), _: Move, _: Stone) {}
+            fn unmake_move(&self, _: &mut (), _: ()) {}
+            fn evaluate(&self, p: &Position, _: &crate::PatternState, _: &()) -> i32 {
+                if p.move_count() == 3 && p.cell(self.0) == Some(Stone::White) {
+                    10
+                } else {
+                    0
+                }
+            }
+        }
+        let position = fixture(&[112]);
+        let patterns = crate::PatternState::new(&position);
+        let mut moves = crate::move_generation::generate_candidates(&position);
+        crate::move_ordering::order_moves(
+            Stone::White,
+            &patterns,
+            &mut moves,
+            None,
+            &crate::search_heuristics::SearchHeuristics::default(),
+            0,
+        );
+        let late = moves.as_slice()[12];
+        for initial_counter in [0, 50_000] {
+            let mut engine =
+                AlphaBetaEngine::with_config(LateEvaluator(late), EngineConfig::new(1));
+            let mut state = SearchState::new(&position, &engine.evaluator);
+            let undo = state.make_move(late, &engine.evaluator).unwrap();
+            engine.table.store(TtEntry::new(
+                state.key().value(),
+                -10,
+                None,
+                2,
+                Bound::Exact,
+                0,
+            ));
+            state.unmake_move(undo, &engine.evaluator);
+            let mut statistics = SearchStatistics {
+                lmr_reductions: initial_counter,
+                ..SearchStatistics::default()
+            };
+            let mut pv = crate::principal_variation::PvTable::new();
+            let mut seldepth = 0;
+            let result = engine.negamax::<true>(
+                &mut state,
+                3,
+                0,
+                1,
+                0,
+                &mut super::SearchResources {
+                    seldepth: &mut seldepth,
+                    pv: &mut pv,
+                    statistics: &mut statistics,
+                    heuristics: crate::search_heuristics::SearchHeuristics::default(),
+                },
+            );
+            assert_eq!(result.score, 10);
+            assert!(statistics.lmr_reductions - initial_counter > statistics.lmr_researches);
+            assert!(result.validity.lower && !result.validity.upper);
+            assert!(!result.validity.supports(Bound::Exact));
+            let cached = engine.table.probe(state.key().value()).unwrap();
+            assert_eq!(
+                (cached.depth, cached.bound, cached.score),
+                (3, Bound::Lower, 10)
+            );
+            let negated = -result;
+            assert!(negated.validity.upper && !negated.validity.lower);
+            assert_eq!(state.position(), &position);
+            state.assert_consistent(&engine.evaluator);
         }
     }
 }

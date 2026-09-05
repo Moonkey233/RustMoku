@@ -62,6 +62,10 @@ impl PatternState {
         self.profiles[at.index()][stone_index(stone)]
     }
 
+    pub(crate) fn line_keys(&self, at: Move) -> [LineKey; 4] {
+        self.lines[at.index()]
+    }
+
     pub(crate) const fn counts(&self) -> &[[u16; ThreatProfile::COUNT]; 2] {
         &self.counts
     }

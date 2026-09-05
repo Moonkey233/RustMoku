@@ -57,6 +57,15 @@ impl<E: Evaluator> SearchState<E> {
         solver.solve(&mut self.board, attacker, max_plies)
     }
 
+    pub(crate) fn prove_vct(
+        &mut self,
+        solver: &mut crate::vct::VctSolver,
+        attacker: Stone,
+        max_plies: u8,
+    ) -> crate::vct::VctResult {
+        solver.solve(&mut self.board, attacker, max_plies)
+    }
+
     pub(crate) fn make_move(
         &mut self,
         at: Move,

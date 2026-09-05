@@ -72,7 +72,15 @@ impl VcfSolver {
         let mut status = VcfStatus::NotProven;
         // Increasing terminal distance, then ascending attacks: a longer line
         // can never hide a shorter proof or win an equal-distance root tie.
-        for depth in 0..=max_plies {
+        let terminal = board.position().winner().is_some() || board.position().is_full();
+        let first = if terminal {
+            0
+        } else if board.position().side_to_move() == attacker {
+            1
+        } else {
+            2
+        };
+        for depth in (first..=max_plies).step_by(2) {
             status = self.visit(board, attacker, depth, 0, &mut pv);
             if status != VcfStatus::NotProven {
                 break;
@@ -119,7 +127,7 @@ impl VcfSolver {
                     self.statistics.cache_hits += 1;
                     return VcfStatus::NotProven;
                 }
-                CachedProof::ProvenWin { plies } if entry.depth == depth && plies <= depth => {
+                CachedProof::ProvenWin { plies } if plies <= depth => {
                     // A collision may have evicted descendants. Never return a
                     // partial certificate: missing links fall back to search.
                     if self.replay(board, attacker, depth, ply, pv) == Some(plies) {
@@ -220,7 +228,7 @@ impl VcfSolver {
         let CachedProof::ProvenWin { plies } = entry.proof else {
             return None;
         };
-        if entry.depth != depth || plies > depth {
+        if plies > depth {
             return None;
         }
         let at = entry
@@ -391,6 +399,54 @@ mod tests {
     }
 
     #[test]
+    fn parity_skips_impossible_depths_and_proven_cache_accepts_larger_caps() {
+        let position = fixture(CHAIN);
+        let mut board = BoardState::new(&position);
+        let mut solver = VcfSolver::new();
+        solver.begin_search(10_000);
+        let proof = solver.solve(&mut board, Stone::Black, 5);
+        verify(&position, &proof, 5, 111);
+        let before = solver.statistics();
+        let mut pv = PvTable::new();
+        assert_eq!(
+            solver.visit(&mut board, Stone::Black, 9, 0, &mut pv),
+            VcfStatus::ProvenWin { plies: 5 }
+        );
+        assert_eq!(solver.statistics().nodes - before.nodes, 1);
+        assert_eq!(solver.statistics().cache_hits - before.cache_hits, 1);
+        assert_eq!(pv.root_line(), proof.principal_variation);
+        // A depth-zero nonterminal solve and an odd defender cap do no work.
+        solver.begin_search(10_000);
+        assert_eq!(
+            solver.solve(&mut board, Stone::Black, 0).status,
+            VcfStatus::NotProven
+        );
+        assert_eq!(solver.statistics().nodes, 0);
+        let undo = board.make_move(at(111)).unwrap();
+        assert_eq!(
+            solver.solve(&mut board, Stone::Black, 1).status,
+            VcfStatus::NotProven
+        );
+        assert_eq!(solver.statistics().nodes, 0);
+        let result = solver.solve(&mut board, Stone::Black, 4);
+        assert_eq!(result.status, VcfStatus::ProvenWin { plies: 4 });
+        let defender_nodes = solver.statistics().nodes;
+        solver.begin_search(10_000);
+        let mut manual = PvTable::new();
+        assert_eq!(
+            solver.visit(&mut board, Stone::Black, 2, 0, &mut manual),
+            VcfStatus::NotProven
+        );
+        assert_eq!(
+            solver.visit(&mut board, Stone::Black, 4, 0, &mut manual),
+            VcfStatus::ProvenWin { plies: 4 }
+        );
+        assert_eq!(solver.statistics().nodes, defender_nodes);
+        board.unmake_move(undo);
+        assert_eq!(board, BoardState::new(&position));
+    }
+
+    #[test]
     fn open_four_and_double_four_use_distinct_winning_cells_and_canonical_ties() {
         for (position, best) in [
             (fixture(&[110, 0, 111, 2, 112, 4]), 109),
@@ -462,8 +518,7 @@ mod tests {
         );
         assert_eq!(solver.statistics().nodes, 1);
         assert_eq!(solver.statistics().budget_exhausted, 1);
-        let entry = solver.table.probe(key).unwrap();
-        assert_eq!((entry.depth, entry.proof), (0, CachedProof::NotProven));
+        assert!(solver.table.probe(key).is_none());
         // Test-only replenishment keeps this generation to detect a poisoned
         // negative entry. Production budgets only reset at begin_search.
         solver.remaining_nodes = 10_000;
@@ -541,7 +596,7 @@ mod tests {
         for (depth, nodes, expected) in [
             (11, 10_000, VcfStatus::ProvenWin { plies: 5 }),
             (4, 10_000, VcfStatus::NotProven),
-            (11, 15, VcfStatus::BudgetExceeded),
+            (11, 1, VcfStatus::BudgetExceeded),
         ] {
             let mut solver = VcfSolver::new();
             solver.begin_search(nodes);

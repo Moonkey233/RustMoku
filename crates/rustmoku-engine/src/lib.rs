@@ -10,6 +10,8 @@ mod board_state;
 mod candidate_frontier;
 mod config;
 mod evaluation;
+#[cfg(test)]
+mod line_classifier;
 mod line_geometry;
 mod move_generation;
 mod move_ordering;
@@ -24,9 +26,10 @@ mod search_state;
 mod tactical;
 mod transposition_table;
 mod vcf;
+mod vct;
 mod zobrist;
 
-pub use config::EngineConfig;
+pub use config::{EngineConfig, ProofLimits, TacticalConfig};
 pub use evaluation::{ClassicalEvaluator, Evaluator, PatternEvaluator};
 pub use pattern_state::PatternState;
 pub use search::{

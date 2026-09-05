@@ -51,6 +51,10 @@ impl BitBoard256 {
         self.0 == [0; 4]
     }
 
+    pub(crate) const fn words(self) -> [u64; 4] {
+        self.0
+    }
+
     pub(crate) fn iter(self) -> SetBits {
         SetBits {
             bits: self,

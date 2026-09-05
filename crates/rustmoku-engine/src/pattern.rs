@@ -193,12 +193,9 @@ const fn profile_table() -> [ThreatProfile; 4096] {
 }
 
 #[cfg(test)]
-#[path = "line_classifier.rs"]
-mod line_classifier;
-
-#[cfg(test)]
 mod tests {
     use super::*;
+    use crate::line_classifier;
     use DirectionalThreat::{Five, Four, OpenFour, OpenThree, Quiet, Three};
 
     fn key(line: &str) -> LineKey {

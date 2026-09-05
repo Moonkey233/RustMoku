@@ -20,11 +20,16 @@ are plans, not implemented capabilities or permission to expand a current task.
 - Gated root integration, proof metadata, legal terminal PV, native proof display.
 - Focused correctness tests and the lean fixed-position performance check.
 
-## V0.7: VCT / Threat-Space / DFPN
+## V0.7: Exact VCT / Threat-Space / DFPN (implemented)
 
-- Extend independent tactical solving beyond continuous fours.
-- Specify threat/defense semantics and proof validity before selective shortcuts.
-- Evaluate VCT, threat-space reasoning, and DFPN against concrete fixtures.
+- Bound-aware LMR/TT validity; parity-aware VCF and validated wider-depth reuse.
+- Private threat descriptors with simulated continuation, cost, and dependency masks.
+- Separate build-generated tactical metadata; the normal pattern table stays two bytes.
+- Exact defender obligations, Four+ counter-threats, and all-legal omission audits.
+- Bounded saturating DFPN with a dedicated context/depth/generation-sensitive table.
+- Shortest attack / longest defense distance reconstruction and canonical terminal PV.
+- Grouped proof configuration; gated root integration after immediate facts and VCF.
+- Shallow independent AND/OR oracle, focused regressions, and six lean benchmarks.
 
 ## V0.8: Search limits / cancellation / SearchInfo / Arena
 
@@ -41,7 +46,7 @@ are plans, not implemented capabilities or permission to expand a current task.
 
 - Advanced selective tuning, with regression, benchmark, and match evidence.
 - NNUE and custom-evaluator API milestone: address the public PatternState debt.
-  PatternUndo is private; the existing Evaluator abstraction stays intact in V0.6.
+  PatternUndo is private; the existing Evaluator abstraction stays intact in V0.7.
   Decide which pattern features an external evaluator should access and whether
   engine tactical state belongs in its public evaluation context.
 - Additional rules and opening protocols, modeled as distinct concepts.
@@ -56,5 +61,5 @@ are plans, not implemented capabilities or permission to expand a current task.
 - Evaluator remains replaceable; board proof nodes do not update learned accumulators.
 - Core owns rules and legal transitions. Search consumes Position; apps are adapters.
 
-V0.6 does not implement V0.7 algorithms, deadlines, cancellation, Arena,
+V0.7 does not implement V0.8 deadlines, cancellation, SearchInfo, Arena,
 multicore search, NNUE, MCTS, new rules/openings, unsafe Rust, or SIMD.
