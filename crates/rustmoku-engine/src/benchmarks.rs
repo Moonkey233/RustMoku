@@ -14,7 +14,7 @@ pub fn run_hotpath(iterations: usize) {
         std::mem::size_of::<crate::bitboard::BitBoard256>(),
         std::mem::size_of::<CandidateFrontier>(),
         std::mem::size_of::<PatternState>(),
-        std::mem::size_of::<crate::PatternUndo>(),
+        std::mem::size_of::<crate::pattern_state::PatternUndo>(),
         std::mem::size_of::<SearchState<PatternEvaluator>>(),
     );
     let mut position = Position::default();

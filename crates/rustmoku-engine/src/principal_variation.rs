@@ -32,7 +32,12 @@ impl PvTable {
     }
 
     pub(crate) fn root_line(&self) -> &[Move] {
-        self.moves[0].split_at(self.lengths[0]).0
+        self.line(0)
+    }
+
+    pub(crate) fn line(&self, ply: u8) -> &[Move] {
+        let row = usize::from(ply);
+        &self.moves[row][..self.lengths[row]]
     }
 }
 

@@ -1,73 +1,60 @@
-use rustmoku_core::{Move, MoveError, MoveUndo, Position, Stone};
+use rustmoku_core::{Move, MoveError, Position, Stone};
 
 use crate::{
-    Evaluator, PatternState, PatternUndo, candidate_frontier::CandidateFrontier,
-    move_generation::MoveList, zobrist::PositionKey,
+    Evaluator, PatternState,
+    board_state::{BoardState, BoardUndo},
+    move_generation::MoveList,
+    vcf::{VcfResult, VcfSolver},
+    zobrist::PositionKey,
 };
 
 pub(crate) struct SearchState<E: Evaluator> {
-    position: Position,
-    key: PositionKey,
-    frontier: CandidateFrontier,
+    board: BoardState,
     evaluator_state: E::State,
-    patterns: PatternState,
 }
 
 pub(crate) struct SearchUndo<U> {
-    evaluator_undo: U,
-    pattern_undo: PatternUndo,
-    position_undo: MoveUndo,
-    played: Move,
-    stone: Stone,
+    board: BoardUndo,
+    evaluator: U,
 }
 
 impl<E: Evaluator> SearchState<E> {
     pub(crate) fn new(position: &Position, evaluator: &E) -> Self {
-        // This is the one intentional Position clone in a public search.
-        let position = position.clone();
-        let key = PositionKey::from_position(&position);
-        let frontier = CandidateFrontier::new(&position);
-        let evaluator_state = evaluator.initialize(&position);
-        let patterns = PatternState::new(&position);
         Self {
-            evaluator_state,
-            patterns,
-            position,
-            key,
-            frontier,
+            board: BoardState::new(position),
+            evaluator_state: evaluator.initialize(position),
         }
     }
 
-    pub(crate) const fn position(&self) -> &Position {
-        &self.position
+    pub(crate) fn position(&self) -> &Position {
+        self.board.position()
     }
-
-    pub(crate) const fn key(&self) -> PositionKey {
-        self.key
+    pub(crate) fn key(&self) -> PositionKey {
+        self.board.key()
     }
-
+    pub(crate) fn patterns(&self) -> &PatternState {
+        self.board.patterns()
+    }
     pub(crate) fn candidates(&self) -> MoveList {
-        if self.position.winner().is_some() || self.position.is_full() {
-            MoveList::new()
-        } else {
-            self.frontier.candidates()
-        }
+        self.board.candidates()
     }
-
     pub(crate) fn candidate_bits(&self) -> crate::bitboard::BitBoard256 {
-        if self.position.winner().is_some() || self.position.is_full() {
-            crate::bitboard::BitBoard256::EMPTY
-        } else {
-            self.frontier.candidate_bits()
-        }
+        self.board.candidate_bits()
     }
 
     pub(crate) fn evaluate(&self, evaluator: &E) -> i32 {
-        evaluator.evaluate(&self.position, &self.patterns, &self.evaluator_state)
+        evaluator.evaluate(self.position(), self.patterns(), &self.evaluator_state)
     }
 
-    pub(crate) fn patterns(&self) -> &PatternState {
-        &self.patterns
+    /// The solver restores the board before returning an owned result. No mutable
+    /// board getter or callback can expose a board/accumulator mismatch.
+    pub(crate) fn prove_vcf(
+        &mut self,
+        solver: &mut VcfSolver,
+        attacker: Stone,
+        max_plies: u8,
+    ) -> VcfResult {
+        solver.solve(&mut self.board, attacker, max_plies)
     }
 
     pub(crate) fn make_move(
@@ -75,29 +62,15 @@ impl<E: Evaluator> SearchState<E> {
         at: Move,
         evaluator: &E,
     ) -> Result<SearchUndo<E::Undo>, MoveError> {
-        let stone = self.position.side_to_move();
-        let position_undo = self.position.make_move(at)?;
-        self.frontier.make_move(at);
-        let evaluator_undo = evaluator.make_move(&mut self.evaluator_state, at, stone);
-        let pattern_undo = self.patterns.make_move(at, stone);
-        self.key = self.key.toggle_move(at, stone);
-        debug_assert_eq!(self.key, PositionKey::from_position(&self.position));
-        Ok(SearchUndo {
-            evaluator_undo,
-            pattern_undo,
-            position_undo,
-            played: at,
-            stone,
-        })
+        let stone = self.position().side_to_move();
+        let board = self.board.make_move(at)?;
+        let evaluator = evaluator.make_move(&mut self.evaluator_state, at, stone);
+        Ok(SearchUndo { board, evaluator })
     }
 
     pub(crate) fn unmake_move(&mut self, undo: SearchUndo<E::Undo>, evaluator: &E) {
-        evaluator.unmake_move(&mut self.evaluator_state, undo.evaluator_undo);
-        self.patterns.unmake_move(undo.pattern_undo);
-        self.position.unmake_move(undo.position_undo);
-        self.frontier.unmake_move(undo.played);
-        self.key = self.key.toggle_move(undo.played, undo.stone);
-        debug_assert_eq!(self.key, PositionKey::from_position(&self.position));
+        evaluator.unmake_move(&mut self.evaluator_state, undo.evaluator);
+        self.board.unmake_move(undo.board);
     }
 
     #[cfg(test)]
@@ -105,20 +78,14 @@ impl<E: Evaluator> SearchState<E> {
     where
         E::State: std::fmt::Debug + PartialEq,
     {
-        assert_eq!(self.key, PositionKey::from_position(&self.position));
-        assert_eq!(self.frontier, CandidateFrontier::new(&self.position));
-        assert_eq!(
-            self.candidates(),
-            crate::move_generation::generate_candidates(&self.position)
-        );
-        assert_eq!(self.patterns(), &PatternState::reference(&self.position));
-        let reference = evaluator.initialize(&self.position);
+        self.board.assert_consistent();
+        let reference = evaluator.initialize(self.position());
         assert_eq!(self.evaluator_state, reference);
         assert_eq!(
             self.evaluate(evaluator),
             evaluator.evaluate(
-                &self.position,
-                &PatternState::reference(&self.position),
+                self.position(),
+                &PatternState::reference(self.position()),
                 &reference
             )
         );

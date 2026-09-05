@@ -4,13 +4,13 @@ use crate::{
     EngineConfig, Evaluator, PatternEvaluator,
     move_generation::MoveList,
     move_ordering::order_moves,
-    pattern::ThreatProfile,
     principal_variation::PvTable,
     score::{MATE_SCORE, MATE_THRESHOLD, SEARCH_INFINITY, score_from_tt, score_to_tt},
     search_heuristics::SearchHeuristics,
     search_state::SearchState,
-    tactical::immediate_tactic,
+    tactical::{forcing_moves, immediate_tactic},
     transposition_table::{Bound, TranspositionTable, TranspositionTableStatistics, TtEntry},
+    vcf::{VcfSolver, VcfStatus},
 };
 
 const ASPIRATION_DELTA: i32 = 10_000;
@@ -38,7 +38,7 @@ impl Default for SearchLimits {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SearchStatistics {
-    /// All visited nodes, including qnodes and re-search work.
+    /// Alpha-Beta nodes, including qnodes and re-search work; VCF is separate.
     pub nodes: u64,
     pub qnodes: u64,
     pub pvs_researches: u64,
@@ -53,6 +53,24 @@ pub struct SearchStatistics {
     pub tt_cutoffs: u64,
     pub tt_stores: u64,
     pub tt_replacements: u64,
+    pub vcf_nodes: u64,
+    pub vcf_cache_hits: u64,
+    /// Gated solver attempts, not proof-table lookups.
+    pub vcf_probes: u64,
+    pub vcf_proven: u64,
+    pub vcf_budget_exhausted: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TacticalProofKind {
+    Vcf,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TacticalProof {
+    pub kind: TacticalProofKind,
+    /// Exact shortest terminal distance within the continuous-four definition.
+    pub plies: u8,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -64,6 +82,7 @@ pub struct SearchResult {
     pub seldepth: u8,
     pub principal_variation: Vec<Move>,
     pub statistics: SearchStatistics,
+    pub tactical_proof: Option<TacticalProof>,
 }
 
 pub trait SearchEngine {
@@ -74,6 +93,8 @@ pub struct AlphaBetaEngine<E = PatternEvaluator> {
     evaluator: E,
     table: TranspositionTable,
     generation: u8,
+    config: EngineConfig,
+    vcf: VcfSolver,
 }
 
 impl<E> AlphaBetaEngine<E> {
@@ -88,6 +109,8 @@ impl<E> AlphaBetaEngine<E> {
             evaluator,
             table: TranspositionTable::new(config.tt_memory_mib()),
             generation: 0,
+            config,
+            vcf: VcfSolver::new(),
         }
     }
 
@@ -122,6 +145,7 @@ impl Default for AlphaBetaEngine<PatternEvaluator> {
 impl<E: Evaluator> SearchEngine for AlphaBetaEngine<E> {
     fn search(&mut self, position: &Position, limits: SearchLimits) -> SearchResult {
         self.begin_search_generation();
+        self.vcf.begin_search(self.config.vcf_max_nodes());
         let mut state = SearchState::new(position, &self.evaluator);
         let mut statistics = SearchStatistics::default();
         let mut seldepth = 0;
@@ -147,6 +171,36 @@ impl<E: Evaluator> SearchEngine for AlphaBetaEngine<E> {
             );
             // A zero nominal depth remains an analysis-only call: no root move.
             return search_result(None, score, limits, 0, seldepth, Vec::new(), statistics);
+        }
+
+        let side = state.position().side_to_move();
+        if self.config.vcf_max_plies() != 0
+            && self.config.vcf_max_nodes() != 0
+            && !forcing_moves(state.patterns(), side).is_empty()
+        {
+            let proof = state.prove_vcf(&mut self.vcf, side, self.config.vcf_max_plies());
+            let vcf = self.vcf.statistics();
+            statistics.vcf_nodes = vcf.nodes;
+            statistics.vcf_cache_hits = vcf.cache_hits;
+            statistics.vcf_probes = vcf.probes;
+            statistics.vcf_proven = vcf.proven;
+            statistics.vcf_budget_exhausted = vcf.budget_exhausted;
+            if let VcfStatus::ProvenWin { plies } = proof.status {
+                let mut result = search_result(
+                    proof.principal_variation.first().copied(),
+                    MATE_SCORE - i32::from(plies),
+                    limits,
+                    0,
+                    plies,
+                    proof.principal_variation,
+                    statistics,
+                );
+                result.tactical_proof = Some(TacticalProof {
+                    kind: TacticalProofKind::Vcf,
+                    plies,
+                });
+                return result;
+            }
         }
 
         let mut completed_depth = 0;
@@ -239,7 +293,7 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
             };
         }
         let forced_block = tactic.forced_block();
-        let reductions_before = resources.statistics.lmr_reductions;
+        let mut completeness = Completeness::Complete;
 
         let original_alpha = alpha;
         resources.statistics.tt_probes += 1;
@@ -272,17 +326,17 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
             let undo = state
                 .make_move(at, &self.evaluator)
                 .expect("frontier moves are legal");
-            let mut score;
+            let mut result;
             if PVS && index != 0 {
-                score = -self.negamax::<PVS>(state, depth - 1, -alpha - 1, -alpha, 1, resources);
-                if score > alpha && score < beta {
+                result = -self.negamax::<PVS>(state, depth - 1, -alpha - 1, -alpha, 1, resources);
+                if result.score > alpha && result.score < beta {
                     resources.statistics.pvs_researches += 1;
-                    score = -self.negamax::<PVS>(state, depth - 1, -beta, -alpha, 1, resources);
+                    result = -self.negamax::<PVS>(state, depth - 1, -beta, -alpha, 1, resources);
                 }
             } else {
-                score = -self.negamax::<PVS>(state, depth - 1, -beta, -alpha, 1, resources);
+                result = -self.negamax::<PVS>(state, depth - 1, -beta, -alpha, 1, resources);
             }
-            if score == best_score
+            if result.score == best_score
                 && best_score > original_alpha
                 && best_score < beta
                 && best_move.is_some_and(|current| at < current)
@@ -290,7 +344,7 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
                 // Equality from a scout can be only an upper bound. A smaller
                 // index replaces the exact incumbent only after resolving it.
                 resources.statistics.pvs_researches += 1;
-                score = -self.negamax::<PVS>(
+                result = -self.negamax::<PVS>(
                     state,
                     depth - 1,
                     -SEARCH_INFINITY,
@@ -299,6 +353,8 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
                     resources,
                 );
             }
+            completeness = completeness.combine(result.completeness);
+            let score = result.score;
             state.unmake_move(undo, &self.evaluator);
             if score > best_score
                 || (score == best_score && best_move.is_none_or(|current| at < current))
@@ -319,7 +375,7 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
         if best_move.is_none() {
             best_score = 0;
         }
-        if resources.statistics.lmr_reductions == reductions_before {
+        if completeness == Completeness::Complete {
             self.store_tt(
                 TtStore {
                     key: state.key().value(),
@@ -346,32 +402,28 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
         beta: i32,
         ply: u8,
         resources: &mut SearchResources<'_>,
-    ) -> i32 {
+    ) -> NodeResult {
         // Qsearch owns leaf counting and never probes/stores ordinary TT scores.
         if depth == 0 {
-            return self.qsearch(state, alpha, beta, ply, 0, resources);
+            return NodeResult::complete(self.qsearch(state, alpha, beta, ply, 0, resources));
         }
         resources.statistics.nodes += 1;
         *resources.seldepth = (*resources.seldepth).max(ply);
         resources.pv.clear(ply);
         if let Some(score) = terminal_score(state.position(), ply) {
-            return score;
+            return NodeResult::complete(score);
         }
         let tactic = immediate_tactic(state.patterns(), state.position().side_to_move());
         if let Some((_, score)) = tactic.resolve(ply, resources.pv, resources.seldepth) {
-            return score;
+            return NodeResult::complete(score);
         }
         let forced_block = tactic.forced_block();
-        let reductions_before = resources.statistics.lmr_reductions;
+        let mut completeness = Completeness::Complete;
         let original_alpha = alpha;
         let scout_node = beta == alpha + 1;
-        let probe = if forced_block.is_some() {
-            TtProbe::default()
-        } else {
-            self.probe_tt(state, depth, alpha, beta, ply, resources.statistics)
-        };
+        let probe = self.probe_tt(state, depth, alpha, beta, ply, resources.statistics);
         if let Some(score) = probe.cutoff_score {
-            return score;
+            return NodeResult::complete(score);
         }
         let side = state.position().side_to_move();
         let mut moves = if let Some(at) = forced_block {
@@ -382,7 +434,7 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
             state.candidates()
         };
         if moves.is_empty() {
-            return 0;
+            return NodeResult::complete(0);
         }
         order_moves(
             side,
@@ -421,28 +473,31 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
                     ply + 1,
                     resources,
                 );
-                if reduced <= alpha {
+                if reduced.score <= alpha {
+                    completeness = Completeness::Selective;
                     // Heuristic fail-low, not a proof at nominal depth. It
                     // cannot improve alpha/PV or create a nominal TT bound.
                     state.unmake_move(undo, &self.evaluator);
-                    best_score = best_score.max(reduced);
+                    best_score = best_score.max(reduced.score);
                     continue;
                 }
                 resources.statistics.lmr_researches += 1;
                 // Improvement must survive the ordinary full-depth PVS path.
             }
-            let mut score;
+            let mut result;
             if PVS && index != 0 {
-                score =
+                result =
                     -self.negamax::<PVS>(state, depth - 1, -alpha - 1, -alpha, ply + 1, resources);
-                if score > alpha && score < beta {
+                if result.score > alpha && result.score < beta {
                     resources.statistics.pvs_researches += 1;
-                    score =
+                    result =
                         -self.negamax::<PVS>(state, depth - 1, -beta, -alpha, ply + 1, resources);
                 }
             } else {
-                score = -self.negamax::<PVS>(state, depth - 1, -beta, -alpha, ply + 1, resources);
+                result = -self.negamax::<PVS>(state, depth - 1, -beta, -alpha, ply + 1, resources);
             }
+            completeness = completeness.combine(result.completeness);
+            let score = result.score;
             state.unmake_move(undo, &self.evaluator);
             if score > best_score {
                 best_score = score;
@@ -458,9 +513,9 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
                 break;
             }
         }
-        // Children at genuinely reduced depths may store their own depth.
-        // Ancestors touched by LMR do not claim an unverified nominal bound.
-        if resources.statistics.lmr_reductions == reductions_before {
+        // Only results still affected by an unverified reduced child propagate
+        // incompleteness. A nominal retry replaces the discarded reduced result.
+        if completeness == Completeness::Complete {
             self.store_tt(
                 TtStore {
                     key: state.key().value(),
@@ -473,7 +528,10 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
                 resources.statistics,
             );
         }
-        best_score
+        NodeResult {
+            score: best_score,
+            completeness,
+        }
     }
 
     fn qsearch(
@@ -526,7 +584,7 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
         // placements are not check, and never remove the stand-pat option.
         let noisy = state
             .candidate_bits()
-            .intersection(patterns.moves_at_least(side, ThreatProfile::Four));
+            .intersection(forcing_moves(patterns, side));
         let mut moves = MoveList::new();
         for at in noisy.iter() {
             moves.push(at);
@@ -593,6 +651,48 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
             statistics.tt_stores += 1;
         }
         statistics.tt_replacements += self.table.replacements() - previous_replacements;
+    }
+}
+
+/// Completeness of the returned nominal-depth result, never derived from metrics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Completeness {
+    Complete,
+    Selective,
+}
+
+impl Completeness {
+    fn combine(self, child: Self) -> Self {
+        if self == Self::Complete && child == Self::Complete {
+            Self::Complete
+        } else {
+            Self::Selective
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct NodeResult {
+    score: i32,
+    completeness: Completeness,
+}
+
+impl NodeResult {
+    fn complete(score: i32) -> Self {
+        Self {
+            score,
+            completeness: Completeness::Complete,
+        }
+    }
+}
+
+impl std::ops::Neg for NodeResult {
+    type Output = Self;
+    fn neg(self) -> Self {
+        Self {
+            score: -self.score,
+            completeness: self.completeness,
+        }
     }
 }
 
@@ -676,6 +776,7 @@ fn search_result(
         best_move,
         score,
         requested_depth: limits.max_depth,
+        tactical_proof: None,
         completed_depth,
         seldepth,
         principal_variation,
@@ -1244,7 +1345,7 @@ mod tests {
                 heuristics: crate::search_heuristics::SearchHeuristics::default(),
             },
         );
-        assert_eq!(distant, -crate::score::MATE_SCORE + 9);
+        assert_eq!(distant.score, -crate::score::MATE_SCORE + 9);
         assert_eq!(statistics.tt_probes, 0);
     }
 
@@ -1321,12 +1422,16 @@ mod tests {
                 heuristics: crate::search_heuristics::SearchHeuristics::default(),
             },
         );
-        assert_eq!(score, -100);
+        assert_eq!(score.score, -100);
+        assert_eq!(score.completeness, super::Completeness::Complete);
         assert!(statistics.lmr_reductions > 0);
         assert_eq!(statistics.lmr_researches, statistics.lmr_reductions);
         assert!(
-            engine.table.probe(state.key().value()).is_none(),
-            "no unverified nominal TT bound"
+            engine
+                .table
+                .probe(state.key().value())
+                .is_some_and(|entry| entry.depth == 3 && entry.bound == Bound::Upper),
+            "all reduced children were nominally verified, so the upper bound is cacheable"
         );
         state.assert_consistent(&HorizonEvaluator);
         assert_eq!(state.position(), &position);
@@ -1384,6 +1489,90 @@ mod tests {
             for at in warm.principal_variation {
                 replay.make_move(at).unwrap();
             }
+        }
+    }
+    #[test]
+    fn forced_block_allows_valid_tt_scores_but_never_an_unrelated_candidate() {
+        let position = fixture(&[107, 108, 0, 109, 2, 110, 15, 111]);
+        for (bound, score, alpha, beta) in [
+            (
+                Bound::Exact,
+                crate::score::MATE_SCORE - 9,
+                -crate::score::SEARCH_INFINITY,
+                crate::score::SEARCH_INFINITY,
+            ),
+            (Bound::Lower, 30, 10, 20),
+            (Bound::Upper, -30, -20, -10),
+        ] {
+            let mut engine = AlphaBetaEngine::with_config(ZeroEvaluator, EngineConfig::new(1));
+            let mut state = SearchState::new(&position, &ZeroEvaluator);
+            let stored = crate::score::score_to_tt(score, 7);
+            engine.table.store(TtEntry::new(
+                state.key().value(),
+                stored,
+                Some(Move::from_index(224).unwrap()),
+                3,
+                bound,
+                0,
+            ));
+            let mut statistics = SearchStatistics::default();
+            let mut pv = crate::principal_variation::PvTable::new();
+            let mut seldepth = 0;
+            let mut resources = super::SearchResources {
+                seldepth: &mut seldepth,
+                pv: &mut pv,
+                statistics: &mut statistics,
+                heuristics: crate::search_heuristics::SearchHeuristics::default(),
+            };
+            let result = engine.negamax::<true>(&mut state, 3, alpha, beta, 4, &mut resources);
+            assert_eq!(result.score, crate::score::score_from_tt(stored, 4));
+            assert_eq!(resources.statistics.tt_cutoffs, 1);
+            assert_eq!(resources.statistics.nodes, 1);
+            // A mismatched depth must search exactly the block; the unrelated
+            // legal hash move cannot escape the single-candidate restriction.
+            resources.statistics.tt_cutoffs = 0;
+            engine.negamax::<true>(
+                &mut state,
+                1,
+                -crate::score::SEARCH_INFINITY,
+                crate::score::SEARCH_INFINITY,
+                0,
+                &mut resources,
+            );
+            assert_eq!(resources.statistics.tt_cutoffs, 0);
+            assert_eq!(resources.pv.root_line(), &[Move::CENTER]);
+            state.assert_consistent(&ZeroEvaluator);
+        }
+    }
+
+    #[test]
+    fn unverified_lmr_fail_lows_propagate_to_ancestors_without_nominal_tt_storage() {
+        let position = fixture(&[112]);
+        for initial_counter in [0, 10_000] {
+            let mut engine = AlphaBetaEngine::with_config(ZeroEvaluator, EngineConfig::new(1));
+            let mut state = SearchState::new(&position, &ZeroEvaluator);
+            let mut statistics = SearchStatistics {
+                lmr_reductions: initial_counter,
+                ..SearchStatistics::default()
+            };
+            let mut pv = crate::principal_variation::PvTable::new();
+            let mut seldepth = 0;
+            let mut resources = super::SearchResources {
+                seldepth: &mut seldepth,
+                pv: &mut pv,
+                statistics: &mut statistics,
+                heuristics: crate::search_heuristics::SearchHeuristics::default(),
+            };
+            let result = engine.negamax::<true>(&mut state, 3, 0, 1, 0, &mut resources);
+            assert_eq!(result.score, 0);
+            assert_eq!(result.completeness, super::Completeness::Selective);
+            assert!(resources.statistics.lmr_reductions > initial_counter);
+            assert_eq!(resources.statistics.lmr_researches, 0);
+            assert!(engine.table.probe(state.key().value()).is_none());
+            engine.clear_transposition_table();
+            engine.search_root::<true>(&mut state, 4, -1, 0, &mut resources);
+            assert!(engine.table.probe(state.key().value()).is_none());
+            state.assert_consistent(&ZeroEvaluator);
         }
     }
 }

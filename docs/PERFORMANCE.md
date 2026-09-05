@@ -375,3 +375,70 @@ Final validation passed: fmt check, workspace/all-targets check, all-feature
 Clippy with warnings denied, workspace tests (102: 14 Core + 73 Engine unit + 15
 integration), Release Engine tests (88), and Release Native build. Eight focused
 regressions were added; existing lifecycle tests now also verify profile bitsets.
+
+
+## V0.6 exact VCF lean check (2026-09-05)
+
+Baseline: official V0.5 `faf36748`, measured before edits with its saved Release
+benchmark executable. V0.6 uses the same host/toolchain, PatternEvaluator,
+64 MiB ordinary TT, untimed warm-up and cold TT clearing. Quick and the two new
+fixtures use five repetitions; depth-six cases use three. Times are medians;
+quick aggregate is the sum of its five medians. Proof-table allocation is
+untimed; generation advance and root state construction are timed. New public
+searches logically invalidate proof cache without clearing its allocation.
+
+Default VCF limits: 11 proof plies / 2,000 nodes; proof table: 384 KiB. The
+existing quick suite is unchanged. No historical V0.1-V0.4, capacity, hot-path,
+assembly, exhaustive-pattern benchmark, or match/strength study was rerun.
+
+| Workload | Nodes / qnodes | VCF nodes / hits / proofs | Best index / score | V0.5 ms | V0.6 ms |
+|---|---:|---:|---|---:|---:|
+| Quick (five depth-4 fixtures) | 32,462 / 23,054 | 21 / 0 / 2 | All unchanged; details below | 14.584 | 14.519 |
+| opening (depth 6) | 123,374 / 75,116 | 0 / 0 / 0 | 129 / 19180 | 67.846 | 56.152 |
+| forced_defense (depth 6) | 189,850 / 140,800 | 0 / 0 / 0 | 112 / -243380 | 99.407 | 87.425 |
+| vcf_win (depth 4) | 0 / 0 | 35 / 0 / 1 | 111 / 99999995 | - | 0.025 |
+| non_vcf_tactical (depth 4) | 27,912 / 21,841 | 54 / 0 / 0 | 94 / 22040 | - | 10.033 |
+
+Quick details (V0.6); all five best moves/scores match V0.5:
+
+| Fixture | Nodes / qnodes | VCF nodes / hits / proofs | Best / score | ms |
+|---|---:|---:|---|---:|
+| opening | 8976 / 4672 | 0 / 0 / 0 | 96 / 780 | 3.999 |
+| balanced_midgame | 16080 / 12122 | 0 / 0 / 0 | 142 / 99999995 | 7.774 |
+| tactical_attack | 0 / 0 | 2 / 0 / 1 | 107 / 99999999 | 0.015 |
+| forced_defense | 7406 / 6260 | 0 / 0 / 0 | 112 / -243120 | 2.709 |
+| transposition_rich | 0 / 0 | 19 / 0 / 1 | 96 / 99999997 | 0.022 |
+
+The quick aggregate is effectively unchanged (-0.4%). Depth-six opening takes
+17.2% less time and forced_defense 12.1% less. Their best move/score remain
+unchanged; nodes fall from 147,870 to 123,374 and 222,413 to 189,850. This is an
+end-to-end CR/state/VCF change, not a claim that all gains come from VCF. Quiet
+opening, balanced_midgame, and forced_defense roots spend zero VCF nodes/probes.
+Depth-four forced_defense timing rises 14.8% in this batch with identical node
+counts and no solver invocation; no quiet case exceeds the 15-20% investigation
+threshold. Sub-millisecond proof timings are observational, not strength evidence.
+
+`vcf_win` starts from indices `[108,107,109,0,110,2,66,4,81,6]`. Its proof PV is
+`[111,112,96,1,51]`: a forced horizontal reply followed by an open vertical four.
+It returns score 99,999,995, completed nominal depth 0, and proof/seldepth 5.
+`non_vcf_tactical` starts from `[108,107,109,0,110,2]`, a one-ended three. Its
+Four+ gate runs, but 54 proof nodes find no VCF within 11 plies; ordinary search
+continues and completes depth 4. All measured proof attempts stay within budget.
+Cache hits are zero on these small first-attempt fixtures; focused tests exercise
+same-public-search cache reuse, certificate loss, and cold/warm history isolation.
+
+Alpha-Beta nodes/qnodes exclude VCF; VCF nodes count visits including depth-zero
+nodes and cache hits. Certificate replay is bounded, nonbranching reconstruction
+and does not spend expansion nodes. `vcf_probes` counts solver attempts. Raw CSVs
+retain all normal/VCF statistics, completed depth, seldepth, and timings:
+[V0.5 lean](benchmarks/v05-lean.csv), [V0.6 lean](benchmarks/v06-lean.csv).
+
+Reproduce the five workloads:
+
+```powershell
+cargo run --release -p rustmoku-engine --example search_bench -- --suite quick --repeats 5
+cargo run --release -p rustmoku-engine --example search_bench -- --depth 6 --fixture opening --repeats 3
+cargo run --release -p rustmoku-engine --example search_bench -- --depth 6 --fixture forced_defense --repeats 3
+cargo run --release -p rustmoku-engine --example search_bench -- --fixture vcf_win --repeats 5
+cargo run --release -p rustmoku-engine --example search_bench -- --fixture non_vcf_tactical --repeats 5
+```

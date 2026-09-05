@@ -8,6 +8,7 @@ For general Rust engineering rules, also read:
 
 * `docs/RUST_GUIDELINES.md`
 * `docs/ARCHITECTURE.md`
+* `docs/ROADMAP.md` (milestone scope and long-term direction)
 
 Project-specific rules in this file take priority when they are more specific.
 

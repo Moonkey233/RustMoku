@@ -20,7 +20,7 @@ pub struct PatternState {
 
 /// A bounded update is reversible from the played cell; no board snapshot.
 #[derive(Debug)]
-pub struct PatternUndo {
+pub(crate) struct PatternUndo {
     at: Move,
     stone: Stone,
 }

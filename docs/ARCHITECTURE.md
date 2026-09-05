@@ -1,9 +1,10 @@
-# RustMoku V0.5 Architecture
+# RustMoku V0.6 Architecture
 
-V0.5 upgrades V0.4 (`882a82d`) with cached tactical bitsets, exact immediate
-pruning, corrected narrow quiescence, and conservative LMR. Core remains authoritative for legality
-and wins; Engine maintains reversible private state; Native remains an adapter.
+V0.6 builds on the official V0.5 baseline `faf36748` with explicit LMR
+completeness, a board-only tactical boundary, and exact continuous-four proofs.
+Core remains authoritative for legality and wins; Native remains an adapter.
 All first-party crates forbid unsafe code. No dependency or thread is added.
+Milestone scope and future work live in [ROADMAP.md](ROADMAP.md).
 
 ## Crate dependency graph
 
@@ -71,35 +72,41 @@ checked. There are no forbidden moves or Swap protocols.
 ## Engine boundary and ownership
 
 The intentionally small public surface includes `Evaluator`, `ClassicalEvaluator`,
-`PatternEvaluator`, opaque `PatternState`/`PatternUndo`,
+`PatternEvaluator`, opaque `PatternState`,
 `SearchEngine`, `AlphaBetaEngine`, `EngineConfig`, `SearchLimits`,
-`SearchResult`, `SearchStatistics`, and `TranspositionTableStatistics`. Candidate lists, ordering, hashes,
-search-side state, TT entries, and PV tables remain private.
+`SearchResult`, `TacticalProof`, `TacticalProofKind`, `SearchStatistics`, and
+`TranspositionTableStatistics`. `PatternUndo` is private; the public PatternState
+API debt is deferred to the NNUE/custom-evaluator milestone. Candidate lists,
+ordering, hashes, search-side state, TT entries, and PV tables remain private.
 
 `SearchEngine::search` takes `&mut self` because `AlphaBetaEngine` owns a mutable,
 persistent transposition table and generation counter. The caller still supplies
 an immutable `&Position`, which search never mutates. No interior mutability,
 synchronization primitive, background task, or global cache is involved.
 
-## SearchState: coordinated incremental ownership
+## BoardState and SearchState: coordinated incremental ownership
 
 ```text
-AlphaBetaEngine<E>                  immutable evaluator configuration + mutable TT
-  SearchState<E>                   one local working state per public search
-    Position                      authoritative rule state (one root clone)
-    PositionKey                   incremental Zobrist key
-    CandidateFrontier             occupancy bits, frontier bits, neighbor counts
-    PatternState                  exactly one shared engine tactical state
-    E::State                      evaluator-specific only (currently unit)
+AlphaBetaEngine<E>                  evaluator configuration + ordinary TT + VCF solver
+  SearchState<E>                    one local working state per public search
+    BoardState                     engine-private, evaluator-independent
+      Position                     authoritative rules (one root clone)
+      PositionKey                  incremental Zobrist key
+      CandidateFrontier            occupancy/frontier bits and neighbor counts
+      PatternState                 exactly one shared tactical state
+    E::State                       evaluator-specific only (currently unit)
 ```
 
-Every recursive transition goes through `SearchState::make_move`/`unmake_move`.
-Make asks Core to accept the move before changing any sidecar. A rejected Core
-move therefore leaves all caches untouched. `SearchUndo<E::Undo>` owns the Core
-undo, evaluator undo, pattern undo, played move, and stone. Undo is
-consumed in LIFO order and restores every field. Recursion never clones Position.
-The generic transition takes `&E` so engine configuration stays immutable while
-the engine's TT can be borrowed mutably. No `dyn`, interior mutability, or locks.
+Normal recursion calls SearchState make/unmake, coordinating BoardUndo with
+E::Undo. BoardState asks Core to accept each move before updating any sidecar;
+rejected moves leave all state untouched. Undo consumes tokens in LIFO order.
+No recursive Position or PatternState copies, dynamic dispatch, or locks exist.
+
+`SearchState::prove_vcf` lends only its private board to the concrete solver and
+returns an owned result after restoration. No mutable board getter or arbitrary
+callback can expose a board/accumulator mismatch. The solver cannot access the
+evaluator or E::State. Proven, NotProven, and BudgetExceeded paths all unwind
+board transitions; tests compare every field against a rebuilt board.
 
 ### Stateful evaluation
 
@@ -360,8 +367,11 @@ It reads cached winning bitsets and at most two set bits, never scans the board:
 
 Own wins take priority because the game ends before any opponent reply. These
 facts bypass TT scores; direct results are not stored because the cached bitset
-query is already cheap and independent of nominal depth. Forced blocks recurse
-normally. Exact proof prefixes update seldepth without counting unvisited nodes.
+query is already cheap and independent of nominal depth. In normal Negamax,
+forced blocks allow full-key, equal-depth Exact/Lower/Upper TT score cutoffs with
+mate normalization. If search continues, the candidate list remains exactly the
+block; an unrelated legal hash move cannot replace it. Exact proof prefixes update
+seldepth without counting unvisited nodes. Qsearch never uses ordinary TT scores.
 
 ### Threat quiescence
 
@@ -375,7 +385,7 @@ After stand-pat beta cutoff and alpha update, noisy moves are generated directly
 as `CandidateFrontier bits & own profile bits >= Four`, then ascending set-bit
 iteration materializes a fixed-capacity ordered list. No scan of ordinary
 candidates, ordinary Three/OpenThree/DoubleThree expansion, or optional enemy
-non-immediate defensive points is included in V0.5.
+non-immediate defensive points is included in V0.6.
 
 The expansion cap remains six qplies. At/after it, only exact immediate facts and
 forced-block chains continue; each reply fills a cell, so the 225-cell board is
@@ -394,17 +404,89 @@ always one ply; no two-ply policy or reduction table is introduced.
 The reduced child uses a null window. A score above alpha must repeat the normal
 PVS path at full nominal depth; a reduced fail-low never updates alpha or PV.
 This is a heuristic decision, not a mathematical proof about full-depth minimax.
-To preserve ordinary TT bound meaning, a node/ancestor touched by any LMR work
-does not store its nominal-depth result. A child genuinely searched at a lower
-depth may store that actual depth if its own subtree had no reductions. The
-16-byte entry, four-way bucket, equal-depth probes, and mate normalization stay
-unchanged; this conservative storage policy trades some cache reuse for clarity.
+The returned `NodeResult { score, completeness }` owns the correctness state.
+A reduced fail-low marks its caller Selective. A nominal-depth retry replaces
+the reduced result, including its completeness; a discarded reduction does not
+poison the ancestor stack. The final scout/full-window/tie verification result
+propagates completeness to the parent. SearchStatistics only records work.
+
+Only Complete results may store ordinary TT bounds. A result still affected by
+any unverified reduced child conservatively skips Exact, Upper, and Lower stores;
+V0.6 does not attempt directional bound proofs for selective subtrees. Reduced
+children may store their actual depth if their own results are Complete. PVS,
+fail-soft scoring, equal-depth TT probes, and mate normalization are unchanged.
+
+## Exact continuous-four (VCF) proofs
+
+The private VcfSolver fixes an attacker Stone and operates only on BoardState.
+It returns ProvenWin, NotProven, or BudgetExceeded. NotProven means no proof
+within the continuous-four definition and max proof plies; it never means lost.
+
+Terminal state comes first. At an attacker turn an immediate win ends the proof.
+Otherwise, ascending Four-or-stronger profile bitsets generate attacks without a
+board scan. Every resulting defender node rechecks actual tactical facts:
+
+1. A defender immediate win refutes the line, including attacks making an open four.
+2. At least two distinct attacker winning cells prove a win in two plies.
+3. Exactly one attacker winning cell permits only that forced block.
+4. Zero attacker winning cells rejects the branch: the continuous four stopped.
+
+Thus an attacker facing an enemy winning point must remove it while creating a
+four, unless the attack itself ends the game. There are no heuristic defenses.
+Qsearch and VCF share `immediate_tactic` and `forcing_moves`; qsearch retains
+bounded static evaluation while VCF only proves terminal wins.
+
+Iterative proof depths increase from zero through the configured maximum.
+Ascending move order at every attack selects the canonical smaller index among
+equal-length proofs. The first successful iteration is shortest within VCF.
+The PV includes the final attacker win, using a canonical legal defender reply
+for the double-winning-cell fact. Root score is MATE_SCORE minus terminal plies
+(root absolute ply is zero); proof scores never enter the ordinary TT.
+
+### Proof cache and deterministic limits
+
+The dedicated table allocates 4096 contiguous four-way buckets once: 16,384
+entries, 24 bytes each, 96 bytes per bucket, 393,216 bytes (384 KiB) on the
+supported target. Entries contain the full attacker-salted PositionKey, u64
+generation, searched depth, NotProven/ProvenWin status, optional validated move,
+and proven distance. BudgetExceeded has no cache representation.
+
+A deeper complete NotProven can answer a shallower request. Proven entries use
+equal searched depth and reconstruct a complete certificate through cached moves
+and current tactical facts. Every move and forcing obligation is validated; a
+missing/evicted descendant falls back to search, never to a truncated proof PV.
+Replacement chooses the same key, then the first stale slot, then the shallowest
+current entry with lower slot index breaking ties. Deeper same-key entries survive
+shallower writes. There is no cache-based attack reordering.
+
+Each public search advances the proof table generation and resets one dedicated
+remaining-node budget. Probes accept only the current generation, including all
+proof iterations in that public call. Old public searches cannot help a new call
+cross its deterministic budget. No per-search table clearing occurs; only u64
+generation exhaustion clears before restarting at one, preventing stale aliases.
+
+EngineConfig defaults to 11 proof plies and 2,000 proof nodes. Each visited proof
+node costs one, including depth-zero nodes and accepted cache hits. Bounded
+certificate replay has no branches and costs no expansion nodes (at most the
+proof depth transitions), like constructing an immediate tactical PV. Depth is
+also clamped to remaining board cells. Zero in either config field disables the
+root attempt. No wall-clock control or generic configuration framework exists.
+
+V0.6 calls VCF once before ordinary iterative deepening, only for nonterminal,
+positive nominal-depth roots with own Four+ candidates. NotProven/BudgetExceeded
+continues existing search. ProvenWin returns exact proof metadata and terminal
+PV with completed_depth=0 and seldepth=proof plies. Zero nominal-depth calls
+retain analysis-only qsearch behavior. No normal-node or qsearch VCF probes run.
+
+`vcf_nodes`, `vcf_cache_hits`, `vcf_probes` (gated solver attempts), `vcf_proven`,
+and `vcf_budget_exhausted` report proof work separately from Alpha-Beta nodes/qnodes.
 
 `SearchResult` distinguishes:
 
 - `requested_depth`: the caller's maximum;
 - `completed_depth`: the last fully completed iteration;
 - `seldepth`: maximum ply visited or resolved in an immediate proof prefix;
+- `tactical_proof`: optional VCF kind/distance, with no completed nominal iteration;
 - `principal_variation`: a legal searched prefix whose first move equals
   `best_move` when one exists.
 
@@ -413,7 +495,7 @@ A fixed 225-ply PV table is updated in place during recursion. It allocates no
 shorten the reported line, so PV is guaranteed to be a valid prefix rather than
 always the full nominal depth.
 
-`SearchStatistics` counts all iterations in one public search: visited nodes,
+`SearchStatistics` counts all Alpha-Beta iterations in one public search: visited nodes,
 qnodes (a subset of nodes), PVS/tie re-searches, LMR reductions/full-depth retries,
 aspiration fail-low/high retries,
 static evaluations, beta cutoffs, TT probes, full-key hits, TT cutoffs, successful
@@ -428,7 +510,7 @@ equal-score selection are deterministic; no random source or unordered
 collection participates. For identical semantic input, configuration, and
 software version, semantic output means the same best move and score.
 
-The persistent table is an optimization state. Warm and cold searches may have
+The persistent ordinary TT is an optimization state. Warm and cold searches may have
 different node, TT-hit, and wall-time measurements while retaining the same
 semantic result. Reproducible performance experiments must use a fresh engine or
 call the explicit table-clear method.
@@ -438,12 +520,12 @@ call the explicit table-clear method.
 The synchronous eframe/egui application draws the board, highlights the latest
 move, maps clicks through validated `Move` construction, displays `GameStatus`,
 supports side selection/New Game, and shows depth, seldepth, nodes, score, TT
-statistics, and PV. It contains no win detection, move legality, evaluator, hash,
+statistics, PV, and `VCF proven, N plies` when proof metadata is present. It contains no win detection, move legality, evaluator, hash,
 or search implementation.
 
-## Explicit V0.5 non-goals
+## Explicit V0.6 non-goals
 
-No LMP, futility/null-move pruning, ProbCut, singular extensions, VCF/VCT/DFPN,
-NNUE, MCTS, opening book, randomization, time/node limits, cancellation,
-parallel/async search, server API, arena, Renju, Swap/Swap2, unsafe, or SIMD.
-Core's backing storage stays at 225 cells. No unused worker/thread abstraction.
+No VCT, threat-space search, DFPN, new selective pruning, NNUE, MCTS, opening book,
+randomization, time/deadline control, cancellation, parallel/async search, server
+API, Arena, Renju, Swap/Swap2, unsafe, or SIMD. Native stays synchronous. Core's
+backing storage stays at 225 cells. Future scope is in [ROADMAP.md](ROADMAP.md).

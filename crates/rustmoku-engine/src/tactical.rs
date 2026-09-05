@@ -1,6 +1,14 @@
 use rustmoku_core::{Move, Stone};
 
-use crate::{PatternState, principal_variation::PvTable, score::MATE_SCORE};
+use crate::{
+    PatternState, bitboard::BitBoard256, pattern::ThreatProfile, principal_variation::PvTable,
+    score::MATE_SCORE,
+};
+
+/// Potential forcing placements; proof search must recheck the resulting board.
+pub(crate) fn forcing_moves(patterns: &PatternState, side: Stone) -> BitBoard256 {
+    patterns.moves_at_least(side, ThreatProfile::Four)
+}
 
 /// Exact Freestyle facts, independent of evaluation and nominal search depth.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
