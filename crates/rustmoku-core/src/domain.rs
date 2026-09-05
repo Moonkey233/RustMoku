@@ -38,7 +38,7 @@ impl Move {
     ///
     /// Returns [`MoveError::OutOfBounds`] when either coordinate is outside
     /// the board.
-    pub fn from_row_col(row: usize, column: usize) -> Result<Self, MoveError> {
+    pub const fn from_row_col(row: usize, column: usize) -> Result<Self, MoveError> {
         if row >= BOARD_SIZE || column >= BOARD_SIZE {
             return Err(MoveError::OutOfBounds { row, column });
         }
@@ -52,7 +52,7 @@ impl Move {
     /// # Errors
     ///
     /// Returns [`MoveError::IndexOutOfBounds`] for indices outside 0..225.
-    pub fn from_index(index: usize) -> Result<Self, MoveError> {
+    pub const fn from_index(index: usize) -> Result<Self, MoveError> {
         if index >= CELL_COUNT {
             return Err(MoveError::IndexOutOfBounds { index });
         }

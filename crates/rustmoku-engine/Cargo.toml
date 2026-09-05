@@ -7,3 +7,10 @@ rust-version.workspace = true
 
 [dependencies]
 rustmoku-core.workspace = true
+
+[features]
+bench-internals = []
+
+[[example]]
+name = "hotpath_bench"
+required-features = ["bench-internals"]

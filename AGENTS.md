@@ -102,7 +102,7 @@ Evaluation scores are always documented with an explicit perspective. The initia
 
 Terminal win/loss values use mate-distance semantics so the engine prefers faster wins and delays forced losses.
 
-Transposition-table probes may use a score or bound only when the stored depth is sufficient and the full Zobrist key matches. Mate scores must be normalized by ply when stored and denormalized when probed. Cached moves must be validated before use.
+Transposition-table probes may use a score or bound only when the stored depth is sufficient and the full Zobrist key matches. The fixed-depth baseline additionally requires equal remaining depth for score/bound reuse, because deeper heuristic values have a different horizon; legal TT moves may still order at any depth. Mate scores must be normalized by ply when stored and denormalized when probed. Cached moves must be validated before use.
 
 Do not use `i32::MAX` or `i32::MIN` directly as search infinity values when arithmetic or negation may be applied.
 
@@ -149,6 +149,8 @@ Avoid inside ordinary search nodes:
 * synchronization primitives.
 
 Use reversible make/unmake state transitions.
+
+Hot search state should be incrementally maintained when the affected region is naturally bounded and differential correctness tests exist.
 
 Prefer bounded fixed-capacity data structures where the Gomoku board gives a natural hard bound.
 
@@ -245,6 +247,8 @@ For performance changes:
 5. make one justified change;
 6. rerun correctness tests;
 7. compare against the baseline.
+
+Intermediate benchmark regression is evidence to investigate, not by itself a reason to delete correctness-validated infrastructure with a concrete role in later search stages.
 
 NPS alone is not an engine-strength metric.
 

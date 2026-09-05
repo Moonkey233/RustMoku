@@ -1,0 +1,6 @@
+fixture,evaluator,tt_mib,repeats,requested_depth,completed_depth,seldepth,best_index,score,nodes,static_evaluations,tt_probes,tt_hits,tt_cutoffs,tt_stores,tt_replacements,capacity_bytes,buckets,entries,hashfull_per_mille,median_ms,nps
+opening,pattern,64,5,4,4,4,96,0,7918,4662,7918,3234,1460,6458,0,67108864,1048576,4194304,0,4.115,1924040
+balanced_midgame,pattern,64,5,4,4,4,142,131300,14802,8250,14802,6390,3183,11619,0,67108864,1048576,4194304,1,7.956,1860553
+tactical_attack,pattern,64,5,4,4,4,107,99999999,8406,3762,8297,4534,2450,5847,0,67108864,1048576,4194304,1,3.932,2138006
+forced_defense,pattern,64,5,4,4,4,112,-243120,8698,6959,8536,1516,930,7606,0,67108864,1048576,4194304,1,3.370,2581315
+transposition_rich,pattern,64,5,4,4,4,96,99999997,11877,3299,9434,6134,2984,6450,0,67108864,1048576,4194304,1,5.956,1994124

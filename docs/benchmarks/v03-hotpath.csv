@@ -1,0 +1,10 @@
+operation,iterations,repeats,median_ns
+candidate_reference,100000,5,214.89
+candidate_incremental,100000,5,48.26
+frontier_make_unmake_pair,100000,5,45.56
+pattern_full_initialize,100000,5,4768.21
+pattern_make_unmake_pair,100000,5,136.67
+classical_evaluate,100000,5,386.69
+pattern_evaluate,100000,5,1.76
+search_state_make_unmake_pair,100000,5,198.09
+candidates_and_ordering,100000,5,368.99

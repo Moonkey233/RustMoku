@@ -1,10 +1,10 @@
 # RustMoku
 
-RustMoku V0.2 is a deterministic 15 x 15 Freestyle Gomoku program and a small
+RustMoku V0.3 is a deterministic 15 x 15 Freestyle Gomoku program and a small
 research-oriented engine foundation. It prioritizes correct game semantics,
 clear crate boundaries, reproducible results, and measurable search behavior.
 
-## V0.2 features
+## V0.3 features
 
 - Freestyle Gomoku: five or more contiguous stones wins, with no forbidden moves
   or opening protocol.
@@ -17,7 +17,13 @@ clear crate boundaries, reproducible results, and measurable search behavior.
 - Mate-distance-safe TT scores, TT-aware tactical move ordering, and canonical
   equal-score root move selection.
 - Principal variation plus node, evaluation, cutoff, and TT statistics.
-- A deliberately simple contiguous-pattern classical evaluator.
+- Engine-private bitboards and an incremental radius-two candidate frontier.
+- Incremental semantic line/threat patterns, including broken and compound shapes,
+  cached tactical ordering, and constant-time aggregate evaluation.
+- V0.3 default evaluator = incremental `PatternEvaluator`;
+  `ClassicalEvaluator` remains the independent full-board reference implementation.
+- Wrapping TT generations, relative-age replacement, bounded hashfull sampling,
+  configurable capacity/resize, and collision-replacement statistics.
 - Tests covering domain invariants, hashing, TT behavior, search semantics, and
   determinism.
 
@@ -46,8 +52,28 @@ The permanent fixed-position benchmark utility is run with:
 cargo run --release -p rustmoku-engine --example search_bench
 ```
 
-Local V0.1 and V0.2 measurements are recorded in
-[`docs/PERFORMANCE.md`](docs/PERFORMANCE.md).
+Use `--suite deep`, `--depth 8`, `--fixture opening`, `--tt-mib 256`,
+`--repeats 3`, or `--evaluator classical` after Cargo's `--` separator. Defaults
+are the historical depth-four suite, 64 MiB, PatternEvaluator, one warm-up and
+five cold runs, reporting their median. TT allocation/clearing is untimed.
+For example:
+
+```powershell
+cargo run --release -p rustmoku-engine --example search_bench -- --suite deep
+cargo run --release -p rustmoku-engine --example search_bench -- --depth 8 --fixture opening --tt-mib 1024 --repeats 3
+cargo run --release -p rustmoku-engine --features bench-internals --example hotpath_bench -- 100000
+```
+
+To use the reference engine explicitly:
+
+```rust
+use rustmoku_engine::{AlphaBetaEngine, ClassicalEvaluator};
+let mut engine = AlphaBetaEngine::new(ClassicalEvaluator);
+```
+
+Historical V0.1/V0.2 and measured V0.3 results are recorded in
+[`docs/PERFORMANCE.md`](docs/PERFORMANCE.md). The implementation and validation
+report is [`docs/V0.3_REPORT.md`](docs/V0.3_REPORT.md).
 
 ## Full validation
 
@@ -75,12 +101,12 @@ search contracts.
 
 ## Current limits and roadmap
 
-V0.2 deliberately has no time control, cancellation, threads, aspiration
-windows, PVS, killer/history heuristics, LMR, quiescence, tactical solvers,
-incremental evaluation, NNUE, MCTS, opening book, server API, Renju, or Swap
-protocol. The classical evaluator does not model broken threes/fours or compound
-threats.
-
-A suitable next milestone is measured search refinement—such as PVS and
-aspiration windows—only after adding fixed-position regressions and comparing
-them against the V0.2 baseline. Those features are not currently implemented.
+V0.3 deliberately has no time control, cancellation, threads, PVS, aspiration
+windows, killer/history heuristics, LMR, quiescence, tactical solver, NNUE, MCTS,
+opening book, server API, Renju, or Swap protocol. Pattern features are bounded
+Freestyle continuation summaries; their initial weights are untuned. The Native
+app remains synchronous. A suitable V0.4 would measure node reductions from PVS,
+aspiration, ordering refinements, and then separately justified selective search.
+Those changes require regression and playing-strength evidence and are not part
+of V0.3. Intermediate benchmark regressions are evidence to investigate, not an
+automatic reason to remove validated search infrastructure.

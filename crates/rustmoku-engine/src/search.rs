@@ -1,13 +1,12 @@
 use rustmoku_core::{Move, Position};
 
 use crate::{
-    ClassicalEvaluator, EngineConfig, Evaluator,
-    move_generation::generate_candidates,
+    EngineConfig, Evaluator, PatternEvaluator,
     move_ordering::order_moves,
     principal_variation::PvTable,
     score::{MATE_SCORE, SEARCH_INFINITY, score_from_tt, score_to_tt},
     search_state::SearchState,
-    transposition_table::{Bound, TranspositionTable, TtEntry},
+    transposition_table::{Bound, TranspositionTable, TranspositionTableStatistics, TtEntry},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,6 +38,7 @@ pub struct SearchStatistics {
     pub tt_hits: u64,
     pub tt_cutoffs: u64,
     pub tt_stores: u64,
+    pub tt_replacements: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -56,7 +56,7 @@ pub trait SearchEngine {
     fn search(&mut self, position: &Position, limits: SearchLimits) -> SearchResult;
 }
 
-pub struct AlphaBetaEngine<E = ClassicalEvaluator> {
+pub struct AlphaBetaEngine<E = PatternEvaluator> {
     evaluator: E,
     table: TranspositionTable,
     generation: u8,
@@ -82,24 +82,33 @@ impl<E> AlphaBetaEngine<E> {
         self.generation = 0;
     }
 
+    /// Samples at most 1024 buckets regardless of configured capacity.
+    #[must_use]
+    pub fn transposition_table_statistics(&self) -> TranspositionTableStatistics {
+        self.table.statistics()
+    }
+
+    /// Replaces the table with an empty table of the requested capacity.
+    pub fn resize_transposition_table(&mut self, memory_mib: usize) {
+        self.table = TranspositionTable::new(memory_mib);
+        self.generation = 0;
+    }
+
     fn begin_search_generation(&mut self) {
-        if self.generation == u8::MAX {
-            self.clear_transposition_table();
-        }
-        self.generation += 1;
+        self.generation = self.generation.wrapping_add(1);
     }
 }
 
-impl Default for AlphaBetaEngine<ClassicalEvaluator> {
+impl Default for AlphaBetaEngine<PatternEvaluator> {
     fn default() -> Self {
-        Self::new(ClassicalEvaluator)
+        Self::new(PatternEvaluator)
     }
 }
 
 impl<E: Evaluator> SearchEngine for AlphaBetaEngine<E> {
     fn search(&mut self, position: &Position, limits: SearchLimits) -> SearchResult {
         self.begin_search_generation();
-        let mut state = SearchState::new(position);
+        let mut state = SearchState::new(position, &self.evaluator);
         let mut statistics = SearchStatistics::default();
         let mut seldepth = 0;
         let mut pv = PvTable::new();
@@ -113,7 +122,7 @@ impl<E: Evaluator> SearchEngine for AlphaBetaEngine<E> {
             statistics.static_evaluations += 1;
             return search_result(
                 None,
-                self.evaluator.evaluate(state.position()),
+                state.evaluate(&self.evaluator),
                 limits,
                 0,
                 seldepth,
@@ -154,7 +163,7 @@ impl<E: Evaluator> SearchEngine for AlphaBetaEngine<E> {
 impl<E: Evaluator> AlphaBetaEngine<E> {
     fn search_root(
         &mut self,
-        state: &mut SearchState,
+        state: &mut SearchState<E>,
         depth: u8,
         resources: &mut SearchResources<'_>,
     ) -> RootSearchResult {
@@ -167,14 +176,19 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
                 .best_move()
                 .filter(|&at| state.position().is_legal(at))
         });
-        let mut moves = generate_candidates(state.position());
-        order_moves(state.position(), &mut moves, tt_move);
+        let mut moves = state.candidates();
+        order_moves(
+            state.position().side_to_move(),
+            state.patterns(),
+            &mut moves,
+            tt_move,
+        );
         let mut best_move = None;
         let mut best_score = -SEARCH_INFINITY;
         let mut alpha = -SEARCH_INFINITY;
 
         for at in moves.iter() {
-            let Ok(undo) = state.make_move(at) else {
+            let Ok(undo) = state.make_move(at, &self.evaluator) else {
                 continue;
             };
             let mut score = -self.negamax(state, depth - 1, -SEARCH_INFINITY, -alpha, 1, resources);
@@ -190,7 +204,7 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
                     resources,
                 );
             }
-            state.unmake_move(undo);
+            state.unmake_move(undo, &self.evaluator);
 
             if score > best_score
                 || (score == best_score && best_move.is_none_or(|current| at < current))
@@ -224,7 +238,7 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
 
     fn negamax(
         &mut self,
-        state: &mut SearchState,
+        state: &mut SearchState<E>,
         depth: u8,
         mut alpha: i32,
         beta: i32,
@@ -247,7 +261,7 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
 
         if depth == 0 {
             resources.statistics.static_evaluations += 1;
-            let score = self.evaluator.evaluate(state.position());
+            let score = state.evaluate(&self.evaluator);
             self.store_tt(
                 TtStore {
                     key: state.key().value(),
@@ -262,7 +276,7 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
             return score;
         }
 
-        let mut moves = generate_candidates(state.position());
+        let mut moves = state.candidates();
         if moves.is_empty() {
             self.store_tt(
                 TtStore {
@@ -277,16 +291,21 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
             );
             return 0;
         }
-        order_moves(state.position(), &mut moves, probe.best_move);
+        order_moves(
+            state.position().side_to_move(),
+            state.patterns(),
+            &mut moves,
+            probe.best_move,
+        );
         let mut best_move = None;
         let mut best_score = -SEARCH_INFINITY;
 
         for at in moves.iter() {
-            let Ok(undo) = state.make_move(at) else {
+            let Ok(undo) = state.make_move(at, &self.evaluator) else {
                 continue;
             };
             let score = -self.negamax(state, depth - 1, -beta, -alpha, ply + 1, resources);
-            state.unmake_move(undo);
+            state.unmake_move(undo, &self.evaluator);
 
             if score > best_score
                 || (score == best_score && best_move.is_none_or(|current| at < current))
@@ -319,7 +338,7 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
 
     fn probe_tt(
         &self,
-        state: &SearchState,
+        state: &SearchState<E>,
         depth: u8,
         alpha: i32,
         beta: i32,
@@ -346,6 +365,7 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
     }
 
     fn store_tt(&mut self, store: TtStore, statistics: &mut SearchStatistics) {
+        let previous_replacements = self.table.replacements();
         let entry = TtEntry::new(
             store.key,
             score_to_tt(store.score, store.ply),
@@ -357,6 +377,7 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
         if self.table.store(entry) {
             statistics.tt_stores += 1;
         }
+        statistics.tt_replacements += self.table.replacements() - previous_replacements;
     }
 }
 
@@ -389,7 +410,10 @@ struct RootSearchResult {
 }
 
 fn tt_cutoff_score(entry: TtEntry, depth: u8, alpha: i32, beta: i32, ply: u8) -> Option<i32> {
-    if entry.depth < depth {
+    // A deeper heuristic score has a different horizon and is not a bound on
+    // this fixed-depth minimax value. Exact depth preserves cold/warm semantics
+    // across arbitrary public-search history; deeper legal moves still order.
+    if entry.depth != depth {
         return None;
     }
     let score = score_from_tt(entry.score, ply);
@@ -461,7 +485,12 @@ mod tests {
     struct ZeroEvaluator;
 
     impl Evaluator for ZeroEvaluator {
-        fn evaluate(&self, _position: &Position) -> i32 {
+        type State = ();
+        type Undo = ();
+        fn initialize(&self, _position: &Position) {}
+        fn make_move(&self, _state: &mut (), _at: Move, _stone: rustmoku_core::Stone) {}
+        fn unmake_move(&self, _state: &mut (), _undo: ()) {}
+        fn evaluate(&self, _position: &Position, _state: &()) -> i32 {
             0
         }
     }
@@ -506,12 +535,21 @@ mod tests {
     }
 
     #[test]
+    fn deeper_horizon_is_not_an_exact_score_or_bound_for_shallower_search() {
+        for bound in [Bound::Exact, Bound::Lower, Bound::Upper] {
+            for score in [-25, 25] {
+                assert_eq!(tt_cutoff_score(entry(5, score, bound), 4, -10, 10, 0), None);
+            }
+        }
+    }
+
+    #[test]
     fn insufficient_depth_probe_still_supplies_legal_hash_move() {
         let mut position = Position::default();
         position
             .make_move(Move::CENTER)
             .expect("center must be legal");
-        let state = SearchState::new(&position);
+        let state = SearchState::new(&position, &ZeroEvaluator);
         let hash_move = Move::from_row_col(5, 5).expect("test move must be valid");
         let mut engine = AlphaBetaEngine::with_config(ZeroEvaluator, EngineConfig::new(0));
         engine.generation = 1;
@@ -581,5 +619,76 @@ mod tests {
         assert_eq!(classify_bound(-10, -10, 20), Bound::Upper);
         assert_eq!(classify_bound(20, -10, 20), Bound::Lower);
         assert_eq!(classify_bound(5, -10, 20), Bound::Exact);
+    }
+
+    #[test]
+    fn public_generation_rollover_preserves_entries_and_explicit_clear_still_works() {
+        let position = Position::default();
+        let key = PositionKey::from_position(&position).value();
+        let mut engine = AlphaBetaEngine::with_config(ZeroEvaluator, EngineConfig::new(0));
+        let stored = TtEntry::new(key, 42, Some(Move::CENTER), 5, Bound::Exact, 255);
+        engine.table.store(stored);
+        engine.generation = 255;
+        for _ in 0..260 {
+            engine.search(&position, SearchLimits::new(0));
+        }
+        assert_eq!(engine.generation, 3);
+        assert_eq!(engine.table.probe(key), Some(stored));
+        assert_eq!(tt_cutoff_score(stored, 5, -100, 100, 0), Some(42));
+        assert_eq!(tt_cutoff_score(stored, 6, -100, 100, 0), None);
+        engine.clear_transposition_table();
+        assert!(engine.table.probe(key).is_none());
+        engine.table.store(stored);
+        engine.resize_transposition_table(1);
+        assert!(engine.table.probe(key).is_none());
+        assert_eq!(
+            engine.transposition_table_statistics().capacity_bytes,
+            1024 * 1024
+        );
+    }
+
+    #[test]
+    fn actual_search_recursion_restores_all_incremental_state() {
+        use crate::{PatternEvaluator, principal_variation::PvTable};
+        let mut position = Position::default();
+        for index in [112, 97, 128, 113, 127, 98] {
+            position
+                .make_move(Move::from_index(index).unwrap())
+                .unwrap();
+        }
+        let mut state = SearchState::new(&position, &PatternEvaluator);
+        let mut engine = AlphaBetaEngine::with_config(PatternEvaluator, EngineConfig::new(1));
+        let mut statistics = SearchStatistics::default();
+        let mut pv = PvTable::new();
+        let mut seldepth = 0;
+        let mut resources = super::SearchResources {
+            statistics: &mut statistics,
+            pv: &mut pv,
+            seldepth: &mut seldepth,
+        };
+        for depth in 1..=3 {
+            engine.search_root(&mut state, depth, &mut resources);
+            state.assert_consistent(&PatternEvaluator);
+            assert_eq!(state.position(), &position);
+        }
+    }
+
+    #[test]
+    fn occupied_tt_move_is_not_used_for_ordering() {
+        let mut position = Position::default();
+        position.make_move(Move::CENTER).unwrap();
+        let state = SearchState::new(&position, &ZeroEvaluator);
+        let mut engine = AlphaBetaEngine::with_config(ZeroEvaluator, EngineConfig::new(0));
+        engine.table.store(TtEntry::new(
+            state.key().value(),
+            25,
+            Some(Move::CENTER),
+            0,
+            Bound::Exact,
+            1,
+        ));
+        let probe = engine.probe_tt(&state, 1, -100, 100, 0, &mut SearchStatistics::default());
+        assert_eq!(probe.best_move, None);
+        assert_eq!(probe.cutoff_score, None);
     }
 }

@@ -1,74 +1,64 @@
-use rustmoku_core::{BOARD_SIZE, CELL_COUNT, Move, Position, Stone};
+use rustmoku_core::{CELL_COUNT, Move, Stone};
 
-use crate::move_generation::MoveList;
+use crate::{
+    PatternState, bitboard::MOVES, line_geometry::CENTER_BIAS, move_generation::MoveList,
+    pattern::ThreatProfile,
+};
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct MovePriority {
-    tactical_class: u8,
-    is_tt_move: bool,
-    local_score: i32,
+pub(crate) fn order_moves(
+    side: Stone,
+    patterns: &PatternState,
+    moves: &mut MoveList,
+    tt_move: Option<Move>,
+) {
+    // A single integer comparison preserves the complete former lexicographic
+    // order. Sorting packed priorities avoids indirect per-field comparisons.
+    // Bits: tactical 24..32, TT 23, own 19..23, opponent 15..19,
+    // center bias 11..15, canonical reversed index 0..8. Other bits are zero.
+    let mut priorities = [0_u32; CELL_COUNT];
+    let len = moves.as_slice().len();
+    for (index, at) in moves.iter().enumerate() {
+        let own = patterns.profile(at, side);
+        let opponent = patterns.profile(at, side.opponent());
+        priorities[index] = (u32::from(tactical_class(own, opponent)) << 24)
+            | (u32::from(Some(at) == tt_move) << 23)
+            | ((own as u32) << 19)
+            | ((opponent as u32) << 15)
+            | (u32::from(CENTER_BIAS[at.index()]) << 11)
+            | (CELL_COUNT - 1 - at.index()) as u32;
+    }
+    priorities[..len].sort_unstable_by(|left, right| right.cmp(left));
+    for (at, &priority) in moves.as_mut_slice().iter_mut().zip(&priorities[..len]) {
+        *at = MOVES[CELL_COUNT - 1 - (priority & 255) as usize];
+    }
 }
 
-pub(crate) fn order_moves(position: &Position, moves: &mut MoveList, tt_move: Option<Move>) {
-    let side = position.side_to_move();
-    let mut priorities = [MovePriority::default(); CELL_COUNT];
-    for at in moves.iter() {
-        priorities[at.index()] = MovePriority {
-            tactical_class: if position.would_win(at, side) {
-                2
-            } else if position.would_win(at, side.opponent()) {
-                1
-            } else {
-                0
-            },
-            is_tt_move: Some(at) == tt_move,
-            local_score: local_score(position, at, side),
-        };
-    }
-
-    moves.as_mut_slice().sort_unstable_by(|left, right| {
-        let left_priority = priorities[left.index()];
-        let right_priority = priorities[right.index()];
-        right_priority
-            .tactical_class
-            .cmp(&left_priority.tactical_class)
-            .then_with(|| right_priority.is_tt_move.cmp(&left_priority.is_tt_move))
-            .then_with(|| right_priority.local_score.cmp(&left_priority.local_score))
-            .then_with(|| left.index().cmp(&right.index()))
-    });
-}
-
-fn local_score(position: &Position, at: Move, side: Stone) -> i32 {
-    let mut score = 0;
-    for row_delta in -2_isize..=2 {
-        for column_delta in -2_isize..=2 {
-            if row_delta == 0 && column_delta == 0 {
-                continue;
-            }
-            let Some(row) = at.row().checked_add_signed(row_delta) else {
-                continue;
-            };
-            let Some(column) = at.column().checked_add_signed(column_delta) else {
-                continue;
-            };
-            let Ok(neighbor) = Move::from_row_col(row, column) else {
-                continue;
-            };
-            let distance = row_delta.unsigned_abs().max(column_delta.unsigned_abs());
-            score += match (position.cell(neighbor), distance) {
-                (Some(stone), 1) if stone == side => 8,
-                (Some(_), 1) => 7,
-                (Some(stone), 2) if stone == side => 2,
-                (Some(_), 2) => 1,
-                (None, _) | (Some(_), _) => 0,
-            };
-        }
-    }
-
-    let center = BOARD_SIZE / 2;
-    let center_distance = at.row().abs_diff(center) + at.column().abs_diff(center);
-    // On a 15 x 15 board, the Manhattan distance from center is at most 14.
-    score + (BOARD_SIZE - 1 - center_distance) as i32
+fn tactical_class(own: ThreatProfile, opponent: ThreatProfile) -> u8 {
+    use ThreatProfile::{DoubleThree, FourThree, OpenThree, Three, WinningMove};
+    // Four bits for tier, four for structural class. TT preference is confined
+    // to the resulting class and can never displace a win or mandatory block.
+    let (tier, profile) = if own == WinningMove {
+        (9, own)
+    } else if opponent == WinningMove {
+        (8, opponent)
+    } else if own >= FourThree {
+        (7, own)
+    } else if opponent >= FourThree {
+        (6, opponent)
+    } else if own >= DoubleThree {
+        (5, own)
+    } else if opponent >= DoubleThree {
+        (4, opponent)
+    } else if own >= OpenThree {
+        (3, own)
+    } else if opponent >= OpenThree {
+        (2, opponent)
+    } else if own == Three || opponent == Three {
+        (1, own.max(opponent))
+    } else {
+        (0, own)
+    };
+    (tier << 4) | profile as u8
 }
 
 #[cfg(test)]
@@ -76,7 +66,7 @@ mod tests {
     use rustmoku_core::{Move, Position, Stone};
 
     use super::order_moves;
-    use crate::move_generation::generate_candidates;
+    use crate::{PatternState, move_generation::generate_candidates};
 
     fn move_at(row: usize, column: usize) -> Move {
         Move::from_row_col(row, column).expect("test coordinates must be valid")
@@ -97,7 +87,12 @@ mod tests {
         let position = position_from(&[(7, 7)]);
         let tt_move = move_at(5, 5);
         let mut moves = generate_candidates(&position);
-        order_moves(&position, &mut moves, Some(tt_move));
+        order_moves(
+            position.side_to_move(),
+            &PatternState::new(&position),
+            &mut moves,
+            Some(tt_move),
+        );
         assert_eq!(moves.as_slice().first().copied(), Some(tt_move));
     }
 
@@ -114,7 +109,12 @@ mod tests {
             (1, 2),
         ]);
         let mut moves = generate_candidates(&position);
-        order_moves(&position, &mut moves, Some(move_at(5, 5)));
+        order_moves(
+            position.side_to_move(),
+            &PatternState::new(&position),
+            &mut moves,
+            Some(move_at(5, 5)),
+        );
         let first = moves.as_slice()[0];
         assert!(position.would_win(first, Stone::Black));
     }
@@ -132,7 +132,54 @@ mod tests {
             (7, 6),
         ]);
         let mut moves = generate_candidates(&position);
-        order_moves(&position, &mut moves, Some(move_at(5, 5)));
+        order_moves(
+            position.side_to_move(),
+            &PatternState::new(&position),
+            &mut moves,
+            Some(move_at(5, 5)),
+        );
         assert_eq!(moves.as_slice().first().copied(), Some(move_at(7, 7)));
+    }
+
+    #[test]
+    fn packed_order_matches_lexicographic_reference_on_deterministic_boards() {
+        use crate::line_geometry::CENTER_BIAS;
+        let mut seed = 0x9e3779b97f4a7c15_u64;
+        for _ in 0..32 {
+            let mut position = Position::default();
+            for _ in 0..90 {
+                let legal: Vec<_> = Move::all().filter(|&at| position.is_legal(at)).collect();
+                if legal.is_empty() {
+                    break;
+                }
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                let at = legal[(seed % legal.len() as u64) as usize];
+                position.make_move(at).unwrap();
+            }
+            let patterns = PatternState::new(&position);
+            for side in [Stone::Black, Stone::White] {
+                let mut moves = generate_candidates(&position);
+                let tt_move = moves.as_slice().last().copied();
+                let mut reference = moves.as_slice().to_vec();
+                reference.sort_unstable_by_key(|&at| {
+                    let own = patterns.profile(at, side);
+                    let opponent = patterns.profile(at, side.opponent());
+                    (
+                        std::cmp::Reverse((
+                            super::tactical_class(own, opponent),
+                            Some(at) == tt_move,
+                            own,
+                            opponent,
+                            CENTER_BIAS[at.index()],
+                        )),
+                        at,
+                    )
+                });
+                order_moves(side, &patterns, &mut moves, tt_move);
+                assert_eq!(moves.as_slice(), reference);
+            }
+        }
     }
 }

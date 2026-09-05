@@ -1,4 +1,6 @@
-use rustmoku_core::{CELL_COUNT, Move, Position};
+#[cfg(any(test, feature = "bench-internals"))]
+use rustmoku_core::Position;
+use rustmoku_core::{CELL_COUNT, Move};
 
 /// Fixed-capacity move storage sized to the natural board maximum.
 #[derive(Debug, PartialEq, Eq)]
@@ -33,7 +35,7 @@ impl MoveList {
         self.moves.split_at_mut(self.len).0
     }
 
-    fn push(&mut self, at: Move) {
+    pub(crate) fn push(&mut self, at: Move) {
         debug_assert!(self.len < CELL_COUNT);
         self.moves[self.len] = at;
         self.len += 1;
@@ -49,6 +51,7 @@ impl Default for MoveList {
 /// Generates every empty point within Chebyshev distance two of a stone.
 /// The empty-board exception is the center point. Results are unique and in
 /// ascending move-index order.
+#[cfg(any(test, feature = "bench-internals"))]
 #[must_use]
 pub(crate) fn generate_candidates(position: &Position) -> MoveList {
     let mut candidates = MoveList::new();
@@ -90,7 +93,9 @@ pub(crate) fn generate_candidates(position: &Position) -> MoveList {
 
 #[cfg(test)]
 mod tests {
-    use rustmoku_core::{CELL_COUNT, Move, Position};
+    #[cfg(test)]
+    use rustmoku_core::Position;
+    use rustmoku_core::{CELL_COUNT, Move};
 
     use super::generate_candidates;
 

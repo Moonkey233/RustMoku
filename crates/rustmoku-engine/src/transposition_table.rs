@@ -4,6 +4,19 @@ use rustmoku_core::Move;
 
 const ENTRIES_PER_BUCKET: usize = 4;
 const BYTES_PER_MIB: usize = 1024 * 1024;
+const HASHFULL_SAMPLE_BUCKETS: usize = 1024;
+
+/// A bounded-cost snapshot; hashfull is occupied sampled entries per thousand,
+/// including entries from earlier searches. It is not a whole-table census.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TranspositionTableStatistics {
+    pub capacity_bytes: usize,
+    pub bucket_count: usize,
+    pub entry_count: usize,
+    pub hashfull_per_mille: u16,
+    /// Colliding full-key evictions since the last explicit clear or resize.
+    pub replacements: u64,
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
@@ -82,6 +95,7 @@ struct Bucket {
 pub(crate) struct TranspositionTable {
     buckets: Vec<Bucket>,
     mask: usize,
+    replacements: u64,
 }
 
 impl TranspositionTable {
@@ -96,11 +110,33 @@ impl TranspositionTable {
         Self {
             buckets: vec![Bucket::default(); bucket_count],
             mask: bucket_count - 1,
+            replacements: 0,
         }
     }
 
     pub(crate) fn clear(&mut self) {
         self.buckets.fill(Bucket::default());
+        self.replacements = 0;
+    }
+
+    pub(crate) fn statistics(&self) -> TranspositionTableStatistics {
+        let sampled = self.buckets.len().min(HASHFULL_SAMPLE_BUCKETS);
+        let occupied = self.buckets[..sampled]
+            .iter()
+            .flat_map(|bucket| &bucket.entries)
+            .filter(|entry| !entry.is_empty())
+            .count();
+        TranspositionTableStatistics {
+            capacity_bytes: self.buckets.len() * size_of::<Bucket>(),
+            bucket_count: self.buckets.len(),
+            entry_count: self.buckets.len() * ENTRIES_PER_BUCKET,
+            hashfull_per_mille: (occupied * 1000 / (sampled * ENTRIES_PER_BUCKET)) as u16,
+            replacements: self.replacements,
+        }
+    }
+
+    pub(crate) const fn replacements(&self) -> u64 {
+        self.replacements
     }
 
     pub(crate) fn probe(&self, key: u64) -> Option<TtEntry> {
@@ -149,6 +185,7 @@ impl TranspositionTable {
             }
         }
         bucket.entries[replacement] = entry;
+        self.replacements += 1;
         true
     }
 
@@ -167,8 +204,10 @@ impl TranspositionTable {
 }
 
 fn replacement_priority(entry: TtEntry, current_generation: u8, slot: usize) -> (u8, u8, usize) {
-    let is_current = u8::from(entry.generation == current_generation);
-    (is_current, entry.depth, slot)
+    // Ages alias after 256 searches. This can change replacement quality only:
+    // probes still require the full key and a sufficient depth/valid bound.
+    let age = current_generation.wrapping_sub(entry.generation);
+    (u8::MAX - age, entry.depth, slot)
 }
 
 fn floor_power_of_two(value: usize) -> usize {
@@ -283,5 +322,54 @@ mod tests {
         let table = TranspositionTable::new(1);
         assert_eq!(table.buckets.len() * size_of::<Bucket>(), 1024 * 1024);
         assert_eq!(table.buckets.len() * 4, 65_536);
+    }
+
+    #[test]
+    fn replacement_uses_relative_age_across_wrap() {
+        let mut table = TranspositionTable::with_bucket_count(1);
+        for (key, depth, generation) in [(1, 1, 255), (2, 20, 253), (3, 1, 0), (4, 1, 254)] {
+            table.store(entry(key, depth, Bound::Exact, generation));
+        }
+        table.store(entry(5, 1, Bound::Lower, 1));
+        assert!(
+            table.probe(2).is_none(),
+            "age 4 precedes ages 1, 2, 3, even at greater depth"
+        );
+        for key in [1, 3, 4, 5] {
+            assert!(table.probe(key).is_some());
+        }
+    }
+
+    #[test]
+    fn statistics_count_only_colliding_evictions_and_clear_resets_them() {
+        let mut table = TranspositionTable::with_bucket_count(1);
+        assert_eq!(table.statistics().hashfull_per_mille, 0);
+        for key in 1..=4 {
+            table.store(entry(key, 3, Bound::Exact, 1));
+        }
+        assert_eq!(table.statistics().hashfull_per_mille, 1000);
+        assert_eq!(table.statistics().replacements, 0);
+        table.store(entry(1, 4, Bound::Exact, 2));
+        table.store(entry(1, 1, Bound::Upper, 2));
+        assert_eq!(table.statistics().replacements, 0);
+        table.store(entry(5, 4, Bound::Exact, 2));
+        assert_eq!(table.statistics().replacements, 1);
+        table.clear();
+        let stats = table.statistics();
+        assert_eq!(stats.hashfull_per_mille, 0);
+        assert_eq!(stats.replacements, 0);
+        assert_eq!(stats.capacity_bytes, 64);
+        assert_eq!(stats.entry_count, 4);
+    }
+
+    #[test]
+    fn sampling_is_bounded_and_deterministic() {
+        let mut table = TranspositionTable::with_bucket_count(2048);
+        table.store(entry(1500, 1, Bound::Exact, 1));
+        assert_eq!(table.statistics().hashfull_per_mille, 0);
+        for key in 0..1024 {
+            table.store(entry(key, 1, Bound::Exact, 1));
+        }
+        assert_eq!(table.statistics().hashfull_per_mille, 250);
     }
 }

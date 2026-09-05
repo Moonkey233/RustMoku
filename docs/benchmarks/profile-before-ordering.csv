@@ -1,0 +1,25 @@
+process,sampled_microseconds,percent_all_cpus,symbol
+search_bench.exe (103476),33067,0.01,"ntoskrnl.exe!""Unknown"""
+search_bench.exe (103476),3003,0.00,"ntdll.dll!""Unknown"""
+search_bench.exe (103476),20993,0.01,"vcruntime140.dll!""Unknown"""
+search_bench.exe (103476),1039140,0.27,search_bench.exe!rustmoku_engine::pattern_state::PatternState::update_lines
+search_bench.exe (103476),507284,0.13,"search_bench.exe!core::slice::sort::shared::smallsort::swap_if_less<rustmoku_core::domain::Move,core::slice::impl$0::sort_unstable_by::closure_env$0<rustmoku_core::domain::Move,rustmoku_engine::move_ordering::order_moves::closure_env$0> >"
+search_bench.exe (103476),91038,0.02,search_bench.exe!rustmoku_engine::candidate_frontier::CandidateFrontier::candidates
+search_bench.exe (103476),80867,0.02,"search_bench.exe!core::slice::sort::shared::smallsort::insert_tail<rustmoku_core::domain::Move,core::slice::impl$0::sort_unstable_by::closure_env$0<rustmoku_core::domain::Move,rustmoku_engine::move_ordering::order_moves::closure_env$0> >"
+search_bench.exe (103476),197689,0.05,search_bench.exe!rustmoku_engine::candidate_frontier::CandidateFrontier::unmake_move
+search_bench.exe (103476),80982,0.02,search_bench.exe!rustmoku_engine::transposition_table::TranspositionTable::probe
+search_bench.exe (103476),2997,0.00,search_bench.exe!rustmoku_engine::evaluation::impl$1::evaluate
+search_bench.exe (103476),148983,0.04,search_bench.exe!rustmoku_engine::candidate_frontier::CandidateFrontier::make_move
+search_bench.exe (103476),208858,0.05,"search_bench.exe!core::slice::sort::unstable::quicksort::quicksort<rustmoku_core::domain::Move,core::slice::impl$0::sort_unstable_by::closure_env$0<rustmoku_core::domain::Move,rustmoku_engine::move_ordering::order_moves::closure_env$0> >"
+search_bench.exe (103476),111878,0.03,"search_bench.exe!core::slice::sort::shared::smallsort::small_sort_network<rustmoku_core::domain::Move,core::slice::impl$0::sort_unstable_by::closure_env$0<rustmoku_core::domain::Move,rustmoku_engine::move_ordering::order_moves::closure_env$0> >"
+search_bench.exe (103476),8015,0.00,search_bench.exe!rustmoku_engine::evaluation::impl$1::unmake_move
+search_bench.exe (103476),123001,0.03,search_bench.exe!rustmoku_engine::move_ordering::order_moves
+search_bench.exe (103476),1000,0.00,search_bench.exe!rustmoku_engine::move_generation::MoveList::iter
+search_bench.exe (103476),35031,0.01,search_bench.exe!rustmoku_core::position::Position::make_move
+search_bench.exe (103476),52736,0.01,search_bench.exe!rustmoku_engine::search::AlphaBetaEngine::negamax<rustmoku_engine::evaluation::PatternEvaluator>
+search_bench.exe (103476),10991,0.00,search_bench.exe!rustmoku_engine::transposition_table::TranspositionTable::store
+search_bench.exe (103476),19014,0.00,"search_bench.exe!core::slice::sort::shared::pivot::median3_rec<rustmoku_core::domain::Move,core::slice::impl$0::sort_unstable_by::closure_env$0<rustmoku_core::domain::Move,rustmoku_engine::move_ordering::order_moves::closure_env$0> >"
+search_bench.exe (103476),12001,0.00,search_bench.exe!rustmoku_engine::search_state::SearchState::unmake_move<rustmoku_engine::evaluation::PatternEvaluator>
+search_bench.exe (103476),4999,0.00,search_bench.exe!rustmoku_engine::evaluation::impl$1::make_move
+search_bench.exe (103476),11999,0.00,"search_bench.exe!core::slice::sort::unstable::ipnsort<rustmoku_core::domain::Move,core::slice::impl$0::sort_unstable_by::closure_env$0<rustmoku_core::domain::Move,rustmoku_engine::move_ordering::order_moves::closure_env$0> >"
+search_bench.exe (103476),5001,0.00,search_bench.exe!rustmoku_engine::transposition_table::TranspositionTable::new

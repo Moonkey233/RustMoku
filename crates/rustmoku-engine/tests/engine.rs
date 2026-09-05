@@ -1,6 +1,7 @@
 use rustmoku_core::{Move, Position, Stone};
 use rustmoku_engine::{
-    AlphaBetaEngine, ClassicalEvaluator, EngineConfig, Evaluator, SearchEngine, SearchLimits,
+    AlphaBetaEngine, ClassicalEvaluator, EngineConfig, Evaluator, PatternEvaluator, SearchEngine,
+    SearchLimits,
 };
 
 fn move_at(row: usize, column: usize) -> Move {
@@ -16,13 +17,18 @@ fn play(position: &mut Position, row: usize, column: usize) {
 struct ZeroEvaluator;
 
 impl Evaluator for ZeroEvaluator {
-    fn evaluate(&self, _position: &Position) -> i32 {
+    type State = ();
+    type Undo = ();
+    fn initialize(&self, _position: &Position) {}
+    fn make_move(&self, _state: &mut (), _at: Move, _stone: rustmoku_core::Stone) {}
+    fn unmake_move(&self, _state: &mut (), _undo: ()) {}
+    fn evaluate(&self, _position: &Position, _state: &()) -> i32 {
         0
     }
 }
 
 fn test_engine() -> AlphaBetaEngine {
-    AlphaBetaEngine::with_config(ClassicalEvaluator, EngineConfig::new(1))
+    AlphaBetaEngine::with_config(PatternEvaluator, EngineConfig::new(1))
 }
 
 #[test]
@@ -51,7 +57,18 @@ fn evaluator_uses_side_to_move_perspective() {
     play(&mut position, 7, 8);
 
     assert_eq!(position.side_to_move(), Stone::White);
-    assert!(ClassicalEvaluator.evaluate(&position) < 0);
+    assert!(ClassicalEvaluator.evaluate(&position, &()) < 0);
+}
+
+#[test]
+fn pattern_evaluator_uses_side_to_move_perspective() {
+    let mut position = Position::default();
+    for (row, column) in [(7, 6), (0, 0), (7, 7), (0, 2), (7, 8)] {
+        play(&mut position, row, column);
+    }
+    assert_eq!(position.side_to_move(), Stone::White);
+    let state = PatternEvaluator.initialize(&position);
+    assert!(PatternEvaluator.evaluate(&position, &state) < 0);
 }
 
 #[test]
@@ -158,4 +175,67 @@ fn warm_engine_preserves_semantic_result_and_records_tt_hits() {
     assert_eq!(cold.completed_depth, warm.completed_depth);
     assert!(warm.statistics.tt_hits > 0);
     assert!(warm.statistics.tt_cutoffs > 0);
+}
+
+#[test]
+fn broken_four_gap_is_selected_as_an_immediate_win() {
+    let mut position = Position::default();
+    for (index, col) in [4, 5, 7, 8].into_iter().enumerate() {
+        play(&mut position, 7, col);
+        play(&mut position, 0, index * 2);
+    }
+    for mut engine in [test_engine(), test_engine()] {
+        let before = position.clone();
+        let cold = engine.search(&position, SearchLimits::new(3));
+        let warm = engine.search(&position, SearchLimits::new(3));
+        assert_eq!(cold.best_move, Some(move_at(7, 6)));
+        assert_eq!(cold.best_move, warm.best_move);
+        assert_eq!(cold.score, 99_999_999);
+        assert_eq!(cold.score, warm.score);
+        assert_eq!(position, before);
+    }
+}
+
+#[test]
+fn classical_reference_remains_constructible_and_tactically_correct() {
+    let mut position = Position::default();
+    for (index, col) in [4, 5, 7, 8].into_iter().enumerate() {
+        play(&mut position, 7, col);
+        play(&mut position, 0, index * 2);
+    }
+    let mut engine = AlphaBetaEngine::with_config(ClassicalEvaluator, EngineConfig::new(1));
+    let result = engine.search(&position, SearchLimits::new(2));
+    assert_eq!(result.best_move, Some(move_at(7, 6)));
+    assert_eq!(result.score, 99_999_999);
+}
+
+#[test]
+fn terminal_and_zero_depth_searches_keep_score_ranges_separate() {
+    let mut position = Position::default();
+    for (index, col) in [4, 5, 7, 8].into_iter().enumerate() {
+        play(&mut position, 7, col);
+        play(&mut position, 0, index * 2);
+    }
+    let static_result = test_engine().search(&position, SearchLimits::new(0));
+    assert!(static_result.score.abs() <= 10_000_000);
+    assert_eq!(static_result.best_move, None);
+    play(&mut position, 7, 6);
+    let terminal = test_engine().search(&position, SearchLimits::new(5));
+    assert_eq!(terminal.best_move, None);
+    assert_eq!(terminal.score, -100_000_000);
+    assert_eq!(terminal.completed_depth, 0);
+    assert_eq!(terminal.statistics.static_evaluations, 0);
+}
+
+#[test]
+fn deeper_child_cache_cannot_change_a_shallower_ancestor_search() {
+    let ancestor = Position::default();
+    let mut child = ancestor.clone();
+    play(&mut child, 7, 7);
+    let limits = SearchLimits::new(4);
+    let cold = test_engine().search(&ancestor, limits);
+    let mut warm_engine = test_engine();
+    warm_engine.search(&child, limits);
+    let warm = warm_engine.search(&ancestor, limits);
+    assert_eq!((warm.best_move, warm.score), (cold.best_move, cold.score));
 }
