@@ -72,19 +72,22 @@ impl CandidateFrontier {
         }
     }
 
-    pub(crate) fn candidates(&self) -> MoveList {
-        let mut moves = MoveList::new();
+    pub(crate) fn candidate_bits(&self) -> BitBoard256 {
         if self.occupied.is_empty() {
-            moves.push(Move::CENTER);
+            let mut center = BitBoard256::EMPTY;
+            center.set(Move::CENTER);
+            center
         } else {
-            for at in self
-                .frontier
+            self.frontier
                 .and_not(self.occupied)
                 .intersection(BitBoard256::PLAYABLE)
-                .iter()
-            {
-                moves.push(at);
-            }
+        }
+    }
+
+    pub(crate) fn candidates(&self) -> MoveList {
+        let mut moves = MoveList::new();
+        for at in self.candidate_bits().iter() {
+            moves.push(at);
         }
         moves
     }

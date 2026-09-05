@@ -96,7 +96,7 @@ Opening protocols such as Swap or Swap2 are conceptually distinct from board win
 
 ## 6. Search Semantics
 
-The engine uses deterministic fail-soft PVS, aspiration iterative deepening, and bounded Gomoku threat quiescence. Root canonical ties require exact-score verification when a scout returns only a bound.
+The engine uses deterministic fail-soft PVS, aspiration iterative deepening, and bounded Gomoku threat quiescence. Root canonical ties require exact-score verification when a scout returns only a bound. Immediate tactical facts take priority over qsearch caps; potential Four-class threats are not mandatory defense. Reduced searches must retry nominal depth before improving alpha/PV, and unverified selective subtrees must not be stored as nominal-depth TT bounds.
 
 Evaluation scores are always documented with an explicit perspective. The initial evaluator returns scores from the side-to-move perspective.
 

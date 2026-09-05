@@ -21,6 +21,27 @@ impl Default for SearchHeuristics {
 }
 
 impl SearchHeuristics {
+    /// A single-ply reduction for the ninth or later genuinely quiet move.
+    /// The caller additionally excludes PV windows, hash moves, and forced blocks.
+    pub(crate) fn lmr_reduction(
+        &self,
+        depth: u8,
+        index: usize,
+        side: Stone,
+        at: Move,
+        ply: u8,
+        patterns: &PatternState,
+    ) -> u8 {
+        u8::from(
+            depth >= 3
+                && index >= 8
+                && patterns.profile(at, side) == ThreatProfile::Quiet
+                && patterns.profile(at, side.opponent()) == ThreatProfile::Quiet
+                && self.history(side, at) < 128
+                && self.killer_rank(ply, at) == 0,
+        )
+    }
+
     pub(crate) fn history(&self, side: Stone, at: Move) -> u16 {
         self.history[stone_index(side)][at.index()]
     }

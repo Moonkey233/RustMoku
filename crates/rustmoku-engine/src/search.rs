@@ -4,11 +4,12 @@ use crate::{
     EngineConfig, Evaluator, PatternEvaluator,
     move_generation::MoveList,
     move_ordering::order_moves,
-    pattern::{ThreatProfile, stone_index},
+    pattern::ThreatProfile,
     principal_variation::PvTable,
     score::{MATE_SCORE, MATE_THRESHOLD, SEARCH_INFINITY, score_from_tt, score_to_tt},
     search_heuristics::SearchHeuristics,
     search_state::SearchState,
+    tactical::immediate_tactic,
     transposition_table::{Bound, TranspositionTable, TranspositionTableStatistics, TtEntry},
 };
 
@@ -41,6 +42,8 @@ pub struct SearchStatistics {
     pub nodes: u64,
     pub qnodes: u64,
     pub pvs_researches: u64,
+    pub lmr_reductions: u64,
+    pub lmr_researches: u64,
     pub aspiration_fail_low: u64,
     pub aspiration_fail_high: u64,
     pub static_evaluations: u64,
@@ -222,6 +225,22 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
     ) -> RootSearchResult {
         resources.statistics.nodes += 1;
         resources.pv.clear(0);
+        if let Some(score) = terminal_score(state.position(), 0) {
+            return RootSearchResult {
+                best_move: None,
+                score,
+            };
+        }
+        let tactic = immediate_tactic(state.patterns(), state.position().side_to_move());
+        if let Some((at, score)) = tactic.resolve(0, resources.pv, resources.seldepth) {
+            return RootSearchResult {
+                best_move: Some(at),
+                score,
+            };
+        }
+        let forced_block = tactic.forced_block();
+        let reductions_before = resources.statistics.lmr_reductions;
+
         let original_alpha = alpha;
         resources.statistics.tt_probes += 1;
         let tt_move = self.table.probe(state.key().value()).and_then(|entry| {
@@ -231,7 +250,13 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
                 .filter(|&at| state.position().is_legal(at))
         });
         let side = state.position().side_to_move();
-        let mut moves = state.candidates();
+        let mut moves = if let Some(at) = forced_block {
+            let mut moves = MoveList::new();
+            moves.push(at);
+            moves
+        } else {
+            state.candidates()
+        };
         order_moves(
             side,
             state.patterns(),
@@ -294,17 +319,19 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
         if best_move.is_none() {
             best_score = 0;
         }
-        self.store_tt(
-            TtStore {
-                key: state.key().value(),
-                score: best_score,
-                best_move,
-                depth,
-                bound: classify_bound(best_score, original_alpha, beta),
-                ply: 0,
-            },
-            resources.statistics,
-        );
+        if resources.statistics.lmr_reductions == reductions_before {
+            self.store_tt(
+                TtStore {
+                    key: state.key().value(),
+                    score: best_score,
+                    best_move,
+                    depth,
+                    bound: classify_bound(best_score, original_alpha, beta),
+                    ply: 0,
+                },
+                resources.statistics,
+            );
+        }
         RootSearchResult {
             best_move,
             score: best_score,
@@ -330,14 +357,30 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
         if let Some(score) = terminal_score(state.position(), ply) {
             return score;
         }
+        let tactic = immediate_tactic(state.patterns(), state.position().side_to_move());
+        if let Some((_, score)) = tactic.resolve(ply, resources.pv, resources.seldepth) {
+            return score;
+        }
+        let forced_block = tactic.forced_block();
+        let reductions_before = resources.statistics.lmr_reductions;
         let original_alpha = alpha;
-        let probe = self.probe_tt(state, depth, alpha, beta, ply, resources.statistics);
+        let scout_node = beta == alpha + 1;
+        let probe = if forced_block.is_some() {
+            TtProbe::default()
+        } else {
+            self.probe_tt(state, depth, alpha, beta, ply, resources.statistics)
+        };
         if let Some(score) = probe.cutoff_score {
             return score;
         }
-
         let side = state.position().side_to_move();
-        let mut moves = state.candidates();
+        let mut moves = if let Some(at) = forced_block {
+            let mut moves = MoveList::new();
+            moves.push(at);
+            moves
+        } else {
+            state.candidates()
+        };
         if moves.is_empty() {
             return 0;
         }
@@ -352,9 +395,42 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
         let mut best_move = None;
         let mut best_score = -SEARCH_INFINITY;
         for (index, at) in moves.iter().enumerate() {
+            let reduction = if PVS
+                && scout_node
+                && forced_block.is_none()
+                && probe.best_move != Some(at)
+                && alpha.abs() < MATE_THRESHOLD
+            {
+                resources
+                    .heuristics
+                    .lmr_reduction(depth, index, side, at, ply, state.patterns())
+            } else {
+                0
+            };
+
             let undo = state
                 .make_move(at, &self.evaluator)
                 .expect("frontier moves are legal");
+            if reduction != 0 {
+                resources.statistics.lmr_reductions += 1;
+                let reduced = -self.negamax::<PVS>(
+                    state,
+                    depth - 1 - reduction,
+                    -alpha - 1,
+                    -alpha,
+                    ply + 1,
+                    resources,
+                );
+                if reduced <= alpha {
+                    // Heuristic fail-low, not a proof at nominal depth. It
+                    // cannot improve alpha/PV or create a nominal TT bound.
+                    state.unmake_move(undo, &self.evaluator);
+                    best_score = best_score.max(reduced);
+                    continue;
+                }
+                resources.statistics.lmr_researches += 1;
+                // Improvement must survive the ordinary full-depth PVS path.
+            }
             let mut score;
             if PVS && index != 0 {
                 score =
@@ -382,17 +458,21 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
                 break;
             }
         }
-        self.store_tt(
-            TtStore {
-                key: state.key().value(),
-                score: best_score,
-                best_move,
-                depth,
-                bound: classify_bound(best_score, original_alpha, beta),
-                ply,
-            },
-            resources.statistics,
-        );
+        // Children at genuinely reduced depths may store their own depth.
+        // Ancestors touched by LMR do not claim an unverified nominal bound.
+        if resources.statistics.lmr_reductions == reductions_before {
+            self.store_tt(
+                TtStore {
+                    key: state.key().value(),
+                    score: best_score,
+                    best_move,
+                    depth,
+                    bound: classify_bound(best_score, original_alpha, beta),
+                    ply,
+                },
+                resources.statistics,
+            );
+        }
         best_score
     }
 
@@ -412,51 +492,44 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
         if let Some(score) = terminal_score(state.position(), ply) {
             return score;
         }
-        if qply == MAX_QSEARCH_PLY {
-            resources.statistics.static_evaluations += 1;
-            return state.evaluate(&self.evaluator);
-        }
-
         let side = state.position().side_to_move();
-        let patterns = state.patterns();
-        let counts = patterns.counts();
-        let own_wins = counts[stone_index(side)][ThreatProfile::WinningMove as usize] != 0;
-        let enemy_counts = &counts[stone_index(side.opponent())];
-        let enemy_wins = enemy_counts[ThreatProfile::WinningMove as usize] != 0;
-        let must_defend = enemy_counts[ThreatProfile::Four as usize..]
-            .iter()
-            .any(|&count| count != 0);
-        let mut best_score = -SEARCH_INFINITY;
-        // Never stand pat instead of winning or answering an immediate threat.
-        // Also search defenses when the opponent can create a forcing four.
-        if !own_wins && !must_defend {
-            resources.statistics.static_evaluations += 1;
-            best_score = state.evaluate(&self.evaluator);
-            if best_score >= beta {
-                return best_score;
-            }
-            alpha = alpha.max(best_score);
-            if !counts[stone_index(side)][ThreatProfile::Four as usize..]
-                .iter()
-                .any(|&count| count != 0)
-            {
-                return best_score;
-            }
+        let tactic = immediate_tactic(state.patterns(), side);
+        if let Some((_, score)) = tactic.resolve(ply, resources.pv, resources.seldepth) {
+            return score;
         }
+        if let Some(at) = tactic.forced_block() {
+            // An immediate obligation survives the expansion cap. A chain of
+            // forced replies still terminates because every ply fills a cell.
+            let undo = state
+                .make_move(at, &self.evaluator)
+                .expect("winning point is legal");
+            let score = -self.qsearch(
+                state,
+                -beta,
+                -alpha,
+                ply + 1,
+                (qply + 1).min(MAX_QSEARCH_PLY),
+                resources,
+            );
+            state.unmake_move(undo, &self.evaluator);
+            resources.pv.update(ply, at);
+            return score;
+        }
+        resources.statistics.static_evaluations += 1;
+        let mut best_score = state.evaluate(&self.evaluator);
+        if qply >= MAX_QSEARCH_PLY || best_score >= beta {
+            return best_score;
+        }
+        alpha = alpha.max(best_score);
+        let patterns = state.patterns();
+        // Only our existing forcing continuations. Potential enemy Four+
+        // placements are not check, and never remove the stand-pat option.
+        let noisy = state
+            .candidate_bits()
+            .intersection(patterns.moves_at_least(side, ThreatProfile::Four));
         let mut moves = MoveList::new();
-        for at in state.candidates().iter() {
-            let own = patterns.profile(at, side);
-            let enemy = patterns.profile(at, side.opponent());
-            let forcing = if own_wins {
-                own == ThreatProfile::WinningMove
-            } else if enemy_wins {
-                enemy == ThreatProfile::WinningMove
-            } else {
-                own >= ThreatProfile::Four || enemy >= ThreatProfile::Four
-            };
-            if forcing {
-                moves.push(at);
-            }
+        for at in noisy.iter() {
+            moves.push(at);
         }
         order_moves(side, patterns, &mut moves, None, &resources.heuristics, ply);
         for at in moves.iter() {
@@ -1054,7 +1127,7 @@ mod tests {
         let (score, pv, stats, seldepth) = q_result(&position, 0);
         assert_eq!(score, crate::score::MATE_SCORE - 3);
         assert_eq!(pv.len(), 3);
-        assert!(stats.qnodes > 3);
+        assert!(stats.qnodes >= 2);
         assert!((3..=super::MAX_QSEARCH_PLY).contains(&seldepth));
         // The explicit cap applies even to a forcing position.
         let (_, capped_pv, capped, capped_depth) = q_result(&position, super::MAX_QSEARCH_PLY);
@@ -1084,5 +1157,233 @@ mod tests {
             ),
             (1, 1, 1, 0)
         );
+    }
+
+    #[test]
+    fn qsearch_cap_cannot_hide_an_immediate_win() {
+        let position = fixture(&[109, 0, 110, 2, 112, 4, 113, 6]);
+        let (score, pv, stats, seldepth) = q_result(&position, super::MAX_QSEARCH_PLY);
+        assert_eq!(score, crate::score::MATE_SCORE - 1);
+        assert_eq!(pv, [Move::from_index(111).unwrap()]);
+        assert_eq!(
+            (stats.qnodes, stats.static_evaluations, seldepth),
+            (1, 0, 1)
+        );
+    }
+
+    #[test]
+    fn single_immediate_threat_restricts_normal_and_capped_qsearch_to_block() {
+        let position = fixture(&[107, 108, 0, 109, 2, 110, 15, 111]);
+        let mut engine =
+            AlphaBetaEngine::with_config(crate::PatternEvaluator, EngineConfig::new(1));
+        let result = engine.search(&position, SearchLimits::new(1));
+        assert_eq!(result.best_move, Some(Move::CENTER));
+        assert_eq!((result.statistics.nodes, result.statistics.qnodes), (2, 1));
+        let (score, pv, stats, _) = q_result(&position, super::MAX_QSEARCH_PLY);
+        assert_eq!(pv, [Move::CENTER]);
+        assert_eq!(score, result.score);
+        assert_eq!(stats.qnodes, 2);
+        let patterns = crate::PatternState::new(&position);
+        assert_eq!(
+            crate::tactical::immediate_tactic(&patterns, position.side_to_move()),
+            crate::tactical::ImmediateTactic::ForcedBlock(Move::CENTER)
+        );
+        assert_eq!(
+            crate::search_heuristics::SearchHeuristics::default().lmr_reduction(
+                6,
+                20,
+                position.side_to_move(),
+                Move::CENTER,
+                0,
+                &patterns
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn double_immediate_threat_is_exact_loss_with_legal_canonical_pv() {
+        let position = fixture(&[0, 108, 2, 109, 15, 110, 17, 111]);
+        let (score, pv, stats, seldepth) = q_result(&position, super::MAX_QSEARCH_PLY);
+        assert_eq!(score, -crate::score::MATE_SCORE + 2);
+        assert_eq!(
+            (stats.qnodes, stats.static_evaluations, seldepth),
+            (1, 0, 2)
+        );
+        assert_eq!(pv.len(), 2);
+        assert_eq!(pv[0], Move::from_index(1).unwrap());
+        let mut engine =
+            AlphaBetaEngine::with_config(crate::PatternEvaluator, EngineConfig::new(1));
+        // An untrusted cached move/score must not override the board proof.
+        engine.table.store(TtEntry::new(
+            PositionKey::from_position(&position).value(),
+            1234,
+            Some(Move::CENTER),
+            4,
+            Bound::Exact,
+            0,
+        ));
+        let result = engine.search(&position, SearchLimits::new(4));
+        assert_eq!((result.best_move, result.score), (Some(pv[0]), score));
+        assert_eq!(result.principal_variation, pv);
+        assert_eq!((result.statistics.nodes, result.statistics.qnodes), (4, 0));
+        let mut state = SearchState::new(&position, &crate::PatternEvaluator);
+        let mut statistics = SearchStatistics::default();
+        let mut line = crate::principal_variation::PvTable::new();
+        let mut selective_depth = 0;
+        let distant = engine.negamax::<true>(
+            &mut state,
+            4,
+            -crate::score::SEARCH_INFINITY,
+            crate::score::SEARCH_INFINITY,
+            7,
+            &mut super::SearchResources {
+                seldepth: &mut selective_depth,
+                pv: &mut line,
+                statistics: &mut statistics,
+                heuristics: crate::search_heuristics::SearchHeuristics::default(),
+            },
+        );
+        assert_eq!(distant, -crate::score::MATE_SCORE + 9);
+        assert_eq!(statistics.tt_probes, 0);
+    }
+
+    #[test]
+    fn own_immediate_win_precedes_multiple_opponent_wins() {
+        let position = fixture(&[108, 48, 109, 49, 110, 50, 111, 51]);
+        let patterns = crate::PatternState::new(&position);
+        assert_eq!(
+            patterns
+                .winning_moves(position.side_to_move().opponent())
+                .iter()
+                .count(),
+            2
+        );
+        let (score, pv, stats, _) = q_result(&position, super::MAX_QSEARCH_PLY);
+        assert_eq!(score, crate::score::MATE_SCORE - 1);
+        assert_eq!(pv, [Move::from_index(107).unwrap()]);
+        assert_eq!(stats.qnodes, 1);
+        let result = AlphaBetaEngine::with_config(crate::PatternEvaluator, EngineConfig::new(1))
+            .search(&position, SearchLimits::new(4));
+        assert_eq!((result.best_move, result.score), (Some(pv[0]), score));
+        assert_eq!(result.statistics.lmr_reductions, 0);
+    }
+
+    #[test]
+    fn opponent_potential_four_does_not_remove_stand_pat() {
+        let position = fixture(&[0, 110, 2, 111, 15, 112]);
+        let patterns = crate::PatternState::new(&position);
+        let enemy = position.side_to_move().opponent();
+        assert!(patterns.winning_moves(enemy).is_empty());
+        assert!(
+            !patterns
+                .moves_at_least(enemy, crate::pattern::ThreatProfile::Four)
+                .is_empty()
+        );
+        let stand_pat = crate::PatternEvaluator.evaluate(&position, &patterns, &());
+        let (score, pv, stats, _) = q_result(&position, 0);
+        assert_eq!(score, stand_pat);
+        assert!(pv.is_empty());
+        assert_eq!((stats.qnodes, stats.static_evaluations), (1, 1));
+    }
+
+    #[test]
+    fn lmr_quiet_improvement_is_researched_at_nominal_depth_and_restores_state() {
+        // A shallow horizon prefers late moves, while the full horizon rejects
+        // them. Only a full-depth re-search can distinguish these evaluations.
+        struct HorizonEvaluator;
+        impl Evaluator for HorizonEvaluator {
+            type State = ();
+            type Undo = ();
+            fn initialize(&self, _: &Position) {}
+            fn make_move(&self, _: &mut (), _: Move, _: rustmoku_core::Stone) {}
+            fn unmake_move(&self, _: &mut (), _: ()) {}
+            fn evaluate(&self, _: &Position, _: &crate::PatternState, _: &()) -> i32 {
+                100
+            }
+        }
+        let position = fixture(&[112]);
+        let mut state = SearchState::new(&position, &HorizonEvaluator);
+        let mut engine = AlphaBetaEngine::with_config(HorizonEvaluator, EngineConfig::new(1));
+        let mut statistics = SearchStatistics::default();
+        let mut pv = crate::principal_variation::PvTable::new();
+        let mut seldepth = 0;
+        let score = engine.negamax::<true>(
+            &mut state,
+            3,
+            0,
+            1,
+            0,
+            &mut super::SearchResources {
+                seldepth: &mut seldepth,
+                pv: &mut pv,
+                statistics: &mut statistics,
+                heuristics: crate::search_heuristics::SearchHeuristics::default(),
+            },
+        );
+        assert_eq!(score, -100);
+        assert!(statistics.lmr_reductions > 0);
+        assert_eq!(statistics.lmr_researches, statistics.lmr_reductions);
+        assert!(
+            engine.table.probe(state.key().value()).is_none(),
+            "no unverified nominal TT bound"
+        );
+        state.assert_consistent(&HorizonEvaluator);
+        assert_eq!(state.position(), &position);
+    }
+
+    #[test]
+    fn lmr_excludes_tactical_and_high_priority_moves() {
+        let position = fixture(&[110, 0, 111, 2, 112, 15]);
+        let patterns = crate::PatternState::new(&position);
+        let side = position.side_to_move();
+        let mut heuristics = crate::search_heuristics::SearchHeuristics::default();
+        let mut tactical = 0;
+        for at in patterns.empty_cells().iter() {
+            if patterns.profile(at, side) != crate::pattern::ThreatProfile::Quiet
+                || patterns.profile(at, side.opponent()) != crate::pattern::ThreatProfile::Quiet
+            {
+                assert_eq!(heuristics.lmr_reduction(6, 20, side, at, 0, &patterns), 0);
+                tactical += 1;
+            }
+        }
+        assert!(tactical > 0);
+        let quiet = Move::from_index(224).unwrap();
+        assert_eq!(
+            heuristics.lmr_reduction(6, 20, side, quiet, 0, &patterns),
+            1
+        );
+        assert_eq!(
+            heuristics.lmr_reduction(2, 20, side, quiet, 0, &patterns),
+            0
+        );
+        assert_eq!(heuristics.lmr_reduction(6, 7, side, quiet, 0, &patterns), 0);
+        heuristics.record_cutoff(side, quiet, 16, 1, &patterns);
+        assert_eq!(
+            heuristics.lmr_reduction(6, 20, side, quiet, 0, &patterns),
+            0
+        );
+        let mut killers = crate::search_heuristics::SearchHeuristics::default();
+        killers.record_cutoff(side, quiet, 1, 0, &patterns);
+        assert_eq!(killers.lmr_reduction(6, 20, side, quiet, 0, &patterns), 0);
+    }
+
+    #[test]
+    fn selective_search_preserves_warm_cold_root_results_and_legal_pv() {
+        for (position, depth) in [
+            (fixture(&[112, 97, 128, 113]), 6),
+            (fixture(&[107, 108, 0, 109, 2, 110, 15, 111]), 6),
+            (fixture(&[112]), 4),
+        ] {
+            let mut engine =
+                AlphaBetaEngine::with_config(crate::PatternEvaluator, EngineConfig::new(1));
+            let cold = engine.search(&position, SearchLimits::new(depth));
+            let warm = engine.search(&position, SearchLimits::new(depth));
+            assert_eq!((warm.best_move, warm.score), (cold.best_move, cold.score));
+            let mut replay = position.clone();
+            for at in warm.principal_variation {
+                replay.make_move(at).unwrap();
+            }
+        }
     }
 }

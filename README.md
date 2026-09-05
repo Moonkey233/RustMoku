@@ -1,10 +1,10 @@
 # RustMoku
 
-RustMoku V0.4 is a deterministic 15 x 15 Freestyle Gomoku program and a small
+RustMoku V0.5 is a deterministic 15 x 15 Freestyle Gomoku program and a small
 research-oriented engine foundation. It prioritizes correct game semantics,
 clear crate boundaries, reproducible results, and measurable search behavior.
 
-## V0.4 — Search Core Upgrade
+## V0.5 — Tactical Selectivity
 
 - Freestyle Gomoku: five or more contiguous stones wins, with no forbidden moves
   or opening protocol.
@@ -13,13 +13,18 @@ clear crate boundaries, reproducible results, and measurable search behavior.
 - Fail-soft PVS with iterative deepening and exponentially widened aspiration
   windows; canonical equal-score root selection is preserved.
 - Per-search history and two killers per ply, subordinate to tactical priorities.
-- Threat quiescence for immediate wins, mandatory blocks, and Four-or-stronger
-  continuations/defenses, capped at six extra plies; no ordinary Three expansion.
+- Cached profile bitsets and exact immediate tactics: win in one, unique forced
+  block, or loss in two against multiple winning points, shared by all searches.
+- Threat quiescence expands only own Four-or-stronger continuations through
+  bitsets. Its six-ply expansion cap never masks immediate wins or forced replies;
+  potential opponent Four+ threats do not remove stand pat.
+- Conservative one-ply LMR for late, low-history Quiet moves at scout nodes;
+  improvements are re-searched at nominal depth before updating alpha/PV.
 - Deterministic incremental 64-bit Zobrist keys and a persistent, fixed-size,
   four-way clustered transposition table.
 - Mate-distance-safe TT scores, TT-aware tactical move ordering, and canonical
   equal-score root move selection.
-- Legal principal-variation prefixes plus nodes/qnodes, re-search, evaluation,
+- Legal principal-variation prefixes plus nodes/qnodes, LMR/re-search, evaluation,
   cutoff, and TT statistics.
 - Engine-private bitboards and an incremental radius-two candidate frontier.
 - Incremental semantic line/threat patterns, including broken and compound shapes,
@@ -76,8 +81,8 @@ use rustmoku_engine::{AlphaBetaEngine, ClassicalEvaluator};
 let mut engine = AlphaBetaEngine::new(ClassicalEvaluator);
 ```
 
-Measured V0.3 → V0.4 comparisons and historical results are recorded in
-[`docs/PERFORMANCE.md`](docs/PERFORMANCE.md). V0.3 is the official `2b41449` baseline.
+Measured V0.4 → V0.5 comparisons and historical results are recorded in
+[`docs/PERFORMANCE.md`](docs/PERFORMANCE.md). V0.4 is the official `882a82d` baseline.
 
 ## Full validation
 
@@ -105,9 +110,10 @@ search contracts.
 
 ## Current limits and roadmap
 
-V0.4 has no LMR or other selective reductions, time control, cancellation,
-threads, tactical proof solver, NNUE, MCTS, opening book, server API, Renju, or
-Swap protocol. Quiescence is a bounded threat extension: its defensive candidates
-are threat points, not an exhaustive defense solver, and the cap may leave
-unresolved tactics. Pattern weights and ordering bonuses remain untuned. The
-Native app remains synchronous; benchmark speed does not establish playing strength.
+V0.5 has no additional selective pruning, tactical proof solver, time control,
+cancellation, threads, NNUE, MCTS, opening book, server API, Renju, or Swap protocol.
+LMR remains heuristic and may miss quiet resources; it does not prove equality
+with full-depth minimax. Quiescence omits ordinary Three expansion and optional
+non-immediate defensive moves, and stops non-immediate forcing continuations at
+the cap. Pattern weights and LMR thresholds are untuned. The Native app remains
+synchronous; fixed-position timings do not establish playing strength.

@@ -18,7 +18,7 @@ fn main() -> eframe::Result {
     };
 
     eframe::run_native(
-        "RustMoku V0.4",
+        "RustMoku V0.5",
         options,
         Box::new(|_creation_context| Ok(Box::new(RustMokuApp::default()))),
     )
@@ -109,7 +109,7 @@ impl RustMokuApp {
     }
 
     fn controls(&mut self, ui: &mut egui::Ui) {
-        ui.heading("RustMoku V0.4");
+        ui.heading("RustMoku V0.5");
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             ui.label("Play as:");

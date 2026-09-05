@@ -1,7 +1,7 @@
-# RustMoku V0.4 Architecture
+# RustMoku V0.5 Architecture
 
-V0.4 upgrades the V0.3 (`2b41449`) search core with PVS, aspiration, history/killer
-ordering, and bounded threat quiescence. Core remains authoritative for legality
+V0.5 upgrades V0.4 (`882a82d`) with cached tactical bitsets, exact immediate
+pruning, corrected narrow quiescence, and conservative LMR. Core remains authoritative for legality
 and wins; Engine maintains reversible private state; Native remains an adapter.
 All first-party crates forbid unsafe code. No dependency or thread is added.
 
@@ -114,7 +114,8 @@ evaluator. Ordering and qsearch read this same tactical state. Both current
 evaluators have `State = ()`, `Undo = ()`: PatternEvaluator reads the shared
 counts; ClassicalEvaluator ignores patterns and retains full reference scoring.
 Future evaluators can own their own accumulator through the existing lifecycle.
-The default SearchState shrinks from 6,992 to 3,768 bytes on Windows x64.
+On Windows x64, profile bitsets add 576 bytes: default SearchState is now 4,344
+bytes (V0.4: 3,768), still with exactly one PatternState and unit evaluator state.
 
 ### Zobrist
 
@@ -199,7 +200,11 @@ Root construction encodes every center once. PatternState owns:
 - `[225]` four-byte DirectionSet values: four three-bit Black classes in bits
   0..11, four White classes in 16..27; all other bits zero;
 - `[225][2]` one-byte profiles; occupied cells have canonical Quiet profiles;
-- `[2][9]` u16 feature counts over empty cells only.
+- `[2][9]` u16 feature counts over empty cells only;
+- `[2][9]` BitBoard256 profile sets, with one membership per empty cell/color
+  and no occupied-cell memberships. Transitions clear the old bit and set the
+  new bit alongside profiles/counts. The existing recomputation oracle also
+  verifies bitsets, counts, disjointness, and their union of all empty cells.
 
 `LINE_INFLUENCES[225]` lists at most 32 `(center, direction, two-bit shift)`
 updates. Non-center points on the four axes are disjoint, so no affected center
@@ -340,33 +345,66 @@ Depth >= 2 starts at previous score +/- 10,000. Fail-low/high doubles the delta
 until a result falls strictly inside the window, capped at full search infinity.
 Previous or newly discovered mate scores bypass further narrow windows. Finite
 infinity and saturating endpoint arithmetic prevent overflow. No interrupted
-iterations or selective reductions are introduced.
+iterations are introduced.
+
+### Exact immediate tactics
+
+Root, Negamax, and qsearch check terminal state, then share `immediate_tactic`.
+It reads cached winning bitsets and at most two set bits, never scans the board:
+
+1. Own winning point: choose the lowest index and return `MATE - (ply + 1)`.
+2. No own win and one enemy winning point: search only that forced block.
+3. No own win and multiple enemy winning points: return `-MATE + (ply + 2)`.
+   Every legal move loses in two, so choose the lowest empty index and a distinct
+   remaining enemy winning point for a legal two-move PV prefix.
+
+Own wins take priority because the game ends before any opponent reply. These
+facts bypass TT scores; direct results are not stored because the cached bitset
+query is already cheap and independent of nominal depth. Forced blocks recurse
+normally. Exact proof prefixes update seldepth without counting unvisited nodes.
 
 ### Threat quiescence
 
-Normal depth zero enters qsearch without ordinary TT score probes or stores.
-Terminal scores are checked first. Cached profile counts choose the threat class;
-CandidateFrontier supplies only legal nearby cells, with no full-board scan:
+Normal depth zero enters qsearch without ordinary TT score probes/stores. After
+terminal/immediate checks, a unique forced block recurses even at the cap. With
+no immediate obligation, static stand pat is always available, including when
+the opponent has potential Four/FourThree/DoubleFour/OpenFour points. The latter
+are possible future threats, not a current mandatory defense.
 
-1. Own immediate wins: search only winning placements, without stand pat.
-2. Otherwise opponent immediate wins: search only occupation of winning points.
-3. Otherwise search own Four/OpenFour/DoubleFour/FourThree placements and the
-   opponent's equivalent threat points as defenses. Ordinary Three, OpenThree,
-   and DoubleThree do not extend the search.
+After stand-pat beta cutoff and alpha update, noisy moves are generated directly
+as `CandidateFrontier bits & own profile bits >= Four`, then ascending set-bit
+iteration materializes a fixed-capacity ordered list. No scan of ordinary
+candidates, ordinary Three/OpenThree/DoubleThree expansion, or optional enemy
+non-immediate defensive points is included in V0.5.
 
-Stand pat is available when the opponent has no forcing-four candidate and there
-is no own immediate win. A quiet position returns static evaluation immediately.
-All continuations use the same patterns, frontier, ordering, and make/unmake.
-After six extra plies, a nonterminal position returns static evaluation even if
-threats remain. Defensive threat points are a narrow heuristic set, not a VCF/VCT
-proof or exhaustive defense search. A zero nominal-depth public call reports the
-qsearch score and statistics but keeps best_move=None and an empty public PV.
+The expansion cap remains six qplies. At/after it, only exact immediate facts and
+forced-block chains continue; each reply fills a cell, so the 225-cell board is
+the absolute bound. Quiet or non-immediate states at the cap return static
+evaluation. A zero nominal-depth public call reports qsearch score/statistics
+but keeps best_move=None and an empty public PV.
+
+### Conservative LMR
+
+Only normal non-root scout nodes (beta = alpha + 1) may reduce. Remaining depth
+must be at least 3, move index in the ordered list at least 8 (ninth move), both
+profiles exactly Quiet, history below 128, and killer rank zero. Hash moves,
+forced blocks, PV windows, and mate-range windows are excluded. Reduction is
+always one ply; no two-ply policy or reduction table is introduced.
+
+The reduced child uses a null window. A score above alpha must repeat the normal
+PVS path at full nominal depth; a reduced fail-low never updates alpha or PV.
+This is a heuristic decision, not a mathematical proof about full-depth minimax.
+To preserve ordinary TT bound meaning, a node/ancestor touched by any LMR work
+does not store its nominal-depth result. A child genuinely searched at a lower
+depth may store that actual depth if its own subtree had no reductions. The
+16-byte entry, four-way bucket, equal-depth probes, and mate normalization stay
+unchanged; this conservative storage policy trades some cache reuse for clarity.
 
 `SearchResult` distinguishes:
 
 - `requested_depth`: the caller's maximum;
 - `completed_depth`: the last fully completed iteration;
-- `seldepth`: maximum ply visited anywhere in the public search;
+- `seldepth`: maximum ply visited or resolved in an immediate proof prefix;
 - `principal_variation`: a legal searched prefix whose first move equals
   `best_move` when one exists.
 
@@ -376,9 +414,10 @@ shorten the reported line, so PV is guaranteed to be a valid prefix rather than
 always the full nominal depth.
 
 `SearchStatistics` counts all iterations in one public search: visited nodes,
-qnodes (a subset of nodes), PVS/tie re-searches, aspiration fail-low/high retries,
+qnodes (a subset of nodes), PVS/tie re-searches, LMR reductions/full-depth retries,
+aspiration fail-low/high retries,
 static evaluations, beta cutoffs, TT probes, full-key hits, TT cutoffs, successful
-TT stores, and colliding replacements. Seldepth may exceed nominal depth by up to six.
+TT stores, and colliding replacements. Seldepth may exceed nominal depth plus six through exact immediate tactics.
 Wall time is intentionally excluded from deterministic
 engine statistics and measured externally by the benchmark utility.
 
@@ -402,9 +441,9 @@ supports side selection/New Game, and shows depth, seldepth, nodes, score, TT
 statistics, and PV. It contains no win detection, move legality, evaluator, hash,
 or search implementation.
 
-## Explicit V0.4 non-goals
+## Explicit V0.5 non-goals
 
-No LMR/LMP, futility/null-move pruning, ProbCut, singular extensions, VCF/VCT/DFPN,
+No LMP, futility/null-move pruning, ProbCut, singular extensions, VCF/VCT/DFPN,
 NNUE, MCTS, opening book, randomization, time/node limits, cancellation,
 parallel/async search, server API, arena, Renju, Swap/Swap2, unsafe, or SIMD.
 Core's backing storage stays at 225 cells. No unused worker/thread abstraction.

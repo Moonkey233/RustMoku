@@ -15,6 +15,7 @@ pub struct PatternState {
     directions: [DirectionSet; CELL_COUNT],
     profiles: [[ThreatProfile; 2]; CELL_COUNT],
     counts: [[u16; ThreatProfile::COUNT]; 2],
+    profile_bits: [[BitBoard256; ThreatProfile::COUNT]; 2],
 }
 
 /// A bounded update is reversible from the played cell; no board snapshot.
@@ -36,6 +37,7 @@ impl PatternState {
             directions: [DirectionSet::default(); CELL_COUNT],
             profiles: [[ThreatProfile::Quiet; 2]; CELL_COUNT],
             counts: [[0; ThreatProfile::COUNT]; 2],
+            profile_bits: [[BitBoard256::EMPTY; ThreatProfile::COUNT]; 2],
         };
         for at in Move::all() {
             if position.cell(at).is_some() {
@@ -62,6 +64,24 @@ impl PatternState {
 
     pub(crate) const fn counts(&self) -> &[[u16; ThreatProfile::COUNT]; 2] {
         &self.counts
+    }
+
+    pub(crate) fn moves_with_profile(&self, stone: Stone, profile: ThreatProfile) -> BitBoard256 {
+        self.profile_bits[stone_index(stone)][profile as usize]
+    }
+
+    pub(crate) fn winning_moves(&self, stone: Stone) -> BitBoard256 {
+        self.moves_with_profile(stone, ThreatProfile::WinningMove)
+    }
+
+    pub(crate) fn moves_at_least(&self, stone: Stone, threshold: ThreatProfile) -> BitBoard256 {
+        self.profile_bits[stone_index(stone)][threshold as usize..]
+            .iter()
+            .fold(BitBoard256::EMPTY, |bits, &profile| bits.union(profile))
+    }
+
+    pub(crate) fn empty_cells(&self) -> BitBoard256 {
+        BitBoard256::PLAYABLE.and_not(self.occupied)
     }
 
     pub(crate) fn make_move(&mut self, at: Move, stone: Stone) -> PatternUndo {
@@ -103,6 +123,7 @@ impl PatternState {
     fn remove_profile(&mut self, at: Move) {
         for (color, &profile) in self.profiles[at.index()].iter().enumerate() {
             self.counts[color][profile as usize] -= 1;
+            self.profile_bits[color][profile as usize].clear(at);
         }
     }
 
@@ -114,6 +135,7 @@ impl PatternState {
         self.profiles[at.index()] = profiles;
         for (color, &profile) in profiles.iter().enumerate() {
             self.counts[color][profile as usize] += 1;
+            self.profile_bits[color][profile as usize].set(at);
         }
     }
 }
@@ -137,6 +159,7 @@ impl PatternState {
             directions: [DirectionSet::default(); CELL_COUNT],
             profiles: [[ThreatProfile::Quiet; 2]; CELL_COUNT],
             counts: [[0; ThreatProfile::COUNT]; 2],
+            profile_bits: [[BitBoard256::EMPTY; ThreatProfile::COUNT]; 2],
         };
         for at in Move::all() {
             if position.cell(at).is_some() {
@@ -164,6 +187,7 @@ impl PatternState {
                     let profile = ThreatProfile::from_directions(directions);
                     state.profiles[at.index()][stone_index(stone)] = profile;
                     state.counts[stone_index(stone)][profile as usize] += 1;
+                    state.profile_bits[stone_index(stone)][profile as usize].set(at);
                 }
             }
         }
@@ -191,11 +215,19 @@ mod tests {
                 );
             }
         }
-        for counts in state.counts {
-            assert_eq!(
-                counts.iter().copied().sum::<u16>() as usize,
-                CELL_COUNT - position.move_count()
-            );
+        for (color, counts) in state.counts.iter().enumerate() {
+            let mut all = BitBoard256::EMPTY;
+            for (profile, &count) in counts.iter().enumerate() {
+                let bits = state.profile_bits[color][profile];
+                assert_eq!(bits.iter().count(), usize::from(count));
+                assert!(
+                    all.intersection(bits).is_empty(),
+                    "one profile per empty cell"
+                );
+                all = all.union(bits);
+            }
+            assert_eq!(all, state.empty_cells());
+            assert_eq!(all.iter().count(), CELL_COUNT - position.move_count());
         }
     }
 

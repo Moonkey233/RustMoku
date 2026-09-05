@@ -54,6 +54,14 @@ impl<E: Evaluator> SearchState<E> {
         }
     }
 
+    pub(crate) fn candidate_bits(&self) -> crate::bitboard::BitBoard256 {
+        if self.position.winner().is_some() || self.position.is_full() {
+            crate::bitboard::BitBoard256::EMPTY
+        } else {
+            self.frontier.candidate_bits()
+        }
+    }
+
     pub(crate) fn evaluate(&self, evaluator: &E) -> i32 {
         evaluator.evaluate(&self.position, &self.patterns, &self.evaluator_state)
     }
@@ -218,8 +226,13 @@ mod tests {
         );
         let size = std::mem::size_of::<SearchState<crate::PatternEvaluator>>();
         assert_eq!(size, std::mem::size_of::<SearchState<ClassicalEvaluator>>());
-        assert!(size < 4000, "one pattern cache: {size} bytes");
-        println!("SearchState<PatternEvaluator>: V0.3=6992, V0.4={size} bytes");
+        assert_eq!(
+            size,
+            3768 + 2
+                * crate::pattern::ThreatProfile::COUNT
+                * std::mem::size_of::<crate::bitboard::BitBoard256>()
+        );
+        println!("SearchState<PatternEvaluator>: V0.4=3768, V0.5={size} bytes");
     }
 
     #[test]

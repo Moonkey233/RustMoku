@@ -19,6 +19,7 @@ mod score;
 mod search;
 mod search_heuristics;
 mod search_state;
+mod tactical;
 mod transposition_table;
 mod zobrist;
 

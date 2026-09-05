@@ -303,7 +303,7 @@ The GUI remains synchronous. These checks are not an arena or strength test.
 
 ## V0.3 → V0.4 search core summary (2026-09-05)
 
-Baseline: official `2b41449` (0.3.0); upgraded workspace: 0.4.0. Same Windows x64
+Baseline: official `2b41449` (0.3.0); V0.4: official `882a82d` (0.4.0). Same Windows x64
 host, toolchain, Release profile, PatternEvaluator, and 64 MiB TT. Each fixture
 used one untimed warm-up and three measured cold searches; repeated results and
 all statistics matched exactly. Quick uses nominal depth 4; the two representative
@@ -335,3 +335,43 @@ run for this milestone. Reproduce with the three V0.4 commands in README.md.
 Final validation passed: fmt check, workspace/all-targets check, all-feature
 Clippy with warnings denied, all-feature workspace tests (94: 14 Core + 65 Engine
 unit + 15 integration), Release Engine tests (80), and Release Native build.
+
+## V0.4 → V0.5 tactical selectivity (2026-09-05)
+
+Baseline `882a82d` (0.4.0), upgraded version 0.5.0; same host, Release profile,
+PatternEvaluator and 64 MiB TT. One untimed warm-up then three cold runs per
+fixture, with identical semantic results/statistics on all repetitions. Times
+are medians; quick aggregate sums the five fixture medians. LMR counts are V0.5
+reductions/full-depth retries (V0.4 has neither).
+
+| Workload (depth) | Best/score V0.4 → V0.5 | Nodes V0.4 → V0.5 | Qnodes V0.4 → V0.5 | LMR/retries | ms V0.4 → V0.5 |
+|---|---|---:|---:|---:|---:|
+| opening (4) | 129/1120 → 96/780 | 27,555 → 8,977 | 24,901 → 4,673 | 0/0 | 9.064 → 3.687 |
+| balanced_midgame (4) | 142/99999995 → 142/99999995 | 88,646 → 16,080 | 84,690 → 12,122 | 0/0 | 31.258 → 7.501 |
+| tactical_attack (4) | 107/99999999 → 107/99999999 | 16,528 → 4 | 13,162 → 0 | 0/0 | 6.194 → 0.008 |
+| forced_defense (4) | 112/-3660 → 112/-243120 | 10,569 → 7,406 | 9,559 → 6,260 | 0/0 | 3.149 → 2.360 |
+| transposition_rich (4) | 96/99999997 → 96/99999997 | 41,195 → 1,772 | 36,491 → 1,190 | 0/0 | 15.334 → 0.937 |
+| opening (6) | 129/18340 → 129/19180 | 605,631 → 147,870 | 501,198 → 87,463 | 11,228/131 | 221.560 → 67.141 |
+| forced_defense (6) | 112/-20200 → 112/-243380 | 664,877 → 222,413 | 618,864 → 161,115 | 4,317/134 | 194.715 → 95.678 |
+| **Quick aggregate (4)** | — | **184,493 → 34,239** | **168,803 → 24,245** | 0/0 | **64.999 → 14.493** |
+
+Quick elapsed decreases 77.7%, depth-6 opening 69.7%, and forced_defense 50.9%.
+Normal nodes (nodes minus qnodes) change from 15,690 to 9,994 in quick, 104,433 to
+60,407 in opening, and 46,013 to 61,298 in forced_defense. The latter grows 33.2%
+after changed leaf semantics/order and conservative TT storage, while its qnodes
+fall 74.0% and total time halves. LMR is intentionally inactive on these shallow
+quick searches; exact prechecks and narrower corrected qsearch explain their
+savings. No isolated LMR speedup or global playing-strength gain is inferred.
+
+Winning fixtures retain mate-in-one, mate-in-three, and mate-in-five scores;
+forced_defense retains its required block. Non-mate scores and the
+quick opening choice change with qsearch semantics. Warm/cold root/PV regressions
+also cover both depth-6 fixtures. Direct immediate facts are exact; LMR fail-low
+remains heuristic, with no nominal-depth TT store from a reduced subtree. No
+profiler or additional benchmark matrix was needed. Reproduce using the same
+three commands in README.md.
+
+Final validation passed: fmt check, workspace/all-targets check, all-feature
+Clippy with warnings denied, workspace tests (102: 14 Core + 73 Engine unit + 15
+integration), Release Engine tests (88), and Release Native build. Eight focused
+regressions were added; existing lifecycle tests now also verify profile bitsets.
