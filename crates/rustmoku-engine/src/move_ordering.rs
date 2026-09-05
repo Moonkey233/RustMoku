@@ -2,7 +2,7 @@ use rustmoku_core::{CELL_COUNT, Move, Stone};
 
 use crate::{
     PatternState, bitboard::MOVES, line_geometry::CENTER_BIAS, move_generation::MoveList,
-    pattern::ThreatProfile,
+    pattern::ThreatProfile, search_heuristics::SearchHeuristics,
 };
 
 pub(crate) fn order_moves(
@@ -10,22 +10,25 @@ pub(crate) fn order_moves(
     patterns: &PatternState,
     moves: &mut MoveList,
     tt_move: Option<Move>,
+    heuristics: &SearchHeuristics,
+    ply: u8,
 ) {
-    // A single integer comparison preserves the complete former lexicographic
-    // order. Sorting packed priorities avoids indirect per-field comparisons.
-    // Bits: tactical 24..32, TT 23, own 19..23, opponent 15..19,
-    // center bias 11..15, canonical reversed index 0..8. Other bits are zero.
-    let mut priorities = [0_u32; CELL_COUNT];
+    // Packed total order: tactical 56..64, TT 55, killer 53..55,
+    // history 39..53, own 35..39, opponent 31..35, center 27..31,
+    // reversed canonical index 0..8. Comparisons only read integers.
+    let mut priorities = [0_u64; CELL_COUNT];
     let len = moves.as_slice().len();
     for (index, at) in moves.iter().enumerate() {
         let own = patterns.profile(at, side);
         let opponent = patterns.profile(at, side.opponent());
-        priorities[index] = (u32::from(tactical_class(own, opponent)) << 24)
-            | (u32::from(Some(at) == tt_move) << 23)
-            | ((own as u32) << 19)
-            | ((opponent as u32) << 15)
-            | (u32::from(CENTER_BIAS[at.index()]) << 11)
-            | (CELL_COUNT - 1 - at.index()) as u32;
+        priorities[index] = (u64::from(tactical_class(own, opponent)) << 56)
+            | (u64::from(Some(at) == tt_move) << 55)
+            | (u64::from(heuristics.killer_rank(ply, at)) << 53)
+            | (u64::from(heuristics.history(side, at)) << 39)
+            | ((own as u64) << 35)
+            | ((opponent as u64) << 31)
+            | (u64::from(CENTER_BIAS[at.index()]) << 27)
+            | (CELL_COUNT - 1 - at.index()) as u64;
     }
     priorities[..len].sort_unstable_by(|left, right| right.cmp(left));
     for (at, &priority) in moves.as_mut_slice().iter_mut().zip(&priorities[..len]) {
@@ -66,6 +69,7 @@ mod tests {
     use rustmoku_core::{Move, Position, Stone};
 
     use super::order_moves;
+    use crate::search_heuristics::SearchHeuristics;
     use crate::{PatternState, move_generation::generate_candidates};
 
     fn move_at(row: usize, column: usize) -> Move {
@@ -92,6 +96,8 @@ mod tests {
             &PatternState::new(&position),
             &mut moves,
             Some(tt_move),
+            &SearchHeuristics::default(),
+            0,
         );
         assert_eq!(moves.as_slice().first().copied(), Some(tt_move));
     }
@@ -114,6 +120,8 @@ mod tests {
             &PatternState::new(&position),
             &mut moves,
             Some(move_at(5, 5)),
+            &SearchHeuristics::default(),
+            0,
         );
         let first = moves.as_slice()[0];
         assert!(position.would_win(first, Stone::Black));
@@ -132,11 +140,23 @@ mod tests {
             (7, 6),
         ]);
         let mut moves = generate_candidates(&position);
+        let patterns = PatternState::new(&position);
+        let mut heuristics = SearchHeuristics::default();
+        let quiet = move_at(5, 5);
+        for _ in 0..1000 {
+            heuristics.record_cutoff(position.side_to_move(), quiet, 20, 0, &patterns);
+        }
+        let block = move_at(7, 7);
+        heuristics.record_cutoff(position.side_to_move(), block, 20, 0, &patterns);
+        assert_eq!(heuristics.history(position.side_to_move(), block), 0);
+        assert_eq!(heuristics.killer_rank(0, block), 0);
         order_moves(
             position.side_to_move(),
-            &PatternState::new(&position),
+            &patterns,
             &mut moves,
             Some(move_at(5, 5)),
+            &heuristics,
+            0,
         );
         assert_eq!(moves.as_slice().first().copied(), Some(move_at(7, 7)));
     }
@@ -177,7 +197,14 @@ mod tests {
                         at,
                     )
                 });
-                order_moves(side, &patterns, &mut moves, tt_move);
+                order_moves(
+                    side,
+                    &patterns,
+                    &mut moves,
+                    tt_move,
+                    &SearchHeuristics::default(),
+                    0,
+                );
                 assert_eq!(moves.as_slice(), reference);
             }
         }

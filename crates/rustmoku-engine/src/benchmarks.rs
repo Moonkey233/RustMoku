@@ -37,7 +37,7 @@ pub fn run_hotpath(iterations: usize) {
             .expect("fixture moves are legal");
     }
     let mut frontier = CandidateFrontier::new(&position);
-    let mut patterns = PatternEvaluator.initialize(&position);
+    let mut patterns = PatternState::new(&position);
     let mut state = SearchState::new(&position, &PatternEvaluator);
     let moves = state.candidates();
     let side = position.side_to_move();
@@ -59,15 +59,15 @@ pub fn run_hotpath(iterations: usize) {
     });
     measure("pattern_make_unmake_pair", iterations, |index| {
         let at = moves.as_slice()[index % moves.as_slice().len()];
-        let undo = PatternEvaluator.make_move(&mut patterns, at, side);
+        let undo = patterns.make_move(at, side);
         black_box(&patterns);
-        PatternEvaluator.unmake_move(&mut patterns, undo);
+        patterns.unmake_move(undo);
     });
     measure("classical_evaluate", iterations, |_| {
-        black_box(ClassicalEvaluator.evaluate(black_box(&position), &()));
+        black_box(ClassicalEvaluator.evaluate(black_box(&position), &patterns, &()));
     });
     measure("pattern_evaluate", iterations, |_| {
-        black_box(PatternEvaluator.evaluate(black_box(&position), black_box(&patterns)));
+        black_box(PatternEvaluator.evaluate(black_box(&position), black_box(&patterns), &()));
     });
     measure("search_state_make_unmake_pair", iterations, |index| {
         let at = moves.as_slice()[index % moves.as_slice().len()];
@@ -79,7 +79,14 @@ pub fn run_hotpath(iterations: usize) {
     });
     measure("candidates_and_ordering", iterations, |_| {
         let mut moves = state.candidates();
-        order_moves(side, state.patterns(), &mut moves, None);
+        order_moves(
+            side,
+            state.patterns(),
+            &mut moves,
+            None,
+            &crate::search_heuristics::SearchHeuristics::default(),
+            0,
+        );
         black_box(moves);
     });
 }

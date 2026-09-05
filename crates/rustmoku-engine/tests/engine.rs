@@ -22,7 +22,12 @@ impl Evaluator for ZeroEvaluator {
     fn initialize(&self, _position: &Position) {}
     fn make_move(&self, _state: &mut (), _at: Move, _stone: rustmoku_core::Stone) {}
     fn unmake_move(&self, _state: &mut (), _undo: ()) {}
-    fn evaluate(&self, _position: &Position, _state: &()) -> i32 {
+    fn evaluate(
+        &self,
+        _position: &Position,
+        _patterns: &rustmoku_engine::PatternState,
+        _state: &(),
+    ) -> i32 {
         0
     }
 }
@@ -57,7 +62,13 @@ fn evaluator_uses_side_to_move_perspective() {
     play(&mut position, 7, 8);
 
     assert_eq!(position.side_to_move(), Stone::White);
-    assert!(ClassicalEvaluator.evaluate(&position, &()) < 0);
+    assert!(
+        ClassicalEvaluator.evaluate(
+            &position,
+            &rustmoku_engine::PatternState::new(&position),
+            &()
+        ) < 0
+    );
 }
 
 #[test]
@@ -67,8 +78,8 @@ fn pattern_evaluator_uses_side_to_move_perspective() {
         play(&mut position, row, column);
     }
     assert_eq!(position.side_to_move(), Stone::White);
-    let state = PatternEvaluator.initialize(&position);
-    assert!(PatternEvaluator.evaluate(&position, &state) < 0);
+    let patterns = rustmoku_engine::PatternState::new(&position);
+    assert!(PatternEvaluator.evaluate(&position, &patterns, &()) < 0);
 }
 
 #[test]
@@ -119,7 +130,7 @@ fn iterative_deepening_completes_requested_depth_and_reports_seldepth() {
 
     assert_eq!(result.requested_depth, 3);
     assert_eq!(result.completed_depth, 3);
-    assert_eq!(result.seldepth, 3);
+    assert!((3..=9).contains(&result.seldepth));
 }
 
 #[test]
@@ -210,14 +221,14 @@ fn classical_reference_remains_constructible_and_tactically_correct() {
 }
 
 #[test]
-fn terminal_and_zero_depth_searches_keep_score_ranges_separate() {
+fn terminal_and_zero_depth_searches_resolve_tactical_scores() {
     let mut position = Position::default();
     for (index, col) in [4, 5, 7, 8].into_iter().enumerate() {
         play(&mut position, 7, col);
         play(&mut position, 0, index * 2);
     }
     let static_result = test_engine().search(&position, SearchLimits::new(0));
-    assert!(static_result.score.abs() <= 10_000_000);
+    assert_eq!(static_result.score, 99_999_999);
     assert_eq!(static_result.best_move, None);
     play(&mut position, 7, 6);
     let terminal = test_engine().search(&position, SearchLimits::new(5));

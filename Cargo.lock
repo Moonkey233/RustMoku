@@ -1685,18 +1685,18 @@ dependencies = [
 
 [[package]]
 name = "rustmoku-core"
-version = "0.3.0"
+version = "0.4.0"
 
 [[package]]
 name = "rustmoku-engine"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "rustmoku-core",
 ]
 
 [[package]]
 name = "rustmoku-native"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "eframe",
  "rustmoku-core",

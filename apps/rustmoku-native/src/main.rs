@@ -18,7 +18,7 @@ fn main() -> eframe::Result {
     };
 
     eframe::run_native(
-        "RustMoku V0.3",
+        "RustMoku V0.4",
         options,
         Box::new(|_creation_context| Ok(Box::new(RustMokuApp::default()))),
     )
@@ -109,7 +109,7 @@ impl RustMokuApp {
     }
 
     fn controls(&mut self, ui: &mut egui::Ui) {
-        ui.heading("RustMoku V0.3");
+        ui.heading("RustMoku V0.4");
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             ui.label("Play as:");
@@ -131,11 +131,12 @@ impl RustMokuApp {
         });
         if let Some(search) = &self.last_search {
             ui.label(format!(
-                "AI search: depth {}/{}  |  seldepth {}  |  nodes {}  |  score {}",
+                "AI search: depth {}/{}  |  seldepth {}  |  nodes {} (q {})  |  score {}",
                 search.completed_depth,
                 search.requested_depth,
                 search.seldepth,
                 search.statistics.nodes,
+                search.statistics.qnodes,
                 search.score
             ));
             ui.label(format!(

@@ -86,8 +86,8 @@ node behavior take priority over cosmetic NPS gains.
 
 - V0.2 engine: official `08232e4`, with only a benchmark-driver update for these
   remeasurements; the original engine executable was captured before V0.3 edits.
-- V0.3: version 0.3.0 working tree based on `08232e4`, with the implementation
-  described in ARCHITECTURE.md. Same host/toolchain/Release profile as above.
+- V0.3: official commit `2b41449`, version 0.3.0, based on `08232e4`.
+  Same host/toolchain/Release profile as above.
 - One complete untimed warm-up, then five cold searches for quick (depth 4),
   three for deep (depth 6) and capacity experiments (depth 8). The reported
   statistic is the median; an even sample count uses the upper median.
@@ -300,3 +300,38 @@ Native Windows smoke testing covered launch, Black move and AI reply, occupied
 cell rejection, side switching to White with AI center opening, New Game, depth/
 score/TT/PV display, and the corrected cross-position warm-cache result (-580).
 The GUI remains synchronous. These checks are not an arena or strength test.
+
+## V0.3 → V0.4 search core summary (2026-09-05)
+
+Baseline: official `2b41449` (0.3.0); upgraded workspace: 0.4.0. Same Windows x64
+host, toolchain, Release profile, PatternEvaluator, and 64 MiB TT. Each fixture
+used one untimed warm-up and three measured cold searches; repeated results and
+all statistics matched exactly. Quick uses nominal depth 4; the two representative
+longer searches use depth 6. Times below are medians; aggregate sums fixture medians.
+
+| Workload | Depth | V0.3 best/score | V0.4 best/score | Nodes V0.3 → V0.4 (qnodes) | ms V0.3 → V0.4 | Time change |
+|---|---:|---|---|---|---|---:|
+| quick aggregate (5 fixtures) | 4 | — | — | 51,701 → 184,493 (168,803) | 23.405 → 68.931 | +194.5% |
+| quick balanced_midgame | 4 | 142/131300 | 142/99999995 | 14,802 → 88,646 (84,690) | 7.413 → 32.569 | +339.3% |
+| opening | 6 | 96/0 | 129/18340 | 788,572 → 605,631 (501,198) | 320.897 → 224.315 | -30.1% |
+| forced_defense | 6 | 112/-893960 | 112/-20200 | 618,990 → 664,877 (618,864) | 235.576 → 201.265 | -14.6% |
+
+The quick increase is explained by the new threat horizon: 168,803 of 184,493
+nodes are qnodes, with seldepth up to 10 instead of 4. Balanced midgame now sees
+mate-distance 5 at nominal depth 4. Aggregate node cost decreases while the extra
+threat work raises elapsed time; this is not an unexplained per-node regression.
+The depth-6 searches reach seldepth 12. Opening records 501,198 qnodes, 34 PVS/tie
+re-searches, and one aspiration failure in each direction; forced_defense records
+618,864 qnodes, 68 re-searches, and one fail-low. Best moves/scores may differ
+between versions because qsearch deliberately changes the horizon. These timings
+and small tactical regressions are not engine-match evidence of overall strength.
+
+SearchState<PatternEvaluator> is 3,768 bytes versus 6,992 in V0.3; exactly one
+PatternState remains and both current evaluators have unit State/Undo. TT entries
+remain 16 bytes and four-way buckets 64 bytes. No capacity experiment, new
+microbenchmark, profiler, assembly inspection, or historical Classical suite was
+run for this milestone. Reproduce with the three V0.4 commands in README.md.
+
+Final validation passed: fmt check, workspace/all-targets check, all-feature
+Clippy with warnings denied, all-feature workspace tests (94: 14 Core + 65 Engine
+unit + 15 integration), Release Engine tests (80), and Release Native build.

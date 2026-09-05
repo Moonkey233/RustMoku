@@ -10,12 +10,12 @@ pub(crate) struct SearchState<E: Evaluator> {
     key: PositionKey,
     frontier: CandidateFrontier,
     evaluator_state: E::State,
-    ordering_patterns: Option<PatternState>,
+    patterns: PatternState,
 }
 
 pub(crate) struct SearchUndo<U> {
     evaluator_undo: U,
-    ordering_undo: Option<PatternUndo>,
+    pattern_undo: PatternUndo,
     position_undo: MoveUndo,
     played: Move,
     stone: Stone,
@@ -28,12 +28,10 @@ impl<E: Evaluator> SearchState<E> {
         let key = PositionKey::from_position(&position);
         let frontier = CandidateFrontier::new(&position);
         let evaluator_state = evaluator.initialize(&position);
-        let ordering_patterns = E::cached_patterns(&evaluator_state)
-            .is_none()
-            .then(|| PatternState::new(&position));
+        let patterns = PatternState::new(&position);
         Self {
             evaluator_state,
-            ordering_patterns,
+            patterns,
             position,
             key,
             frontier,
@@ -57,13 +55,11 @@ impl<E: Evaluator> SearchState<E> {
     }
 
     pub(crate) fn evaluate(&self, evaluator: &E) -> i32 {
-        evaluator.evaluate(&self.position, &self.evaluator_state)
+        evaluator.evaluate(&self.position, &self.patterns, &self.evaluator_state)
     }
 
     pub(crate) fn patterns(&self) -> &PatternState {
-        E::cached_patterns(&self.evaluator_state)
-            .or(self.ordering_patterns.as_ref())
-            .expect("initialization provides exactly one tactical cache")
+        &self.patterns
     }
 
     pub(crate) fn make_move(
@@ -75,15 +71,12 @@ impl<E: Evaluator> SearchState<E> {
         let position_undo = self.position.make_move(at)?;
         self.frontier.make_move(at);
         let evaluator_undo = evaluator.make_move(&mut self.evaluator_state, at, stone);
-        let ordering_undo = self
-            .ordering_patterns
-            .as_mut()
-            .map(|patterns| patterns.make_move(at, stone));
+        let pattern_undo = self.patterns.make_move(at, stone);
         self.key = self.key.toggle_move(at, stone);
         debug_assert_eq!(self.key, PositionKey::from_position(&self.position));
         Ok(SearchUndo {
             evaluator_undo,
-            ordering_undo,
+            pattern_undo,
             position_undo,
             played: at,
             stone,
@@ -92,12 +85,7 @@ impl<E: Evaluator> SearchState<E> {
 
     pub(crate) fn unmake_move(&mut self, undo: SearchUndo<E::Undo>, evaluator: &E) {
         evaluator.unmake_move(&mut self.evaluator_state, undo.evaluator_undo);
-        if let Some(ordering_undo) = undo.ordering_undo {
-            self.ordering_patterns
-                .as_mut()
-                .expect("undo matches initialized ordering cache")
-                .unmake_move(ordering_undo);
-        }
+        self.patterns.unmake_move(undo.pattern_undo);
         self.position.unmake_move(undo.position_undo);
         self.frontier.unmake_move(undo.played);
         self.key = self.key.toggle_move(undo.played, undo.stone);
@@ -120,7 +108,11 @@ impl<E: Evaluator> SearchState<E> {
         assert_eq!(self.evaluator_state, reference);
         assert_eq!(
             self.evaluate(evaluator),
-            evaluator.evaluate(&self.position, &reference)
+            evaluator.evaluate(
+                &self.position,
+                &PatternState::reference(&self.position),
+                &reference
+            )
         );
     }
 }
@@ -216,18 +208,23 @@ mod tests {
     #[test]
     fn pattern_lifecycle_coordinates_every_sidecar_and_failed_moves_are_atomic() {
         exercise_lifecycle(crate::PatternEvaluator);
-        let state = SearchState::new(&Position::default(), &crate::PatternEvaluator);
-        assert!(
-            state.ordering_patterns.is_none(),
-            "default shares its evaluator cache"
+        assert_eq!(
+            std::mem::size_of::<<crate::PatternEvaluator as crate::Evaluator>::State>(),
+            0
         );
+        assert_eq!(
+            std::mem::size_of::<<crate::PatternEvaluator as crate::Evaluator>::Undo>(),
+            0
+        );
+        let size = std::mem::size_of::<SearchState<crate::PatternEvaluator>>();
+        assert_eq!(size, std::mem::size_of::<SearchState<ClassicalEvaluator>>());
+        assert!(size < 4000, "one pattern cache: {size} bytes");
+        println!("SearchState<PatternEvaluator>: V0.3=6992, V0.4={size} bytes");
     }
 
     #[test]
-    fn classical_unit_state_uses_a_separate_incremental_ordering_cache() {
+    fn classical_unit_state_shares_the_engine_tactical_state() {
         exercise_lifecycle(ClassicalEvaluator);
-        let state = SearchState::new(&Position::default(), &ClassicalEvaluator);
-        assert!(state.ordering_patterns.is_some());
     }
 
     #[test]

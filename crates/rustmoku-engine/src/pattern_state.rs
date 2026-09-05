@@ -6,7 +6,7 @@ use crate::{
     pattern::{DirectionSet, LineKey, PatternPair, ThreatProfile, stone_index},
 };
 
-/// Opaque per-search pattern state, owned by PatternEvaluator's lifecycle.
+/// Engine tactical state shared by evaluation, ordering, and threat search.
 /// Keys are maintained for occupied centers too; only empty profiles contribute.
 #[derive(Debug, PartialEq, Eq)]
 pub struct PatternState {
@@ -25,7 +25,8 @@ pub struct PatternUndo {
 }
 
 impl PatternState {
-    pub(crate) fn new(position: &Position) -> Self {
+    #[must_use]
+    pub fn new(position: &Position) -> Self {
         match position.rules() {
             RuleSet::Freestyle => {}
         }
@@ -179,8 +180,8 @@ mod tests {
         let reference = PatternState::reference(position);
         assert_eq!(state, &reference);
         assert_eq!(
-            PatternEvaluator.evaluate(position, state),
-            PatternEvaluator.evaluate(position, &reference)
+            PatternEvaluator.evaluate(position, state, &()),
+            PatternEvaluator.evaluate(position, &reference, &())
         );
         for at in Move::all().filter(|&at| position.cell(at).is_none()) {
             for stone in [Stone::Black, Stone::White] {

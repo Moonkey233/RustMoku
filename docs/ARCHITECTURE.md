@@ -1,9 +1,9 @@
-# RustMoku V0.3 Architecture
+# RustMoku V0.4 Architecture
 
-V0.3 adds incremental board intelligence to the V0.2 search infrastructure.
-Core remains authoritative for legality and wins; Engine maintains reversible
-private caches; Native remains an adapter. All first-party crates forbid unsafe
-code. No new dependency, pruning algorithm, thread, or tactical solver is added.
+V0.4 upgrades the V0.3 (`2b41449`) search core with PVS, aspiration, history/killer
+ordering, and bounded threat quiescence. Core remains authoritative for legality
+and wins; Engine maintains reversible private state; Native remains an adapter.
+All first-party crates forbid unsafe code. No dependency or thread is added.
 
 ## Crate dependency graph
 
@@ -89,14 +89,14 @@ AlphaBetaEngine<E>                  immutable evaluator configuration + mutable 
     Position                      authoritative rule state (one root clone)
     PositionKey                   incremental Zobrist key
     CandidateFrontier             occupancy bits, frontier bits, neighbor counts
-    E::State                      PatternState for the default evaluator
-    optional ordering PatternState (only when E has no pattern cache)
+    PatternState                  exactly one shared engine tactical state
+    E::State                      evaluator-specific only (currently unit)
 ```
 
 Every recursive transition goes through `SearchState::make_move`/`unmake_move`.
 Make asks Core to accept the move before changing any sidecar. A rejected Core
 move therefore leaves all caches untouched. `SearchUndo<E::Undo>` owns the Core
-undo, evaluator undo, optional ordering undo, played move, and stone. Undo is
+undo, evaluator undo, pattern undo, played move, and stone. Undo is
 consumed in LIFO order and restores every field. Recursion never clones Position.
 The generic transition takes `&E` so engine configuration stays immutable while
 the engine's TT can be borrowed mutably. No `dyn`, interior mutability, or locks.
@@ -104,17 +104,17 @@ the engine's TT can be borrowed mutably. No `dyn`, interior mutability, or locks
 ### Stateful evaluation
 
 `Evaluator` has associated `State` and `Undo`, and `initialize`, `make_move`,
-`unmake_move`, `evaluate` lifecycle methods. `evaluate(&Position, &State)` returns
-side-to-move-relative static scores. The transition callbacks are infallible for
-accepted Core moves; callers must preserve the lifecycle and LIFO contract.
+`unmake_move`, `evaluate` lifecycle methods. Its API is
+`evaluate(&Position, &PatternState, &Self::State) -> i32`, from the side-to-move
+perspective. Transition callbacks are infallible after Core accepts a move;
+callers preserve the lifecycle and LIFO contract.
 
-`ClassicalEvaluator` keeps `State = ()` and `Undo = ()`, retaining the independent
-full-board contiguous-run reference implementation. `PatternEvaluator` owns a
-`PatternState` and reverses transitions with a two-byte `PatternUndo` (Move and
-Stone). Its optional `cached_patterns(&State)` hook shares that cache with move
-ordering. The hook's presence must stay constant during the lifecycle. For
-ClassicalEvaluator or another evaluator without patterns, SearchState maintains
-one separate incremental ordering cache. The default has no duplicate cache.
+SearchState owns exactly one always-present `PatternState`, independently of the
+evaluator. Ordering and qsearch read this same tactical state. Both current
+evaluators have `State = ()`, `Undo = ()`: PatternEvaluator reads the shared
+counts; ClassicalEvaluator ignores patterns and retains full reference scoring.
+Future evaluators can own their own accumulator through the existing lifecycle.
+The default SearchState shrinks from 6,992 to 3,768 bytes on Windows x64.
 
 ### Zobrist
 
@@ -243,8 +243,10 @@ these cache-local dimensions without unsafe layout tricks.
 Each public search advances one generation; all iterative depths within it share
 that generation and table. The table persists between searches. On generation
 counter exhaustion the u8 generation wraps without clearing. Replacement is
-deterministic: same full key first, then empty slot, then greatest relative age
-`current.wrapping_sub(stored)`, then shallower depth, then lower slot index.
+deterministic: same full key first, then empty slot, then lowest quality
+`depth + 4 * is_exact - 4 * current.wrapping_sub(stored)`, with lower slot index
+breaking ties. Recent shallow entries cannot trivially displace an older deep
+Exact entry, but sufficient relative age eventually outweighs depth.
 After 256 generations age may alias; this affects eviction quality only, never
 key/depth/bound correctness. A shallow/weaker update
 does not trivially overwrite a deeper exact entry for the same key.
@@ -308,25 +310,57 @@ Move priorities use cached profiles and precomputed center bias. Ordered tiers:
 7. own OpenThree, then opponent OpenThree, then Three-like moves, then Quiet.
 
 Each tier distinguishes its exact structural class. Within it, TT preference,
-own/opponent profile, center bias, and lower canonical move index form the total
-order. A packed u32 includes all these fields and the reversed move index.
-Priorities are materialized in a fixed array, sorted allocation-free, then
-converted through the validated Move table. Comparisons do no board reads,
-`would_win`, geometry, or pattern recognition. Differential tests preserve the
-previous lexicographic order exactly.
+killer rank, history, own/opponent profile, center bias, and lower canonical
+index form a packed u64 total order. Fixed-capacity arrays and integer-only
+comparators avoid allocation and pattern calculation in sorting.
 
-Root and exact ordinary-node comparisons explicitly prefer the smaller move
+SearchHeuristics owns `history[Stone][Move]` and two distinct killers per ply.
+Only beta-cutoff moves whose own and opponent profiles are both below Four are
+learned. The history bonus is min(depth squared, 1024), using bounded gravity
+below 16,384; killers keep the two latest distinct moves. Tactical tiers remain
+above TT, history, and killers, regardless of previously learned values.
+
+Root comparisons explicitly prefer the smaller move
 index on equal exact scores. If a root child only returns an alpha-bound equal to
 the incumbent and has a smaller index, it is re-searched with a full window
 before changing the canonical result. Thus a warm TT may reorder work but cannot
 arbitrarily change the semantic root choice.
 
-## Iterative Negamax, PV, and statistics
+## PVS, aspiration, PV, and statistics
 
-Search runs complete full-window iterations from depth 1 through
-`SearchLimits::max_depth`. V0.3 has no interrupting limit, so a non-terminal
-positive-depth search completes the requested nominal depth. All iterations
-share the same TT and generation.
+Search completes iterations from depth 1 to `SearchLimits::max_depth`, sharing
+one TT generation and one fresh SearchHeuristics across the public call. At root
+and ordinary nodes, the first ordered child uses the full node window. Later
+children use `[-alpha-1, -alpha]`; an improvement strictly below beta triggers
+a full node-window re-search. Fail-high cuts off directly. Scores remain fail-soft
+and TT bounds use the original alpha/beta. Root bound ties with a smaller index
+are resolved by an infinity-window child search before replacing an exact best.
+
+Depth >= 2 starts at previous score +/- 10,000. Fail-low/high doubles the delta
+until a result falls strictly inside the window, capped at full search infinity.
+Previous or newly discovered mate scores bypass further narrow windows. Finite
+infinity and saturating endpoint arithmetic prevent overflow. No interrupted
+iterations or selective reductions are introduced.
+
+### Threat quiescence
+
+Normal depth zero enters qsearch without ordinary TT score probes or stores.
+Terminal scores are checked first. Cached profile counts choose the threat class;
+CandidateFrontier supplies only legal nearby cells, with no full-board scan:
+
+1. Own immediate wins: search only winning placements, without stand pat.
+2. Otherwise opponent immediate wins: search only occupation of winning points.
+3. Otherwise search own Four/OpenFour/DoubleFour/FourThree placements and the
+   opponent's equivalent threat points as defenses. Ordinary Three, OpenThree,
+   and DoubleThree do not extend the search.
+
+Stand pat is available when the opponent has no forcing-four candidate and there
+is no own immediate win. A quiet position returns static evaluation immediately.
+All continuations use the same patterns, frontier, ordering, and make/unmake.
+After six extra plies, a nonterminal position returns static evaluation even if
+threats remain. Defensive threat points are a narrow heuristic set, not a VCF/VCT
+proof or exhaustive defense search. A zero nominal-depth public call reports the
+qsearch score and statistics but keeps best_move=None and an empty public PV.
 
 `SearchResult` distinguishes:
 
@@ -342,8 +376,10 @@ shorten the reported line, so PV is guaranteed to be a valid prefix rather than
 always the full nominal depth.
 
 `SearchStatistics` counts all iterations in one public search: visited nodes,
-static evaluations, beta cutoffs, TT probes, full-key hits, TT cutoffs, and
-successful TT stores, and colliding replacements. Wall time is intentionally excluded from deterministic
+qnodes (a subset of nodes), PVS/tie re-searches, aspiration fail-low/high retries,
+static evaluations, beta cutoffs, TT probes, full-key hits, TT cutoffs, successful
+TT stores, and colliding replacements. Seldepth may exceed nominal depth by up to six.
+Wall time is intentionally excluded from deterministic
 engine statistics and measured externally by the benchmark utility.
 
 ## Determinism contract
@@ -366,11 +402,9 @@ supports side selection/New Game, and shows depth, seldepth, nodes, score, TT
 statistics, and PV. It contains no win detection, move legality, evaluator, hash,
 or search implementation.
 
-## Explicit V0.3 non-goals
+## Explicit V0.4 non-goals
 
-No aspiration windows, PVS, killer/history/continuation heuristics, LMR/LMP,
-futility/null-move pruning, quiescence, VCF/VCT/TSS/DFPN, NNUE, MCTS, opening book,
-randomization, time/node limits, cancellation, parallel/async search, server API,
-AI arena, Renju, or Swap/Swap2. Core's backing storage stays at 225 cells.
-Evaluator configuration can be shared immutably while each future worker owns
-its own state, without introducing an unused worker/thread abstraction now.
+No LMR/LMP, futility/null-move pruning, ProbCut, singular extensions, VCF/VCT/DFPN,
+NNUE, MCTS, opening book, randomization, time/node limits, cancellation,
+parallel/async search, server API, arena, Renju, Swap/Swap2, unsafe, or SIMD.
+Core's backing storage stays at 225 cells. No unused worker/thread abstraction.

@@ -5,7 +5,7 @@ pub(crate) const SEARCH_INFINITY: i32 = 200_000_000;
 
 // Static evaluation is clamped to +/-10,000,000. Reserving the top
 // CELL_COUNT points below MATE_SCORE cleanly identifies every legal mate score.
-const MATE_THRESHOLD: i32 = MATE_SCORE - CELL_COUNT as i32;
+pub(crate) const MATE_THRESHOLD: i32 = MATE_SCORE - CELL_COUNT as i32;
 
 pub(crate) fn score_to_tt(score: i32, ply: u8) -> i32 {
     if score >= MATE_THRESHOLD {

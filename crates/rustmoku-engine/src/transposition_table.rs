@@ -203,11 +203,14 @@ impl TranspositionTable {
     }
 }
 
-fn replacement_priority(entry: TtEntry, current_generation: u8, slot: usize) -> (u8, u8, usize) {
+fn replacement_priority(entry: TtEntry, current_generation: u8, slot: usize) -> (i16, usize) {
     // Ages alias after 256 searches. This can change replacement quality only:
     // probes still require the full key and a sufficient depth/valid bound.
     let age = current_generation.wrapping_sub(entry.generation);
-    (u8::MAX - age, entry.depth, slot)
+    // Four plies buy one generation; Exact entries get another generation.
+    let quality =
+        i16::from(entry.depth) + 4 * i16::from(entry.bound == Bound::Exact) - 4 * i16::from(age);
+    (quality, slot)
 }
 
 fn floor_power_of_two(value: usize) -> usize {
@@ -265,7 +268,7 @@ mod tests {
     }
 
     #[test]
-    fn replacement_prefers_old_then_shallow_entries() {
+    fn replacement_balances_age_and_depth() {
         let mut table = TranspositionTable::with_bucket_count(1);
         for (key, depth, generation) in [(1, 8, 2), (2, 2, 1), (3, 5, 1), (4, 1, 2)] {
             table.store(entry(key, depth, Bound::Lower, generation));
@@ -332,12 +335,31 @@ mod tests {
         }
         table.store(entry(5, 1, Bound::Lower, 1));
         assert!(
-            table.probe(2).is_none(),
-            "age 4 precedes ages 1, 2, 3, even at greater depth"
+            table.probe(4).is_none(),
+            "old shallow entry loses to deep Exact"
         );
-        for key in [1, 3, 4, 5] {
+        for key in [1, 2, 3, 5] {
             assert!(table.probe(key).is_some());
         }
+        // Refresh the shallow entries: sufficient relative age eventually
+        // outweighs even the deep Exact entry, including across wraparound.
+        for key in [1, 3, 5] {
+            table.store(entry(key, 1, Bound::Exact, 10));
+        }
+        table.store(entry(6, 1, Bound::Lower, 10));
+        assert!(table.probe(2).is_none());
+    }
+
+    #[test]
+    fn exact_bonus_protects_an_equal_age_entry() {
+        let mut table = TranspositionTable::with_bucket_count(1);
+        table.store(entry(1, 3, Bound::Exact, 1));
+        for key in 2..=4 {
+            table.store(entry(key, 4, Bound::Lower, 1));
+        }
+        table.store(entry(5, 1, Bound::Lower, 1));
+        assert!(table.probe(1).is_some());
+        assert!(table.probe(2).is_none());
     }
 
     #[test]

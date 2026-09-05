@@ -17,6 +17,7 @@ mod pattern_state;
 mod principal_variation;
 mod score;
 mod search;
+mod search_heuristics;
 mod search_state;
 mod transposition_table;
 mod zobrist;

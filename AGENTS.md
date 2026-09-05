@@ -70,7 +70,7 @@ Do not expose unrestricted mutable access to Position internals.
 
 State changes must go through invariant-preserving operations such as `make_move` and `unmake_move`.
 
-A search call receives an immutable caller-owned Position. The engine itself is mutable because it owns persistent search state. It may create one working Position copy at the search root, but recursive search must use make/unmake rather than cloning Position at every node. Engine-private hashes and caches belong in a search-side state, not in `rustmoku-core::Position`.
+A search call receives an immutable caller-owned Position. The engine itself is mutable because it owns persistent search state. It may create one working Position copy at the search root, but recursive search must use make/unmake rather than cloning Position at every node. Engine-private hashes and caches belong in a search-side state, not in `rustmoku-core::Position`. SearchState owns exactly one always-available PatternState for ordering, qsearch, and evaluation; evaluator State/Undo hold evaluator-specific data only.
 
 ## 4. Domain Types
 
@@ -96,13 +96,13 @@ Opening protocols such as Swap or Swap2 are conceptually distinct from board win
 
 ## 6. Search Semantics
 
-The initial engine uses deterministic Negamax with fail-soft Alpha-Beta pruning.
+The engine uses deterministic fail-soft PVS, aspiration iterative deepening, and bounded Gomoku threat quiescence. Root canonical ties require exact-score verification when a scout returns only a bound.
 
 Evaluation scores are always documented with an explicit perspective. The initial evaluator returns scores from the side-to-move perspective.
 
 Terminal win/loss values use mate-distance semantics so the engine prefers faster wins and delays forced losses.
 
-Transposition-table probes may use a score or bound only when the stored depth is sufficient and the full Zobrist key matches. The fixed-depth baseline additionally requires equal remaining depth for score/bound reuse, because deeper heuristic values have a different horizon; legal TT moves may still order at any depth. Mate scores must be normalized by ply when stored and denormalized when probed. Cached moves must be validated before use.
+Transposition-table probes may use a score or bound only when the stored depth is sufficient and the full Zobrist key matches. The fixed-depth baseline additionally requires equal remaining depth for score/bound reuse, because deeper heuristic values have a different horizon; legal TT moves may still order at any depth. Mate scores must be normalized by ply when stored and denormalized when probed. Cached moves must be validated before use. Quiescence scores must not share ordinary TT depth/bound semantics; history and killers remain per-public-search and subordinate to tactical ordering.
 
 Do not use `i32::MAX` or `i32::MIN` directly as search infinity values when arithmetic or negation may be applied.
 

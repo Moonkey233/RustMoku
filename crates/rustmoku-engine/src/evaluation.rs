@@ -1,6 +1,6 @@
 use crate::{
     pattern::{ThreatProfile, stone_index},
-    pattern_state::{PatternState, PatternUndo},
+    pattern_state::PatternState,
 };
 use rustmoku_core::{Move, Position, Stone};
 
@@ -16,7 +16,7 @@ const EVALUATION_LIMIT: i32 = 10_000_000;
 
 /// Static position scoring from the side-to-move perspective.
 pub trait Evaluator {
-    /// Owned per-search state. Evaluator configuration remains immutable.
+    /// Evaluator-specific per-search state, excluding shared tactical patterns.
     type State;
     /// Consumed in strict LIFO order on the corresponding logical state.
     type Undo;
@@ -26,14 +26,8 @@ pub trait Evaluator {
     fn make_move(&self, state: &mut Self::State, at: Move, stone: Stone) -> Self::Undo;
     fn unmake_move(&self, state: &mut Self::State, undo: Self::Undo);
     /// Static score, positive for side to move, strictly outside the mate range.
-    fn evaluate(&self, position: &Position, state: &Self::State) -> i32;
-
-    /// Reuses tactical state for ordering when available. Presence must remain
-    /// constant throughout the lifecycle. Other evaluators get an independent
-    /// engine-owned pattern cache, while ClassicalEvaluator keeps State=().
-    fn cached_patterns(_state: &Self::State) -> Option<&PatternState> {
-        None
-    }
+    /// Patterns and evaluator state must describe the supplied Position.
+    fn evaluate(&self, position: &Position, patterns: &PatternState, state: &Self::State) -> i32;
 }
 
 /// A deliberately simple contiguous-run evaluator used as the V0.1 baseline.
@@ -48,7 +42,7 @@ impl Evaluator for ClassicalEvaluator {
     fn make_move(&self, _state: &mut (), _at: Move, _stone: Stone) {}
     fn unmake_move(&self, _state: &mut (), _undo: ()) {}
 
-    fn evaluate(&self, position: &Position, _state: &()) -> i32 {
+    fn evaluate(&self, position: &Position, _patterns: &PatternState, _state: &()) -> i32 {
         let side = position.side_to_move();
         let score = score_stone(position, side) - score_stone(position, side.opponent());
         score.clamp(-EVALUATION_LIMIT, EVALUATION_LIMIT)
@@ -66,25 +60,15 @@ const PATTERN_WEIGHTS: [i32; ThreatProfile::COUNT] = [
 ];
 
 impl Evaluator for PatternEvaluator {
-    type State = PatternState;
-    type Undo = PatternUndo;
+    type State = ();
+    type Undo = ();
 
-    fn cached_patterns(state: &PatternState) -> Option<&PatternState> {
-        Some(state)
-    }
-
-    fn initialize(&self, position: &Position) -> PatternState {
-        PatternState::new(position)
-    }
-    fn make_move(&self, state: &mut PatternState, at: Move, stone: Stone) -> PatternUndo {
-        state.make_move(at, stone)
-    }
-    fn unmake_move(&self, state: &mut PatternState, undo: PatternUndo) {
-        state.unmake_move(undo);
-    }
-    fn evaluate(&self, position: &Position, state: &PatternState) -> i32 {
+    fn initialize(&self, _position: &Position) {}
+    fn make_move(&self, _state: &mut (), _at: Move, _stone: Stone) {}
+    fn unmake_move(&self, _state: &mut (), _undo: ()) {}
+    fn evaluate(&self, position: &Position, patterns: &PatternState, _state: &()) -> i32 {
         let side = stone_index(position.side_to_move());
-        let counts = state.counts();
+        let counts = patterns.counts();
         let mut score = 0;
         for (feature, &weight) in PATTERN_WEIGHTS.iter().enumerate() {
             score +=
