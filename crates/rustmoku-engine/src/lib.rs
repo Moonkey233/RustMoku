@@ -15,9 +15,11 @@ mod line_classifier;
 mod line_geometry;
 mod move_generation;
 mod move_ordering;
+mod offline;
 mod pattern;
 mod pattern_state;
 mod principal_variation;
+mod proof_book;
 mod proof_table;
 mod score;
 mod search;
@@ -33,10 +35,18 @@ mod zobrist;
 
 pub use config::{EngineConfig, ProofLimits, TacticalConfig};
 pub use evaluation::{ClassicalEvaluator, Evaluator, PatternEvaluator};
+pub use offline::{
+    OfflineSolver, ProofOutcome, SolverError, SolverLimits, SolverResult, SolverStatistics,
+    SolverTermination,
+};
 pub use pattern_state::PatternState;
+pub use proof_book::{
+    Proof, ProofBook, ProofBookError, ProofBookHit, ProofBookMetadata, ProofBookSourceSummary,
+    ProofDistance, ProofSource, VerifiedProofBook,
+};
 pub use search::{
     AlphaBetaEngine, SearchEngine, SearchInfo, SearchLimits, SearchObserver, SearchResult,
-    SearchStatistics, TacticalProof, TacticalProofKind,
+    SearchStatistics,
 };
 pub use search_control::{CancellationToken, SearchTermination};
 pub use transposition_table::TranspositionTableStatistics;

@@ -278,14 +278,14 @@ fn attacker_minimizes_and_defender_maximizes_actual_proof_distance() {
 #[test]
 fn root_integration_is_gated_deterministic_and_emits_complete_vct_metadata() {
     use crate::{
-        AlphaBetaEngine, EngineConfig, PatternEvaluator, SearchEngine, SearchLimits,
-        TacticalProofKind,
+        AlphaBetaEngine, EngineConfig, PatternEvaluator, ProofDistance, ProofSource, SearchEngine,
+        SearchLimits,
     };
     let position = fixture(DOUBLE_THREE);
     let mut engine = AlphaBetaEngine::with_config(PatternEvaluator, EngineConfig::new(1));
     let first = engine.search(&position, SearchLimits::new(2));
-    assert_eq!(first.tactical_proof.unwrap().kind, TacticalProofKind::Vct);
-    assert_eq!(first.tactical_proof.unwrap().plies, 5);
+    assert_eq!(first.proof.unwrap().source, ProofSource::Vct);
+    assert_eq!(first.proof.unwrap().distance, ProofDistance::Exact(5));
     assert_eq!((first.completed_depth, first.seldepth), (0, 5));
     assert_eq!(first.score, crate::score::MATE_SCORE - 5);
     assert_eq!(first.statistics.vcf_proven, 0);
@@ -301,7 +301,7 @@ fn root_integration_is_gated_deterministic_and_emits_complete_vct_metadata() {
             .search(&position, SearchLimits::new(1));
     assert_eq!(fallback.statistics.vct_budget_exhausted, 1);
     assert_eq!(fallback.completed_depth, 1);
-    assert!(fallback.tactical_proof.is_none());
+    assert!(fallback.proof.is_none());
     let disabled =
         AlphaBetaEngine::with_config(PatternEvaluator, EngineConfig::new(1).with_vct_limits(0, 0))
             .search(&position, SearchLimits::new(1));

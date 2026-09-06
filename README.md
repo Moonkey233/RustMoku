@@ -1,9 +1,28 @@
 # RustMoku
 
-RustMoku V0.10 is a 15 x 15 Freestyle Gomoku program and a small
+RustMoku V0.11 is a 15 x 15 Freestyle Gomoku program and a small
 research-oriented engine foundation. It prioritizes correct game semantics,
 clear crate boundaries, reproducible single-thread results, and measurable
 search behavior.
+
+## V0.11 - Offline Proof Solver & Verified Proof Book
+
+- Core provides exact D4 move transforms and a collision-free canonical packed
+  position key. D4 identity is used by offline data, never the ordinary search TT.
+- A deterministic single-thread offline proof-number manager asks whether one
+  fixed attacker can force a win. Every empty legal point is part of the AND/OR
+  completeness universe; progressive widening retains omitted moves as Unknown.
+- Exact immediate facts, bounded VCF, and bounded VCT/DFPN are evaluator-free
+  leaf oracles. Bounded failure, cancellation, and exhaustion never become a
+  refutation.
+- Versioned checkpoints preserve the proof tree and deterministic expansion
+  state. Versioned Proof Books are a separate explicit little-endian format.
+- Parsed `ProofBook` bytes are untrusted. Only independent legal replay and
+  tactical re-verification produces a runtime-attachable `VerifiedProofBook`.
+- Runtime lookup is root-only after immediate facts and before VCF/VCT. Book
+  distances are honest `AtMost` bounds unless global exact distance is known.
+- `apps/rustmoku-solver` provides `solve`, `resume`, `verify`, `inspect`, and
+  `query`; see [`docs/PROOF_BOOK.md`](docs/PROOF_BOOK.md).
 
 ## V0.10 - Threat-Aware Selectivity, History & QSearch
 
@@ -56,7 +75,8 @@ The established engine foundation remains:
 - Depth-first proof-number search with a dedicated context-sensitive tactical
   cache; parity depth limits and certificate reconstruction give fastest attacks,
   slowest defenses, canonical ties, and a complete terminal PV.
-- Root order: exact immediate facts, cheaper VCF, gated VCT, then Alpha-Beta.
+- Root order: exact immediate facts, verified Proof Book, cheaper VCF, gated VCT,
+  then Alpha-Beta. Zero-depth analysis does not use a book move.
 - Bound-aware LMR validity permits verified Lower cutoffs despite earlier selective
   fail-lows. VCF skips impossible parity depths and reuses validated shorter proofs.
 
@@ -113,6 +133,7 @@ From the repository root:
 cargo build --workspace
 cargo test --workspace --all-features
 cargo run --release -p rustmoku-native
+cargo run --release -p rustmoku-solver -- help
 ```
 
 The Native app displays its Cargo package version automatically and defaults to
@@ -319,6 +340,8 @@ cargo run --release -p rustmoku-engine --example search_bench
   transposition table, principal variation, and PVS/threat search.
 - `apps/rustmoku-native`: desktop presentation and persistent search worker.
 - `apps/rustmoku-arena`: deterministic paired engine matches, no GUI dependency.
+- `apps/rustmoku-solver`: offline proof generation, checkpointing, verification,
+  inspection, and queries.
 
 Dependencies remain one-way: Engine depends on Core; Native depends on Core and
 Engine, as does Arena. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the invariants and
@@ -326,8 +349,8 @@ search contracts.
 
 ## Current limits and roadmap
 
-V0.10 does not add Null Move, ProbCut, singular extension, interior VCF/VCT,
-NNUE, MCTS, opening book, server API, Renju, or Swap protocol. Parallel results
+V0.11 does not add Null Move, ProbCut, singular extension, interior VCF/VCT,
+NNUE, MCTS, an empirical opening database, server API, Renju, or Swap protocol. Parallel results
 with more than one worker are not promised bit-for-bit stable. Selective search
 does not prove equality with full-width minimax. Quiescence omits ordinary Three expansion and optional
 non-immediate defensive moves, and stops non-immediate forcing continuations at

@@ -255,7 +255,7 @@ impl UiText {
                 "AI: depth {depth} | seldepth {seldepth} | work {work} (q {qnodes}) | threads {threads} | score {score}"
             ),
             UiLanguage::SimplifiedChinese => format!(
-                "AI：深度 {depth} | 选择深度 {seldepth} | 工作量 {work}（静态 {qnodes}）| 线程 {threads} | 分数 {score}"
+                "AI：深度 {depth} | 选择深度 {seldepth} | 工作量 {work}（静态搜索节点 {qnodes}）| 线程 {threads} | 分数 {score}"
             ),
         }
     }
@@ -271,10 +271,10 @@ impl UiText {
         }
     }
 
-    pub(super) fn proof_summary(self, kind: &str, plies: u8) -> String {
+    pub(super) fn proof_summary(self, kind: &str, distance: &str) -> String {
         match self.language {
-            UiLanguage::English => format!("{kind} proven, {plies} plies"),
-            UiLanguage::SimplifiedChinese => format!("已证明 {kind}，{plies} 层"),
+            UiLanguage::English => format!("{kind} proven, {distance}"),
+            UiLanguage::SimplifiedChinese => format!("已证明 {kind}，{distance}"),
         }
     }
 

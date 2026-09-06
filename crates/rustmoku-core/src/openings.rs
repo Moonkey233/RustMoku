@@ -1,5 +1,5 @@
 //! Hand-authored Freestyle test starts, not an empirically balanced opening book.
-use crate::{Game, Move, MoveError, RuleSet};
+use crate::{CanonicalPosition, CanonicalPositionKey, Game, Move, MoveError, RuleSet};
 
 pub struct Opening {
     pub id: &'static str,
@@ -16,6 +16,12 @@ impl Opening {
             game.play_move(at)?;
         }
         Ok(game)
+    }
+
+    /// Collision-free D4 identity for deduplication without changing the
+    /// opening's chronological move record.
+    pub fn canonical_key(&self) -> Result<CanonicalPositionKey, MoveError> {
+        Ok(CanonicalPosition::new(self.game()?.position()).key())
     }
 }
 

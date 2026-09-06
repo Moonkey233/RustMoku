@@ -490,9 +490,14 @@ impl RustMokuApp {
                 ))
                 .truncate(),
             );
-            ui.label(search.tactical_proof.map_or_else(
+            ui.label(search.proof.map_or_else(
                 || String::from(text.get(TextKey::NoProof)),
-                |proof| text.proof_summary(&format!("{:?}", proof.kind), proof.plies),
+                |proof| {
+                    text.proof_summary(
+                        &format!("{:?}", proof.source),
+                        &format!("{:?}", proof.distance),
+                    )
+                },
             ));
         } else {
             ui.label(text.get(TextKey::Waiting));

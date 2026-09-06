@@ -102,6 +102,14 @@ Opening protocols such as Swap or Swap2 are conceptually distinct from board win
 
 The engine uses deterministic fail-soft PVS, aspiration iterative deepening, and bounded Gomoku threat quiescence. Root canonical ties require exact-score verification when a scout returns only a bound. Immediate tactical facts take priority over qsearch caps; potential Four-class threats are not mandatory defense. Reduced searches must retry nominal depth before improving alpha/PV, and unverified selective subtrees must not be stored as nominal-depth TT bounds.
 
+Offline proof solving uses every legal move as its completeness universe. An
+attacker OR proof needs one real proven child; a defender AND proof needs every
+legal reply proven. Bounded failure, cancellation, tactical NoProof/NotProven,
+and omitted progressively widened moves are Unknown, never Refuted. Persistent
+Proof Books use collision-free D4 canonical identity outside the ordinary search
+hot path. Parsed books are untrusted and cannot affect runtime search until full
+strategy verification succeeds.
+
 Evaluation scores are always documented with an explicit perspective. The initial evaluator returns scores from the side-to-move perspective.
 
 Terminal win/loss values use mate-distance semantics so the engine prefers faster wins and delays forced losses.

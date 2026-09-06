@@ -81,15 +81,15 @@ are plans, not implemented capabilities or permission to expand a current task.
 - Null Move, ProbCut, singular extension, and interior proof probes were
   deliberately deferred because their assumptions/evidence were insufficient.
 
-## V0.11 — Offline Solver & Proof Book (planned)
+## V0.11 — Offline Solver & Proof Book (implemented)
 
-- Add an offline solver tool with D4 canonicalization for book/database use.
-- Orchestrate a best-first AND/OR frontier and bounded resources while reusing
+- Added an offline solver tool with D4 canonicalization for book/database use.
+- Orchestrates a best-first AND/OR frontier and bounded resources while reusing
   exact Immediate, VCF, VCT and DFPN solving.
-- Produce a compact Freestyle Proof Book with proof metadata/certificates and
+- Produces a compact Freestyle Proof Book with proof metadata/certificates and
   an independent verifier.
-- Query the Proof Book at runtime before ordinary online solving.
-- Keep opening D4 deduplication and empirical balance metadata separate from
+- Queries the verified Proof Book at the runtime root before ordinary online solving.
+- Keeps opening D4 deduplication and empirical balance metadata separate from
   proven strategy.
 
 The semantic boundary is strict:

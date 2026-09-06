@@ -661,18 +661,8 @@ mod tests {
             engine.search(&fixture(&[110, 0, 111, 2, 112, 4]), SearchLimits::new(2));
             let warm = engine.search(&position, SearchLimits::new(2));
             assert_eq!(
-                (
-                    cold.best_move,
-                    cold.score,
-                    cold.tactical_proof,
-                    cold.completed_depth
-                ),
-                (
-                    warm.best_move,
-                    warm.score,
-                    warm.tactical_proof,
-                    warm.completed_depth
-                )
+                (cold.best_move, cold.score, cold.proof, cold.completed_depth),
+                (warm.best_move, warm.score, warm.proof, warm.completed_depth)
             );
             assert_eq!(
                 (
@@ -687,7 +677,7 @@ mod tests {
                 )
             );
             if nodes == 2_000 {
-                assert_eq!(cold.tactical_proof.unwrap().plies, 5);
+                assert_eq!(cold.proof.unwrap().distance, crate::ProofDistance::Exact(5));
                 assert_eq!(cold.completed_depth, 0);
                 assert_eq!(cold.seldepth, 5);
                 assert_eq!(cold.score, crate::score::MATE_SCORE - 5);

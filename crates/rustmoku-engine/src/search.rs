@@ -1,8 +1,9 @@
 use rustmoku_core::{Move, Position};
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use crate::{
-    CancellationToken, EngineConfig, Evaluator, PatternEvaluator, SearchTermination,
+    CancellationToken, EngineConfig, Evaluator, PatternEvaluator, Proof, ProofDistance,
+    ProofSource, SearchTermination, VerifiedProofBook,
     move_generation::MoveList,
     move_ordering::order_moves,
     pattern::ThreatProfile,
@@ -110,25 +111,14 @@ pub struct SearchStatistics {
     pub vct_cache_hits: u64,
     pub vct_proven: u64,
     pub vct_budget_exhausted: u64,
+    pub proof_book_probes: u64,
+    pub proof_book_hits: u64,
     /// Configured worker count for this public search.
     pub worker_count: usize,
     /// Alpha-Beta nodes searched by the principal worker.
     pub principal_nodes: u64,
     /// Alpha-Beta nodes searched by all helper workers.
     pub helper_nodes: u64,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TacticalProofKind {
-    Vcf,
-    Vct,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TacticalProof {
-    pub kind: TacticalProofKind,
-    /// Exact shortest terminal distance within the selected forcing vocabulary.
-    pub plies: u8,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -140,7 +130,7 @@ pub struct SearchResult {
     pub seldepth: u8,
     pub principal_variation: Vec<Move>,
     pub statistics: SearchStatistics,
-    pub tactical_proof: Option<TacticalProof>,
+    pub proof: Option<Proof>,
     pub termination: SearchTermination,
 }
 
@@ -154,7 +144,7 @@ pub struct SearchInfo {
     pub score: i32,
     pub principal_variation: Vec<Move>,
     pub statistics: SearchStatistics,
-    pub tactical_proof: Option<TacticalProof>,
+    pub proof: Option<Proof>,
 }
 
 impl From<&SearchResult> for SearchInfo {
@@ -166,7 +156,7 @@ impl From<&SearchResult> for SearchInfo {
             score: result.score,
             principal_variation: result.principal_variation.clone(),
             statistics: result.statistics,
-            tactical_proof: result.tactical_proof,
+            proof: result.proof,
         }
     }
 }
@@ -209,6 +199,7 @@ pub struct AlphaBetaEngine<E = PatternEvaluator> {
     config: EngineConfig,
     vcf: VcfSolver,
     vct: VctSolver,
+    proof_book: Option<Arc<VerifiedProofBook>>,
 }
 
 impl<E> AlphaBetaEngine<E> {
@@ -226,12 +217,24 @@ impl<E> AlphaBetaEngine<E> {
             config,
             vcf: VcfSolver::new(),
             vct: VctSolver::new(config.tactical().vct_table_memory_mib),
+            proof_book: None,
         }
     }
 
     pub fn clear_transposition_table(&mut self) {
         self.table.clear();
         self.generation = 0;
+    }
+
+    /// Attaches only independently verified, immutable strategy data.
+    #[must_use]
+    pub fn with_proof_book(mut self, book: Arc<VerifiedProofBook>) -> Self {
+        self.proof_book = Some(book);
+        self
+    }
+
+    pub fn set_proof_book(&mut self, book: Option<Arc<VerifiedProofBook>>) {
+        self.proof_book = book;
     }
 
     /// Samples at most 1024 buckets regardless of configured capacity.
@@ -391,6 +394,28 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
             }
             return completed;
         }
+        if let Some(book) = &self.proof_book {
+            statistics.proof_book_probes += 1;
+            if let Some(hit) = book.query(state.position()) {
+                statistics.proof_book_hits += 1;
+                completed = search_result(
+                    Some(hit.best_move),
+                    MATE_SCORE - i32::from(hit.distance.plies()),
+                    limits,
+                    0,
+                    0,
+                    vec![hit.best_move],
+                    *statistics,
+                );
+                completed.proof = Some(Proof {
+                    source: ProofSource::ProofBook,
+                    distance: hit.distance,
+                });
+                completed.statistics.work_nodes = budget.work_nodes();
+                observer.on_info(SearchInfo::from(&completed));
+                return completed;
+            }
+        }
         if self.config.tactical().vcf.enabled() && !forcing_moves(state.patterns(), side).is_empty()
         {
             let proof = state.prove_vcf(&mut self.vcf, side, self.config.vcf_max_plies(), budget);
@@ -413,9 +438,9 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
                     proof.principal_variation,
                     *statistics,
                 );
-                completed.tactical_proof = Some(TacticalProof {
-                    kind: TacticalProofKind::Vcf,
-                    plies,
+                completed.proof = Some(Proof {
+                    source: ProofSource::Vcf,
+                    distance: ProofDistance::Exact(plies),
                 });
                 completed.statistics.work_nodes = budget.work_nodes();
                 observer.on_info(SearchInfo::from(&completed));
@@ -447,9 +472,9 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
                     proof.principal_variation,
                     *statistics,
                 );
-                completed.tactical_proof = Some(TacticalProof {
-                    kind: TacticalProofKind::Vct,
-                    plies,
+                completed.proof = Some(Proof {
+                    source: ProofSource::Vct,
+                    distance: ProofDistance::Exact(plies),
                 });
                 completed.statistics.work_nodes = budget.work_nodes();
                 observer.on_info(SearchInfo::from(&completed));
@@ -1612,7 +1637,7 @@ fn search_result(
         best_move,
         score,
         requested_depth: limits.max_depth,
-        tactical_proof: None,
+        proof: None,
         termination: SearchTermination::Completed,
         completed_depth,
         seldepth,

@@ -1,9 +1,9 @@
-# RustMoku V0.10 Architecture
+# RustMoku V0.11 Architecture
 
-V0.10 builds on the V0.9 CPU-only Lazy SMP and Safe-Rust shared ordinary
-transposition table with worker-local threat-aware selectivity, contextual
-history, and measured qsearch diagnostics. Classical search remains the primary
-backend; learned evaluation remains future work.
+V0.11 adds a deterministic offline AND/OR proof solver, exact D4 identity,
+resumable generation, and an independently verified Freestyle Proof Book to the
+V0.10 classical engine. Classical recursive search and its V0.9/V0.10 TT and
+selectivity protocols remain unchanged; learned evaluation remains future work.
 Core remains authoritative for legality and wins; Native remains an adapter.
 All first-party crates forbid unsafe code. Concurrency uses only the standard library.
 Milestone scope and future work live in [ROADMAP.md](ROADMAP.md).
@@ -15,6 +15,7 @@ rustmoku-engine -> rustmoku-core
 rustmoku-native -> rustmoku-core
 rustmoku-native -> rustmoku-engine
 rustmoku-arena -> rustmoku-core + rustmoku-engine
+rustmoku-solver -> rustmoku-core + rustmoku-engine
 ```
 
 `rustmoku-core` has no third-party dependencies and owns Gomoku semantics.
@@ -96,8 +97,19 @@ or UI dependency. Invalid import cannot mutate the current game.
 The shared OPENINGS slice contains twelve hand-authored Freestyle test starts,
 each with stable id/name, rules and validated Move sequence. Opening::game replays
 through Game and can report a legality error; no direct Position writes exist.
-There is no official balance provenance, RNG, balance score, D4 deduplication or
-opening database. Native selection/cycling and Arena use the same stable order.
+There is no official balance provenance, RNG, balance score, or opening database.
+`Opening::canonical_key` supports exact D4 deduplication without changing the
+chronological opening record. Native selection/cycling and Arena use the same stable order.
+
+### Exact D4 identity
+
+Core's stable eight-value `Symmetry` transforms validated `Move` values and
+provides exact inverses. `CanonicalPosition` chooses the lexicographically least
+complete transformed board encoding, breaking symmetric ties by stable enum
+order. `CanonicalPositionKey` packs all 225 empty/Black/White cell values plus
+side to move into 58 bytes. Rules and attacker remain explicit context fields.
+This facility is used by offline proof/book and opening deduplication only,
+never ordinary TT lookup, move generation, or recursive Alpha-Beta.
 
 ## Engine boundary and ownership
 
@@ -105,7 +117,7 @@ The intentionally small public surface includes `Evaluator`, `ClassicalEvaluator
 `PatternEvaluator`, opaque `PatternState`,
 `SearchEngine`, `AlphaBetaEngine`, `EngineConfig`, `TacticalConfig`, `ProofLimits`, `SearchLimits`,
 `SearchResult`, `SearchInfo`, `SearchObserver`, `CancellationToken`,
-`SearchTermination`, `TacticalProof`, `TacticalProofKind`, `SearchStatistics`, and
+`SearchTermination`, `Proof`, `ProofSource`, `ProofDistance`, `SearchStatistics`, and
 `TranspositionTableStatistics`. `PatternUndo` is private; the public PatternState
 API debt is deferred to the NNUE/custom-evaluator milestone. Candidate lists,
 ordering, hashes, search-side state, TT entries, and PV tables remain private.
@@ -135,6 +147,45 @@ Normal recursion calls SearchState make/unmake, coordinating BoardUndo with
 E::Undo. BoardState asks Core to accept each move before updating any sidecar;
 rejected moves leave all state untouched. Undo consumes tokens in LIFO order.
 No recursive Position or PatternState copies, dynamic dispatch, or locks exist.
+
+## Offline proof solving and Proof Book
+
+`OfflineSolver` fixes Freestyle rules and one attacker. Attacker turns are OR;
+defender turns are AND. A proof-number tree uses saturating arithmetic and stable
+move/node ordering. Legal completeness is always all empty legal board points.
+Progressive widening creates small batches, while every omitted move contributes
+unresolved proof/disproof work: OR cannot become Refuted until all moves are
+refuted, and AND cannot become ProvenWin until every defender reply is present
+and proven. Candidate/frontier and threat profiles affect ordering only.
+
+Terminal facts and exact immediate tactics precede small configurable VCF and
+VCT/DFPN leaf attempts. Only a returned `ProvenWin` closes a tactical leaf.
+NotProven, NoProof, local budget exhaustion, global work/time exhaustion, and
+cancellation remain Unknown. Static evaluation and Alpha-Beta scores are never
+proof evidence. Completed results may be reused only under the collision-free
+D4 key plus rules/attacker context; unresolved nodes remain an ordinary tree.
+
+Solver checkpoints have their own magic/version and store the root record, tree,
+expansion cursors, proof numbers, evidence, and cumulative diagnostics. Loading
+legally replays the root and every parent transition and validates identities,
+counts, links, numbers, and ordering. A temporary sibling is synced before the
+previous checkpoint is replaced. Checkpoints are not Proof Books.
+
+The Proof Book codec is documented in [PROOF_BOOK.md](PROOF_BOOK.md). Parsed
+`ProofBook` is structurally valid but untrusted. Verification starts from every
+ordered root, follows normal legal transitions, recomputes D4 keys, checks each
+attacker action, enumerates every defender legal reply, rejects cycles and
+unreachable records, and reruns tactical leaves with fresh board-only solvers.
+Only `VerifiedProofBook` can be attached to `AlphaBetaEngine` through immutable
+`Arc` ownership.
+
+Positive-depth root order is terminal, immediate fact, verified book, VCF, VCT,
+then iterative Alpha-Beta. A hit inverse-transforms and rechecks its move, reports
+completed depth zero and `ProofSource::ProofBook`, and never enters the ordinary
+TT. `ProofDistance::AtMost` is a winning upper bound on plies, not a shortest-win
+claim; the numeric mate-like score is the corresponding documented lower bound.
+Zero-depth analysis does not probe the book. A miss changes only book probe
+statistics and falls through to the V0.10 behavior.
 
 `SearchState::prove_vcf` / `prove_vct` lend only the coordinator's private board
 to the concrete solver and return an owned result after restoration. Ordinary
@@ -570,7 +621,8 @@ and `vcf_budget_exhausted` report proof work separately from Alpha-Beta nodes/qn
 - `requested_depth`: the caller's maximum;
 - `completed_depth`: the last fully completed iteration;
 - `seldepth`: maximum ply visited or resolved in an immediate proof prefix;
-- `tactical_proof`: optional VCF/VCT kind/distance, with no completed nominal iteration;
+- `proof`: optional VCF/VCT/ProofBook source and exact/at-most distance metadata,
+  with no completed nominal iteration;
 - `principal_variation`: a legal searched prefix whose first move equals
   `best_move` when one exists.
 
@@ -700,10 +752,11 @@ its locally uncharged, nonbranching certificate replay, which does consume globa
 work. Neither limit counts individual CPU instructions. Statistics never determine
 validity.
 
-Positive-depth root order is exact immediate facts, VCF, enabled VCT with an own
-OpenThree-or-stronger candidate, then normal Alpha-Beta. Exact immediate roots
-return completed_depth=0 without invoking either solver. VCT ProvenWin returns
-kind=Vct, MATE_SCORE-plies, completed_depth=0, seldepth=plies, and a full proof PV.
+Positive-depth root order is exact immediate facts, verified Proof Book, VCF,
+enabled VCT with an own OpenThree-or-stronger candidate, then normal Alpha-Beta.
+Exact immediate roots return completed_depth=0 without probing the book or either
+solver. VCT ProvenWin returns source=Vct, an exact distance, MATE_SCORE-plies,
+completed_depth=0, seldepth=plies, and a full proof PV.
 NoProof/BudgetExceeded falls through. No DFPN calls occur inside Alpha-Beta or
 qsearch. Zero nominal-depth analysis remains unchanged.
 
@@ -787,7 +840,7 @@ lowest candidate index (center if empty), static side-to-move score and one-move
 PV, with completed_depth=0. It is not a completed minimax evaluation. Zero-depth
 analysis keeps no move/PV and uses its completed qsearch score if available.
 Immediate exact facts remain valid; VCF/VCT certificates are accepted only after
-complete reconstruction and a boundary poll, with tactical_proof and nominal
+complete reconstruction and a boundary poll, with proof metadata and nominal
 depth zero.
 
 `SearchInfo` owns completed depth, seldepth, best move, root-side score, PV,

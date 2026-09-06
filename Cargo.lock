@@ -1763,7 +1763,7 @@ dependencies = [
 
 [[package]]
 name = "rustmoku-arena"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "rustmoku-core",
  "rustmoku-engine",
@@ -1771,11 +1771,11 @@ dependencies = [
 
 [[package]]
 name = "rustmoku-core"
-version = "0.10.0"
+version = "0.11.0"
 
 [[package]]
 name = "rustmoku-engine"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "loom",
  "rustmoku-core",
@@ -1783,12 +1783,20 @@ dependencies = [
 
 [[package]]
 name = "rustmoku-native"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "eframe",
  "rustmoku-core",
  "rustmoku-engine",
  "sys-locale",
+]
+
+[[package]]
+name = "rustmoku-solver"
+version = "0.11.0"
+dependencies = [
+ "rustmoku-core",
+ "rustmoku-engine",
 ]
 
 [[package]]

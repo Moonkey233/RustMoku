@@ -386,7 +386,7 @@ fn proof_work_shares_outer_limit_but_local_exhaustion_falls_through_and_proofs_e
             );
         assert_eq!(proof.termination, SearchTermination::Completed);
         assert_eq!(infos.len(), 1);
-        assert!(infos[0].tactical_proof.is_some());
+        assert!(infos[0].proof.is_some());
         same_iteration(&proof, &infos[0]);
         assert_eq!(
             proof.statistics.work_nodes,
