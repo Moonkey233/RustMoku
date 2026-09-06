@@ -1,6 +1,6 @@
 use super::*;
 use rustmoku_core::Stone;
-use std::cell::Cell;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 fn fixture(indices: &[usize]) -> Position {
     let mut position = Position::default();
@@ -54,6 +54,90 @@ fn node_limit_is_exact_deterministic_and_retains_last_complete_iteration() {
 }
 
 #[test]
+fn lazy_smp_aggregates_worker_work_and_returns_a_legal_principal_pv() {
+    let position = fixture(&[112, 97, 128, 113]);
+    let config = config().with_threads(4);
+    let result = AlphaBetaEngine::with_config(PatternEvaluator, config)
+        .search(&position, SearchLimits::new(3));
+    assert_eq!(result.termination, SearchTermination::Completed);
+    assert_eq!(result.statistics.worker_count, 4);
+    assert_eq!(
+        result.statistics.nodes,
+        result.statistics.principal_nodes + result.statistics.helper_nodes
+    );
+    assert_eq!(
+        result.statistics.work_nodes,
+        result.statistics.nodes + result.statistics.vcf_nodes + result.statistics.vct_nodes
+    );
+    assert_eq!(
+        result.principal_variation.first().copied(),
+        result.best_move
+    );
+    let mut replay = position.clone();
+    for at in result.principal_variation {
+        replay
+            .make_move(at)
+            .expect("parallel principal variation is legal");
+    }
+}
+
+#[test]
+fn lazy_smp_global_node_limit_is_exact_across_workers() {
+    let position = fixture(&[112, 97, 128, 113]);
+    let result = AlphaBetaEngine::with_config(PatternEvaluator, config().with_threads(4))
+        .search(&position, SearchLimits::new(8).with_max_nodes(500));
+    assert_eq!(result.termination, SearchTermination::NodeLimit);
+    assert_eq!(result.statistics.work_nodes, 500);
+    assert!(result.statistics.nodes <= result.statistics.work_nodes);
+    assert_eq!(
+        result.statistics.nodes,
+        result.statistics.principal_nodes + result.statistics.helper_nodes
+    );
+    assert!(
+        position.is_legal(
+            result
+                .best_move
+                .expect("positive depth has a fallback move")
+        )
+    );
+}
+
+#[test]
+fn helper_shutdown_after_principal_completion_is_not_public_cancellation() {
+    let position = fixture(&[112]);
+    let result = AlphaBetaEngine::with_config(PatternEvaluator, config().with_threads(4))
+        .search(&position, SearchLimits::new(1));
+    assert_eq!(result.termination, SearchTermination::Completed);
+    assert_eq!(result.completed_depth, 1);
+}
+
+#[test]
+fn parallel_cancellation_keeps_only_the_principal_workers_completed_depth() {
+    let position = fixture(&[112, 97, 128, 113]);
+    let armed = AtomicBool::new(false);
+    let cancellation = CancellationToken::new();
+    let evaluator = AuditEvaluator {
+        armed: &armed,
+        cancellation: cancellation.clone(),
+        delay: None,
+    };
+    let mut infos = Vec::new();
+    let result = AlphaBetaEngine::with_config(evaluator, config().with_threads(4))
+        .search_controlled(&position, SearchLimits::new(8), cancellation, &mut |info| {
+            infos.push(info);
+            armed.store(true, Ordering::Relaxed);
+        });
+    assert_eq!(result.termination, SearchTermination::Cancelled);
+    let last = infos.last().expect("depth one must complete before arming");
+    same_iteration(&result, last);
+    assert!(result.statistics.work_nodes > last.statistics.work_nodes);
+    assert_eq!(
+        result.statistics.nodes,
+        result.statistics.principal_nodes + result.statistics.helper_nodes
+    );
+}
+
+#[test]
 fn uncontrolled_search_retains_v07_result_and_info_only_reports_completed_depths() {
     let position = fixture(&[112, 97, 128, 113]);
     let mut infos = Vec::new();
@@ -87,7 +171,7 @@ fn uncontrolled_search_retains_v07_result_and_info_only_reports_completed_depths
 // production unit evaluators. Hooks deterministically interrupt *inside* an
 // iteration after the observer has armed them at the previous completed depth.
 struct AuditEvaluator<'a> {
-    armed: &'a Cell<bool>,
+    armed: &'a AtomicBool,
     cancellation: CancellationToken,
     delay: Option<Duration>,
 }
@@ -111,7 +195,7 @@ impl Evaluator for AuditEvaluator<'_> {
     }
     fn evaluate(&self, position: &Position, patterns: &crate::PatternState, state: &usize) -> i32 {
         assert_eq!(*state, self.initialize(position));
-        if self.armed.replace(false) {
+        if self.armed.swap(false, Ordering::Relaxed) {
             if let Some(delay) = self.delay {
                 std::thread::sleep(delay);
             } else {
@@ -141,7 +225,7 @@ fn cancellation_before_and_inside_search_never_publishes_partial_iterations() {
     );
     assert_eq!(before.best_move, Some(Move::CENTER));
     assert!(infos.is_empty());
-    let armed = Cell::new(false);
+    let armed = AtomicBool::new(false);
     let cancellation = CancellationToken::new();
     let evaluator = AuditEvaluator {
         armed: &armed,
@@ -154,7 +238,7 @@ fn cancellation_before_and_inside_search_never_publishes_partial_iterations() {
         cancellation,
         &mut |info| {
             infos.push(info);
-            armed.set(true);
+            armed.store(true, Ordering::Relaxed);
         },
     );
     assert_eq!(result.termination, SearchTermination::Cancelled);
@@ -173,7 +257,7 @@ fn deadline_inside_an_iteration_returns_previous_depth_and_zero_time_falls_back(
     );
     assert_eq!(zero.termination, SearchTermination::TimeLimit);
     assert_eq!(zero.completed_depth, 0);
-    let armed = Cell::new(false);
+    let armed = AtomicBool::new(false);
     // Depth one on an empty board visits two nodes. The long margin avoids
     // wall-clock races during that setup, then the evaluator crosses the limit.
     let evaluator = AuditEvaluator {
@@ -188,7 +272,7 @@ fn deadline_inside_an_iteration_returns_previous_depth_and_zero_time_falls_back(
         CancellationToken::new(),
         &mut |info| {
             infos.push(info);
-            armed.set(true);
+            armed.store(true, Ordering::Relaxed);
         },
     );
     assert_eq!(result.termination, SearchTermination::TimeLimit);
@@ -200,14 +284,14 @@ fn deadline_inside_an_iteration_returns_previous_depth_and_zero_time_falls_back(
 #[test]
 fn interrupted_recursion_restores_all_sidecars_and_does_not_store_root_bound() {
     let position = fixture(&[112, 97, 128, 113]);
-    let armed = Cell::new(false);
+    let armed = AtomicBool::new(false);
     for cap in [1, 20, 256] {
         let evaluator = AuditEvaluator {
             armed: &armed,
             cancellation: CancellationToken::new(),
             delay: None,
         };
-        let mut engine = AlphaBetaEngine::with_config(evaluator, config());
+        let engine = AlphaBetaEngine::with_config(evaluator, config());
         let mut state = SearchState::new(&position, &engine.evaluator);
         let mut budget = SearchBudget::new(
             SearchLimits::new(6).with_max_nodes(cap),

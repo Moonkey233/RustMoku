@@ -1,8 +1,9 @@
-# RustMoku V0.8 Architecture
+# RustMoku V0.9 Architecture
 
-V0.8 builds on official V0.7 `d1d97088ea418b80df1ba7759958f30dc64aef53` with
-VCT hardening, shared search lifecycle control, a headless Arena and an async
-native adapter. Classical search itself remains single-threaded.
+V0.9 builds on the V0.8 lifecycle, Arena and native adapter with CPU-only
+multi-core Lazy SMP and a Safe-Rust shared ordinary transposition table.
+Classical search remains the primary backend; this milestone adds no advanced
+selectivity or learned evaluation.
 Core remains authoritative for legality and wins; Native remains an adapter.
 All first-party crates forbid unsafe code. Concurrency uses only the standard library.
 Milestone scope and future work live in [ROADMAP.md](ROADMAP.md).
@@ -109,17 +110,19 @@ The intentionally small public surface includes `Evaluator`, `ClassicalEvaluator
 API debt is deferred to the NNUE/custom-evaluator milestone. Candidate lists,
 ordering, hashes, search-side state, TT entries, and PV tables remain private.
 
-`SearchEngine::search` takes `&mut self` because `AlphaBetaEngine` owns a mutable,
-persistent transposition table and generation counter. The caller still supplies
-an immutable `&Position`, which search never mutates. No interior mutability,
-shared engine lock, or global cache is involved. Native's worker owns its engine;
-the only shared search state is a one-way cancellation atomic.
+`SearchEngine::search` takes `&mut self` because `AlphaBetaEngine` owns the
+generation and the coordinator-owned VCF/VCT tables. The ordinary TT itself is
+Safe-Rust shared state borrowed immutably by a temporary scoped Lazy-SMP team.
+The caller still supplies an immutable `&Position`, which search never mutates.
+No engine lock, global cache, or persistent internal thread pool is involved.
+Native's worker owns its engine; the public-search shared state is limited to
+the ordinary TT and one lifecycle control object.
 
 ## BoardState and SearchState: coordinated incremental ownership
 
 ```text
 AlphaBetaEngine<E>                  evaluator configuration + ordinary TT + VCF/VCT solvers
-  SearchState<E>                    one local working state per public search
+  SearchState<E>                    one local working state per AB worker
     BoardState                     engine-private, evaluator-independent
       Position                     authoritative rules (one root clone)
       PositionKey                  incremental Zobrist key
@@ -133,8 +136,9 @@ E::Undo. BoardState asks Core to accept each move before updating any sidecar;
 rejected moves leave all state untouched. Undo consumes tokens in LIFO order.
 No recursive Position or PatternState copies, dynamic dispatch, or locks exist.
 
-`SearchState::prove_vcf` / `prove_vct` lend only its private board to the concrete solver and
-returns an owned result after restoration. No mutable board getter or arbitrary
+`SearchState::prove_vcf` / `prove_vct` lend only the coordinator's private board
+to the concrete solver and return an owned result after restoration. Ordinary
+Lazy-SMP helpers construct their own root state after these stages. No mutable board getter or arbitrary
 callback can expose a board/accumulator mismatch. The solver cannot access the
 evaluator or E::State. Proven, NotProven, BudgetExceeded and outer-interrupted paths all unwind
 board transitions; tests compare every field against a rebuilt board.
@@ -271,38 +275,63 @@ WinningMove flags are also compared to Core `would_win` for both colors.
 
 ## Transposition table
 
-`AlphaBetaEngine` owns a contiguous `Vec<Bucket>`. Bucket count is a power of two,
-the low key bits select a bucket, and each four-way bucket verifies the full
-64-bit key before accepting a hit. The default 64 MiB table has 1,048,576
-buckets and 4,194,304 entries.
+`AlphaBetaEngine` owns a contiguous `Vec<AtomicBucket>` plus a separate atomic
+version sidecar. Bucket count is a power of two, the low key bits select a
+bucket, and each four-way bucket verifies the full 64-bit key before accepting a
+hit. The primary bucket remains four `AtomicSlot`s at 16 bytes each (64 bytes);
+the sidecar adds one 8-byte version per bucket. The default 64 MiB primary table
+has 1,048,576 buckets and 4,194,304 entries, plus 8 MiB of synchronization
+storage, for 72 MiB of reported allocation.
 
-An entry stores the full key, normalized `i32` score, optional packed best move,
-`u8` depth, bound, and `u8` generation. `PackedMove` privately encodes validated
-`Move.index() + 1` in `NonZeroU8`, so `Option<PackedMove>` uses Rust's safe niche
-representation without a public sentinel. On the current supported target,
-`TtEntry` is 16 bytes and a four-entry bucket is 64 bytes; regression tests pin
-these cache-local dimensions without unsafe layout tricks.
+An `AtomicSlot` stores the full key and one packed payload. The payload contains
+the normalized `i32` score, optional packed best move, `u8` depth, bound and
+`u8` generation. `PackedMove` privately encodes validated `Move.index() + 1` in
+`NonZeroU8`, so no public sentinel enters Core. The logical `TtEntry` remains
+16 bytes; primary atomic layout is checked by tests without unsafe code.
 
-Each public search advances one generation; all iterative depths within it share
-that generation and table. The table persists between searches. On generation
-counter exhaustion the u8 generation wraps without clearing. Replacement is
-deterministic: same full key first, then empty slot, then lowest quality
-`depth + 4 * is_exact - 4 * current.wrapping_sub(stored)`, with lower slot index
-breaking ties. Recent shallow entries cannot trivially displace an older deep
-Exact entry, but sufficient relative age eventually outweighs depth.
-After 256 generations age may alias; this affects eviction quality only, never
-key/depth/bound correctness. A shallow/weaker update
-does not trivially overwrite a deeper exact entry for the same key.
+Writers claim a bucket's even version with AcqRel CAS and make it odd, choose
+the same-key/empty/lowest-quality replacement slot, store that slot's key and
+payload with Release, then publish the next even version with Release. A reader
+loads the version with Acquire, misses while it is odd, reads every key and
+payload with Acquire, and loads the version again with Acquire. It accepts only
+equal even versions and a full requested-key match.
+
+The first version Acquire makes the completed publication happen-before the
+field loads, excluding older data. If either field comes from a later writer,
+its Release/Acquire pair makes that writer's preceding odd claim happen-before
+the final version load. Atomic coherence then prevents that load from returning
+the old even version. Writers are serialized by the claim, so equality proves
+one coherent bucket epoch even across same-key updates and colliding writers.
+Relaxed field accesses do not establish this second edge: two Acquire version
+loads alone are insufficient. The actual TT implementation has a Loom regression
+that rejects the mixed key/score accepted by the original V0.9 protocol.
+
+Each probe/store has bounded retries. At the last even u64 version, stores are
+dropped until exclusive clear/resize; versions never wrap during shared access.
+Clear requires `&mut self`, excluding diagnostic readers as well as workers, so
+it can reset the contents and versions without an old snapshot surviving.
+
+Each public search advances one generation; all iterative depths and workers
+within it share that generation and table. The table persists between searches.
+On generation counter exhaustion the u8 generation wraps without clearing.
+Replacement is deterministic in single-thread mode: same full key first, then
+empty slot, then lowest quality `depth + 4 * is_exact - 4 * age`, with lower
+slot index breaking ties. Concurrent stores serialize per bucket only while
+claiming the version; a racing store may be skipped, but replacement races do
+not weaken key/depth/bound validation. After 256 generations age may alias; this
+affects eviction quality only.
 
 `AlphaBetaEngine::clear_transposition_table` provides an explicit cold-cache
-reset for reproducible experiments; resize also starts empty. Capacity rounds down
-to a power-of-two bucket count, with one bucket as the minimum (including 0 MiB).
-The default remains 64 MiB. `transposition_table_statistics()` reports bytes,
-buckets, entries, and sampled occupancy per mille by inspecting at most the first
-1024 buckets (4096 entries), independent of total capacity. Occupancy includes old
-generations and is approximate. Replacement counts record colliding full-key
-evictions since explicit clear/resize; SearchStatistics records this search's
-evictions separately. Same-key updates and empty-slot fills are not evictions.
+reset for reproducible experiments; resize/reconfigure also starts empty and is
+available only through the engine-owning mutable handle between searches.
+`tt_memory_mib` describes primary bucket capacity. Capacity rounds down to a
+power-of-two bucket count, with one bucket as the minimum (including 0 MiB), and
+the default remains 64 MiB. `transposition_table_statistics()` reports primary,
+sidecar and total bytes, buckets, entries, sampled occupancy per mille and
+colliding replacement counts. Sampling inspects at most the first 1024 buckets;
+occupancy includes old generations and is approximate. SearchStatistics records
+the evictions observed by that public search separately. Same-key updates and
+empty-slot fills are not evictions.
 
 ### Bound correctness
 
@@ -371,9 +400,10 @@ arbitrarily change the semantic root choice.
 
 ## PVS, aspiration, PV, and statistics
 
-Search completes iterations from depth 1 to `SearchLimits::max_depth`, sharing
-one TT generation and one fresh SearchHeuristics across the public call. At root
-and ordinary nodes, the first ordered child uses the full node window. Later
+The principal worker completes iterations from depth 1 to
+`SearchLimits::max_depth`, sharing one TT generation with the helper workers.
+Each worker owns a fresh `SearchHeuristics`, PV table and lifecycle handle. At
+root and ordinary nodes, the first ordered child uses the full node window. Later
 children use `[-alpha-1, -alpha]`; an improvement strictly below beta triggers
 a full node-window re-search. Fail-high cuts off directly. Scores remain fail-soft
 and TT bounds use the original alpha/beta. Root bound ties with a smaller index
@@ -418,7 +448,7 @@ After stand-pat beta cutoff and alpha update, noisy moves are generated directly
 as `CandidateFrontier bits & own profile bits >= Four`, then ascending set-bit
 iteration materializes a fixed-capacity ordered list. No scan of ordinary
 candidates, ordinary Three/OpenThree/DoubleThree expansion, or optional enemy
-non-immediate defensive points is included in V0.8.
+non-immediate defensive points is included in V0.9.
 
 The expansion cap remains six qplies. At/after it, only exact immediate facts and
 forced-block chains continue; each reply fills a cell, so the 225-cell board is
@@ -454,8 +484,10 @@ normalization are unchanged.
 ## Exact continuous-four (VCF) proofs
 
 The private VcfSolver fixes an attacker Stone and operates only on BoardState.
-It returns ProvenWin, NotProven, or BudgetExceeded. NotProven means no proof
-within the continuous-four definition and max proof plies; it never means lost.
+It returns ProvenWin, NotProven, BudgetExceeded, or Interrupted. NotProven means
+no proof within the continuous-four definition and max proof plies; it never
+means lost. Interrupted is reserved for an outer cancellation, deadline, or
+global work stop and is never cached as a disproof.
 
 Terminal state comes first. At an attacker turn an immediate win ends the proof.
 Otherwise, ascending Four-or-stronger profile bitsets generate attacks without a
@@ -505,7 +537,7 @@ generation exhaustion clears before restarting at one, preventing stale aliases.
 EngineConfig defaults to 11 proof plies and 2,000 proof nodes. Each visited proof
 node costs one, including depth-zero nodes and accepted cache hits. Bounded
 certificate replay has no branches and costs no local expansion nodes (at most
-the proof depth transitions). V0.8 charges each replay visit to global work. Depth is
+the proof depth transitions). V0.9 charges each replay visit to global work. Depth is
 also clamped to remaining board cells. Zero in either config field disables the
 root attempt. The shared lifecycle independently enforces outer work/time/cancel limits.
 
@@ -534,11 +566,14 @@ always the full nominal depth.
 
 `SearchStatistics` counts all Alpha-Beta iterations in one public search: visited nodes,
 qnodes (a subset of nodes), PVS/tie re-searches, LMR reductions/full-depth retries,
-aspiration fail-low/high retries,
-static evaluations, beta cutoffs, TT probes, full-key hits, TT cutoffs, successful
-TT stores, and colliding replacements. Seldepth may exceed nominal depth plus six through exact immediate tactics.
-Wall time is intentionally excluded from deterministic
-engine statistics and measured externally by the benchmark utility.
+aspiration fail-low/high retries, static evaluations, beta cutoffs, TT probes,
+full-key hits, TT cutoffs, successful TT stores, and colliding replacements.
+`worker_count`, `principal_nodes` and `helper_nodes` expose compact parallel
+observability; the final result aggregates all joined workers, while an emitted
+`SearchInfo` is the principal worker's completed-depth snapshot. Seldepth may
+exceed nominal depth plus six through exact immediate tactics. Wall time is
+intentionally excluded from deterministic engine statistics and measured
+externally by the benchmark utility.
 
 ## Exact threat-space VCT and DFPN
 
@@ -664,13 +699,19 @@ NoProof means no proof within the chosen vocabulary/depth, never a loss verdict.
 
 Zobrist generation, candidate traversal, move ordering, replacement, and
 equal-score selection are deterministic; no random source or unordered
-collection participates. For identical semantic input, configuration, and
-software version, semantic output means the same best move and score.
+collection participates. With `EngineConfig::threads() == 1`, identical
+semantic input, configuration and software version preserve the strict V0.8
+reference result (best move and score). The library default is one worker.
 
-The persistent ordinary TT is an optimization state. Warm and cold searches may have
-different node, TT-hit, and wall-time measurements while retaining the same
-semantic result. Reproducible performance experiments must use a fresh engine or
-call the explicit table-clear method.
+With more than one worker, the root rotation is deterministic and no RNG or
+evaluator noise is introduced, but helper/principal interleaving changes shared
+TT timing and heuristic work. Parallel searches therefore may produce different
+work, wall time or heuristic result; they are not promised bit-for-bit stable.
+
+The persistent ordinary TT is an optimization state. In the one-worker reference
+mode, warm and cold searches may have different node, TT-hit, and wall-time
+measurements while retaining the same semantic result. Reproducible performance
+experiments must use a fresh engine or call the explicit table-clear method.
 
 ## Search lifecycle and completed snapshots
 
@@ -684,11 +725,13 @@ observer. This contract is independent of Alpha-Beta and can serve future backen
 
 `CancellationToken` is a cloneable `Arc<AtomicBool>`, using Relaxed loads/stores:
 it transports no other data. Cancellation is one-way; there is no reset or token
-reuse protocol. `SearchBudget` is a single mutable engine-internal value borrowed
-by Alpha-Beta/qsearch resources and by VCF/VCT proof resources. It owns start time,
-optional elapsed Duration, work count, node cap, token and latched stop reason.
-Elapsed time avoids overflow for large Duration inputs. No Arc clones occur in
-recursion and no engine Mutex/RwLock exists.
+reuse protocol. One public search creates a shared control object containing the
+token, start time, optional elapsed Duration, optional global node cap, latched
+public stop reason and internal team-done flag. Each AB worker then receives a
+local `SearchBudget` handle with its own work counter and the shared control.
+VCF/VCT use the coordinator's handle. Uncapped ordinary nodes therefore avoid a
+contended atomic RMW; capped searches use exact shared admission. No Arc clones
+occur in recursion and no engine Mutex/RwLock exists.
 
 One work unit admits one normal node (qnodes included once), VCF visit, VCF
 certificate replay visit, or VCT/DFPN inspection/certificate visit. VCT child
@@ -699,16 +742,19 @@ if admission is already stopped their known exact answer remains usable without
 exceeding the cap. Existing subsystem counters remain separate; global work can
 exceed nodes + vcf_nodes + vct_nodes because VCF replay is locally uncharged.
 
-The integer cap is checked exactly on admission: N admits at most N visits.
-The atomic and optional clock are polled before the first charge, every 256
-charges, before root solvers, between solver stages/depths, and before publishing
-an iteration/proof. Polls do not charge nodes. Reaching the node count exactly at
-the requested final result can still mean Completed; NodeLimit means additional
-work was denied. Cancellation takes precedence over time at a poll, and the first
-observed reason is latched. Local proof exhaustion means BudgetExceeded and may
-fall through; an outer stop is a distinct Interrupted/Stopped result, never a
-cached NoProof/NotProven. A caller's slow evaluator/observer can delay polling;
-these are cooperative deadlines, not hard real-time guarantees.
+The integer cap is checked exactly by shared admission: N admits at most N visits
+across root proofs, worker 0 and every helper. The atomic and optional clock are
+polled before the first charge, every 256 local charges, before root solvers,
+between solver stages/depths, and before publishing an iteration/proof. Polls do
+not charge nodes. Reaching the node count exactly at the requested final result
+can still mean Completed; NodeLimit means additional work was denied.
+Cancellation takes precedence over time at a poll, and the first observed public
+reason is latched. When the principal worker finishes the requested depth it
+marks team-done; helper shutdown is internal and cannot turn that completed result
+into Cancelled. Local proof exhaustion means BudgetExceeded and may fall through;
+an outer stop is a distinct Interrupted/Stopped result, never a cached
+NoProof/NotProven. A caller's slow evaluator/observer can delay polling; these
+are cooperative deadlines, not hard real-time guarantees.
 
 Alpha-Beta and qsearch return `Result<_, Stopped>`. Child re-searches are enclosed
 in a fallible scope, then Position, hash, frontier, PatternState and evaluator
@@ -741,21 +787,28 @@ histories. Fresh engines and node limits provide reproducible Arena experiments.
 ## Native adapter and worker ownership
 
 The eframe/egui UI draws public Game/Position state, translates validated Moves,
-and displays completed depth, seldepth, total work, qnodes, score, TT statistics,
-PV and proof distance. Depth (1..12) and optional move time (0 = unlimited) apply
-to the next request. No search, rules or evaluator logic lives in presentation.
+and displays completed depth, seldepth, total work, qnodes, worker count, score,
+TT statistics, PV and proof distance. Depth (1..12), thread count and ordinary
+TT MiB apply to the next request; optional move time (0 = unlimited) remains a
+per-request limit. No search, rules or evaluator logic lives in presentation.
 
 One persistent standard-library thread constructs and exclusively owns its
 AlphaBetaEngine. An mpsc request carries a monotonically increasing u64 ID, owned
-Position snapshot, limits and fresh token. A separate mpsc channel returns tagged
-SearchInfo and SearchResult events. Request payloads are boxed once off the hot
-path; channels never block the search on UI consumption, and events are coarse.
-The ordinary TT allocation/history survives consecutive moves.
+Position snapshot, limits and fresh token. During one request the engine
+temporarily scopes its principal plus helper Alpha-Beta workers; the outer Native
+worker remains persistent. A separate mpsc channel returns tagged SearchInfo and
+SearchResult events. Request payloads are boxed once off the hot path; channels
+never block the search on UI consumption, and events are coarse. Ordinary TT
+allocation/history survives consecutive moves unless the user changes TT MiB,
+which is sent as an owner-thread reconfiguration and starts an empty table.
 
 The UI-side SearchWorker owns the matching token clone and current ID. New Game,
 side change, Undo, successful import, a human move starting a request and shutdown cancel the old token
 and advance the ID without wrapping. One admission gate rejects every stale ID
-and any duplicate final event after the active request ends. Only a current,
+and any duplicate final event after the active request ends. Reconfiguring
+Threads or TT MiB first cancels/invalidates the active ID, sends a FIFO command
+to the owning thread, and starts a replacement search only when the game still
+needs one. Only a current,
 non-cancelled result can call Game::play_move, with an ongoing game and AI turn.
 Input cannot enqueue duplicate AI moves. While searching, UI frames poll events
 and request repaint every 16 ms; New Game invalidates immediately, regardless
@@ -771,8 +824,8 @@ it and subsequent replies. A pending AI reply means one ply is removed; a finish
 reply normally means two. Terminal states use the same rule. There is no prior
 human decision behind an initial AI move, so Undo is disabled there. The UI
 cancels/advances its ID before mutation, clears displayed search state, and checks
-whether the restored side requires a new AI request. None of these operations
-clears/resizes the worker's ordinary TT.
+whether the restored side requires a new AI request. Game edits do not clear or
+resize the worker's ordinary TT.
 
 A fixed 238-point top controls panel and fixed 180-point history panel isolate
 the remaining board rectangle. PV is one horizontal scroll row, and history is
@@ -784,25 +837,30 @@ export/copy, legal import and explicit standard-library file load/save.
 
 ## Headless Arena
 
-`rustmoku-arena` depends only on Core and Engine. It runs sequentially and replays
-one of twelve shared fixed legal opening prefixes through Game for each paired leg: A is
-Black then White on the same board. Both engines are fresh per game; their
-ordinary TTs persist between that game's moves. Player-specific EngineConfig and
-Pattern/Classical evaluator selection use concrete variants, dispatched once per
-move with static recursive search. Common positive depth and optional global
-node limits apply per move. The board fills or Core declares a winner; there is
-no heuristic adjudication or arbitrary move cutoff.
+`rustmoku-arena` depends only on Core and Engine. It runs matches sequentially and
+replays one of twelve shared fixed legal opening prefixes through Game for each
+paired leg: A is Black then White on the same board. Both engines are fresh per
+game; their ordinary TTs persist between that game's moves. Player-specific
+EngineConfig includes an independent Alpha-Beta thread count, TT size and
+Pattern/Classical evaluator selection; a move may temporarily fan out its own
+Lazy-SMP team. Common positive depth and optional global node limits apply per
+move. The board fills or Core declares a winner; there is no heuristic
+adjudication or arbitrary move cutoff.
 
 CSV records pair/opening id/leg, A color, winner, plies, searched moves and total work.
 Configuration and summary go to stderr. A win earns one point, a draw half; A's
 paired score is reported out of two points per pair, alongside A/B wins, draws
 and average work per searched move. Identical version, opening order, player
-configs and limits reproduce the run. There are no random openings, parallel
-matches, Elo estimates or tournament infrastructure.
+configs and limits reproduce the one-worker reference run. Multi-worker matches
+are useful for scaling/strength experiments and may be schedule-dependent. There
+are no random openings, parallel matches, Elo estimates or tournament
+infrastructure.
 
-## Explicit V0.8 non-goals
+## Explicit V0.9 non-goals
 
-No parallel Alpha-Beta, shared concurrent TT, new selective pruning, NNUE, MCTS,
-opening book, randomization, server API, full-game clocks, SPRT/Elo framework,
-Renju, Swap/Swap2, unsafe or SIMD. Core's backing storage remains 225 cells.
-Future scope is in [ROADMAP.md](ROADMAP.md).
+No advanced selective pruning, advanced qsearch redesign, interior VCF/VCT,
+NNUE, policy networks, SIMD optimization, unsafe code, MCTS, AlphaZero,
+Transformer evaluation, GPU compute, opening database, server/protocol layer,
+full-game clocks, SPRT/Elo framework, Renju, Swap/Swap2, or a generic persistent
+thread pool. Core's backing storage remains 225 cells. Future scope is in
+[ROADMAP.md](ROADMAP.md).

@@ -54,8 +54,10 @@ impl Options {
                             }
                         }
                         "tt-mib" => {
-                            config.engine =
-                                EngineConfig::new(value.parse()?).with_tactical(tactical)
+                            config.engine = config.engine.with_tt_memory_mib(value.parse()?);
+                        }
+                        "threads" => {
+                            config.engine = config.engine.with_threads(value.parse()?);
                         }
                         "vcf-plies" => tactical.vcf.max_plies = value.parse()?,
                         "vcf-nodes" => tactical.vcf.max_nodes = value.parse()?,
@@ -199,13 +201,13 @@ impl Summary {
 fn main() -> Result<(), Box<dyn Error>> {
     if env::args().any(|arg| arg == "--help") {
         println!(
-            "RustMoku V0.8 Arena\n--pairs 1..12 --depth N --nodes N (optional global work cap per move)\nPlayer flags: --a- or --b- followed by evaluator pattern|classical, tt-mib N,\nvcf-plies N, vcf-nodes N, vct-plies N, vct-nodes N, vct-mib N.\nZero proof nodes/plies disables that solver. CSV stdout; configuration/summary stderr."
+            "RustMoku V0.9 Arena\n--pairs 1..12 --depth N --nodes N (optional global work cap per move)\nPlayer flags: --a- or --b- followed by evaluator pattern|classical, threads N,\ntt-mib N, vcf-plies N, vcf-nodes N, vct-plies N, vct-nodes N, vct-mib N.\nZero proof nodes/plies disables that solver. CSV stdout; configuration/summary stderr."
         );
         return Ok(());
     }
     let options = Options::parse(env::args().skip(1))?;
     eprintln!(
-        "RustMoku V0.8 Arena: {:?}; A={:?}; B={:?}",
+        "RustMoku V0.9 Arena: {:?}; A={:?}; B={:?}",
         options.limits, options.players[0], options.players[1]
     );
     println!("pair,opening,leg,a_color,winner,plies,searched_moves,work_nodes");
@@ -294,6 +296,8 @@ mod tests {
                 "0",
                 "--a-vcf-nodes",
                 "17",
+                "--a-threads",
+                "4",
                 "--b-evaluator",
                 "classical",
                 "--nodes",
@@ -307,11 +311,37 @@ mod tests {
         .unwrap();
         assert_eq!(options.players[0].engine.tt_memory_mib(), 1);
         assert_eq!(options.players[0].engine.vcf_max_nodes(), 17);
+        assert_eq!(options.players[0].engine.threads(), 4);
         assert!(options.players[0].engine.tactical().vct.enabled());
         assert!(!options.players[1].engine.tactical().vct.enabled());
         assert!(options.players[1].classical);
         assert_eq!(options.limits.max_nodes, Some(500));
         assert_eq!(options.pairs, 2);
         assert!(Options::parse(["--depth", "0"].map(String::from).into_iter()).is_err());
+    }
+
+    #[test]
+    fn threaded_players_still_replay_the_opening_and_finish_legally() {
+        let config = PlayerConfig {
+            engine: EngineConfig::new(0)
+                .with_threads(2)
+                .with_vcf_limits(0, 0)
+                .with_vct_limits(0, 0)
+                .with_vct_table_memory(0),
+            classical: false,
+        };
+        let result = play(
+            &OPENINGS[0],
+            Stone::Black,
+            [config; 2],
+            SearchLimits::new(1).with_max_nodes(100),
+        )
+        .unwrap();
+        assert_eq!(
+            result.plies,
+            OPENINGS[0].moves.len() + result.moves as usize
+        );
+        assert!(result.moves > 0);
+        assert!(result.work > 0);
     }
 }

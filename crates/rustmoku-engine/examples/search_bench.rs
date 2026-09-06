@@ -1,9 +1,13 @@
-use std::{env, error::Error, time::Instant};
+use std::{
+    env,
+    error::Error,
+    time::{Duration, Instant},
+};
 
 use rustmoku_core::{Move, Position};
 use rustmoku_engine::{
     AlphaBetaEngine, ClassicalEvaluator, EngineConfig, Evaluator, PatternEvaluator, SearchEngine,
-    SearchLimits,
+    SearchLimits, SearchResult, TranspositionTableStatistics,
 };
 
 const OPENING: &[(usize, usize)] = &[(7, 7), (6, 7), (8, 8), (7, 8)];
@@ -94,6 +98,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut depth = 4;
     let mut classical = false;
     let mut memory_mib = 64;
+    let mut threads = 1;
     let mut repeats = 5;
     let mut fixture_filter = None;
     let mut vcf_plies = EngineConfig::DEFAULT_VCF_MAX_PLIES;
@@ -119,6 +124,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
             "--depth" => depth = args.next().ok_or("missing depth")?.parse()?,
             "--tt-mib" => memory_mib = args.next().ok_or("missing MiB")?.parse()?,
+            "--threads" => threads = args.next().ok_or("missing threads")?.parse()?,
             "--repeats" => repeats = args.next().ok_or("missing repeats")?.parse::<usize>()?,
             "--vcf-plies" => vcf_plies = args.next().ok_or("missing VCF plies")?.parse()?,
             "--vcf-nodes" => vcf_nodes = args.next().ok_or("missing VCF nodes")?.parse()?,
@@ -183,6 +189,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         },
     ];
     let config = EngineConfig::new(memory_mib)
+        .with_threads(threads)
         .with_vcf_limits(vcf_plies, vcf_nodes)
         .with_vct_limits(vct.max_plies, vct.max_nodes)
         .with_vct_table_memory(vct_memory);
@@ -195,7 +202,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Err("unknown fixture".into());
     }
     println!(
-        "fixture,evaluator,tt_mib,repeats,requested_depth,completed_depth,seldepth,best_index,score,nodes,qnodes,pvs_researches,lmr_reductions,lmr_researches,aspiration_fail_low,aspiration_fail_high,static_evaluations,tt_probes,tt_hits,tt_cutoffs,tt_stores,tt_replacements,vcf_nodes,vcf_cache_hits,vcf_probes,vcf_proven,vcf_budget_exhausted,vct_nodes,vct_cache_hits,vct_proven,vct_budget_exhausted,capacity_bytes,buckets,entries,hashfull_per_mille,median_ms,nps,work_nodes,termination"
+        "fixture,evaluator,tt_mib,threads,repeats,requested_depth,completed_depth,seldepth,best_index,score,nodes,qnodes,principal_nodes,helper_nodes,pvs_researches,lmr_reductions,lmr_researches,aspiration_fail_low,aspiration_fail_high,static_evaluations,tt_probes,tt_hits,tt_cutoffs,tt_stores,tt_replacements,vcf_nodes,vcf_cache_hits,vcf_probes,vcf_proven,vcf_budget_exhausted,vct_nodes,vct_cache_hits,vct_proven,vct_budget_exhausted,capacity_bytes,synchronization_bytes,allocated_bytes,buckets,entries,hashfull_per_mille,median_ms,nps,work_nodes,termination"
     );
     for fixture in fixtures.iter().chain(&proof_fixtures) {
         if fixture_filter.is_none() && proof_fixtures.iter().any(|f| f.name == fixture.name) {
@@ -228,28 +235,36 @@ fn benchmark<E: Evaluator>(
     let mut engine = AlphaBetaEngine::with_config(evaluator, config);
     let limits = SearchLimits::new(fixture.depth);
     let reference = engine.search(&position, limits); // Untimed warm-up, cold TT below.
-    let mut times = Vec::with_capacity(repeats);
+    let mut samples = Vec::with_capacity(repeats);
     for _ in 0..repeats {
         engine.clear_transposition_table(); // Exclude memory clearing from search time.
         let started = Instant::now();
         let result = engine.search(&position, limits);
-        times.push(started.elapsed());
-        assert_eq!(
-            result, reference,
-            "cold runs must reproduce semantic results and statistics"
-        );
+        let elapsed = started.elapsed();
+        if config.threads() == 1 {
+            assert_eq!(
+                result, reference,
+                "cold runs must reproduce semantic results and statistics"
+            );
+        }
+        samples.push(BenchmarkSample {
+            elapsed,
+            result,
+            table: engine.transposition_table_statistics(), // Untimed sampling.
+        });
     }
-    times.sort_unstable();
-    let elapsed = times[times.len() / 2]; // Upper median for even sample counts.
-    let result = reference;
+    let sample = median_sample(&mut samples);
+    let elapsed = sample.elapsed;
+    let result = &sample.result;
     let stats = result.statistics;
-    let tt = engine.transposition_table_statistics(); // Sampling outside timed region.
+    let tt = sample.table;
     let nps = stats.nodes as f64 / elapsed.as_secs_f64();
     println!(
-        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:.3},{:.0},{},{:?}",
+        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:.3},{:.0},{},{:?}",
         fixture.name,
         name,
         memory_mib,
+        config.threads(),
         repeats,
         fixture.depth,
         result.completed_depth,
@@ -260,6 +275,8 @@ fn benchmark<E: Evaluator>(
         result.score,
         stats.nodes,
         stats.qnodes,
+        stats.principal_nodes,
+        stats.helper_nodes,
         stats.pvs_researches,
         stats.lmr_reductions,
         stats.lmr_researches,
@@ -281,6 +298,8 @@ fn benchmark<E: Evaluator>(
         stats.vct_proven,
         stats.vct_budget_exhausted,
         tt.capacity_bytes,
+        tt.synchronization_bytes,
+        tt.allocated_bytes,
         tt.bucket_count,
         tt.entry_count,
         tt.hashfull_per_mille,
@@ -289,6 +308,54 @@ fn benchmark<E: Evaluator>(
         stats.work_nodes,
         result.termination
     );
+}
+
+struct BenchmarkSample {
+    elapsed: Duration,
+    result: SearchResult,
+    table: TranspositionTableStatistics,
+}
+
+fn median_sample(samples: &mut [BenchmarkSample]) -> &BenchmarkSample {
+    // Keep scheduling-dependent work, score and occupancy attached to the run
+    // whose time we report. Use the upper median for an even sample count.
+    samples.sort_by_key(|sample| sample.elapsed);
+    &samples[samples.len() / 2]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn median_keeps_the_matching_result_and_table_statistics() {
+        let result = AlphaBetaEngine::with_config(PatternEvaluator, EngineConfig::new(0))
+            .search(&Position::default(), SearchLimits::new(0));
+        for durations in [vec![30, 20, 10], vec![40, 20, 30, 10]] {
+            let expected = if durations.len() == 3 { 20 } else { 30 };
+            let mut samples: Vec<_> = durations
+                .into_iter()
+                .map(|millis| {
+                    let mut result = result.clone();
+                    result.statistics.nodes = millis * 100;
+                    result.score = millis as i32;
+                    BenchmarkSample {
+                        elapsed: Duration::from_millis(millis),
+                        result,
+                        table: TranspositionTableStatistics {
+                            replacements: millis,
+                            ..TranspositionTableStatistics::default()
+                        },
+                    }
+                })
+                .collect();
+            let median = median_sample(&mut samples);
+            assert_eq!(median.elapsed, Duration::from_millis(expected));
+            assert_eq!(median.result.statistics.nodes, expected * 100);
+            assert_eq!(median.result.score, expected as i32);
+            assert_eq!(median.table.replacements, expected);
+        }
+    }
 }
 
 fn build_position(moves: &[(usize, usize)]) -> Position {

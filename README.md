@@ -1,8 +1,26 @@
 # RustMoku
 
-RustMoku V0.8 is a deterministic 15 x 15 Freestyle Gomoku program and a small
+RustMoku V0.9 is a 15 x 15 Freestyle Gomoku program and a small
 research-oriented engine foundation. It prioritizes correct game semantics,
-clear crate boundaries, reproducible results, and measurable search behavior.
+clear crate boundaries, reproducible single-thread results, and measurable
+search behavior.
+
+## V0.9 - Multi-Core Lazy SMP & Shared TT
+
+- CPU-only Lazy SMP: one principal worker plus independent helper workers.
+- `EngineConfig::threads()` defaults to 1; thread 1 preserves the deterministic
+  reference mode, while larger teams are schedule-dependent by design.
+- Worker 0 alone publishes `SearchInfo` and determines the public result; helpers
+  explore the same root and populate a shared ordinary TT.
+- The shared TT uses four atomic key/payload slots per bucket and an atomic
+  bucket-version seqlock with Release/Acquire field publication and full-key
+  validation, preventing mixed snapshots from being accepted as cutoffs.
+- One global node admission counter is exact when `SearchLimits::max_nodes` is
+  enabled; uncapped workers keep local counters that are aggregated after join.
+- VCF and VCT remain single, coordinator-side root stages and are never repeated
+  by Lazy-SMP helpers.
+- Native exposes Threads and TT MiB controls; Arena accepts independent
+  `--a-threads` and `--b-threads` settings.
 
 ## V0.8 - Search Lifecycle, Arena & Async Native
 
@@ -82,16 +100,17 @@ cargo test --workspace --all-features
 cargo run --release -p rustmoku-native
 ```
 
-The AI defaults to depth 4, a 64 MiB transposition table, and a gated VCF attempt
-limited to 11 proof plies / 2,000 nodes with a separate 384 KiB proof table.
-VCT defaults to 9 plies / 4,000 node inspections and a 16 MiB memory request
-(12 MiB actual bucket allocation). Roots without OpenThree-or-stronger candidates
-spend zero VCT nodes. A persistent worker owns the engine and ordinary TT. The UI
-remains responsive, displays completed search snapshots, and accepts New Game
-while searching. Depth and optional move time apply to the next request (0 ms
-means unlimited). Each invalidation cancels its token and advances the request
-ID; both old snapshots and old results are ignored. Application drop cancels,
-sends shutdown and joins the worker.
+The AI defaults to depth 4, one Alpha-Beta worker, a 64 MiB primary
+transposition table, and a gated VCF attempt limited to 11 proof plies / 2,000
+nodes with a separate 384 KiB proof table. VCT defaults to 9 plies / 4,000 node
+inspections and a 16 MiB memory request (12 MiB actual bucket allocation). Roots
+without OpenThree-or-stronger candidates spend zero VCT nodes. A persistent
+worker owns the engine and ordinary TT. The UI remains responsive, displays
+completed search snapshots, and accepts New Game while searching. Depth, thread
+count, TT MiB and optional move time apply to the next request (0 ms means
+unlimited). Each invalidation cancels its token and advances the request ID; both
+old snapshots and old results are ignored. Application drop cancels, sends
+shutdown and joins the worker.
 
 The permanent fixed-position benchmark utility is run with:
 
@@ -100,9 +119,10 @@ cargo run --release -p rustmoku-engine --example search_bench
 ```
 
 Use `--suite deep`, `--depth 8`, `--fixture opening`, `--tt-mib 256`,
-`--repeats 3`, or `--evaluator classical` after Cargo's `--` separator. Defaults
-are the historical depth-four suite, 64 MiB, PatternEvaluator, one warm-up and
-five cold runs, reporting their median. TT allocation/clearing is untimed.
+`--threads 4`, `--repeats 3`, or `--evaluator classical` after Cargo's `--`
+separator. Defaults are the historical depth-four suite, 64 MiB, PatternEvaluator,
+one warm-up and five cold runs, reporting their median. TT allocation/clearing is
+untimed.
 For example:
 
 ```powershell
@@ -111,6 +131,10 @@ cargo run --release -p rustmoku-engine --example search_bench -- --depth 6 --fix
 cargo run --release -p rustmoku-engine --example search_bench -- --depth 6 --fixture forced_defense --repeats 3
 ```
 
+The V0.9 scaling sweep uses `--depth 6 --fixture opening|forced_defense|non_vct_tactical`
+with `--threads 1`, `2`, `4`, `8` and `16`; 64/256/512 MiB capacity results and
+the measured medians are recorded in [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md).
+
 To use the reference engine explicitly:
 
 ```rust
@@ -118,7 +142,7 @@ use rustmoku_engine::{AlphaBetaEngine, ClassicalEvaluator};
 let mut engine = AlphaBetaEngine::new(ClassicalEvaluator);
 ```
 
-The V0.8 lean performance check against official V0.7 `d1d9708` is recorded in
+The V0.8 lean performance check and V0.9 scaling measurements are recorded in
 [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md). Additional fixtures are `vcf_win`,
 `vct_win`, and `non_vct_tactical`; the default quick suite still has five positions.
 Use `--vcf-plies`, `--vcf-nodes`, `--vct-plies`, `--vct-nodes`, and `--vct-mib`.
@@ -213,6 +237,21 @@ at root-stage/iteration boundaries. Time limits are cooperative per move, not
 full-game clocks; node limits with fresh engines are the reproducible option.
 Observers should return promptly because their time is part of the search.
 
+`EngineConfig::threads()` is the total number of CPU Alpha-Beta workers in one
+search. Worker 0 is authoritative for completed depth, result, PV and
+`SearchInfo`; helpers only add useful shared-TT work. VCF and VCT run once on the
+coordinator before the team. With one thread, the semantic baseline is
+deterministic. With multiple threads, no RNG is used, but shared-TT timing and
+OS scheduling may change heuristic search work and results.
+
+The ordinary TT keeps four atomic key/payload slots per bucket and a separate
+atomic u64 bucket-version sidecar. Writers claim an odd version, write the
+selected key and packed payload with Release, then publish the next even version
+with Release. Readers use Acquire for both fields and versions, accepting only
+an unchanged even version and a full-key match. Versions never wrap under shared
+access; exhausted buckets drop stores until exclusive clear/resize. A 64 MiB primary
+table uses 8 MiB of sidecar versions, for 72 MiB of reported table storage.
+
 ## Headless Arena
 
 ```powershell
@@ -222,12 +261,13 @@ cargo run --release -p rustmoku-arena -- --help
 
 Each of up to twelve fixed opening prefixes is played twice: A as Black, then A
 as White. Each game starts with fresh engines; each engine retains its TT between
-moves. All moves go through Core `Game`. No randomness, wall-clock adjudication,
-GUI dependency, or parallel search is involved. CSV goes to stdout; configuration
+moves. All moves go through Core
+`Game`. No randomness, wall-clock adjudication, or GUI dependency is involved.
+Players may use independent CPU thread counts. CSV goes to stdout; configuration
 and A/B wins, draws, A's paired points and average work per move go to stderr.
 A win scores one point and a draw half a point, so each pair has two points.
 
-Player options use `--a-` or `--b-`: `evaluator pattern|classical`, `tt-mib`,
+Player options use `--a-` or `--b-`: `evaluator pattern|classical`, `threads`, `tt-mib`,
 `vcf-plies`, `vcf-nodes`, `vct-plies`, `vct-nodes`, and `vct-mib`. Common `--depth`
 (default 3) and optional `--nodes` apply per move. Zero proof plies/nodes disables
 a solver. Tiny paired runs validate the harness; they do not establish Elo or
@@ -262,8 +302,9 @@ search contracts.
 
 ## Current limits and roadmap
 
-V0.8 has no parallel Alpha-Beta, shared concurrent TT, additional selective
-pruning, NNUE, MCTS, opening book, server API, Renju, or Swap protocol.
+V0.9 does not add additional selective pruning, advanced qsearch, NNUE, MCTS,
+opening book, server API, Renju, or Swap protocol. Parallel results with more
+than one worker are not promised bit-for-bit stable.
 LMR remains heuristic and may miss quiet resources; it does not prove equality
 with full-depth minimax. Quiescence omits ordinary Three expansion and optional
 non-immediate defensive moves, and stops non-immediate forcing continuations at

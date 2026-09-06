@@ -636,3 +636,218 @@ The native validation is behavioral/session and worker testing, not a manual
 visual acceptance run. Cooperative deadlines can overshoot with an expensive
 evaluator/observer or OS scheduling. The opening suite has no measured balance
 provenance, and this Arena smoke sample supplies no strength estimate.
+
+## V0.9 Multi-core Lazy SMP / shared TT scaling (2026-09-06)
+
+The V0.9 measurements use the official V0.8 baseline revision
+`46bd2e7767d71bd9914af39e2d36520bb8ab6c6c`, the same Ryzen 7 8845H host and
+Release toolchain documented above. Each run used PatternEvaluator, default
+proof settings, depth 6, one untimed warm-up and three cold repetitions. Every
+timed repetition clears the ordinary TT before starting; allocation and clearing
+are outside timing. Results below are medians. The cap is disabled, so ordinary
+search uses worker-local counters and aggregates them after all scoped helpers
+join. `work` includes the 330 VCT root-inspection visits on these non-proven
+fixtures; `p/h` is principal/helper Alpha-Beta nodes.
+
+Commands for the matrix were equivalent to:
+
+```powershell
+cargo run --release -p rustmoku-engine --example search_bench -- --depth 6 --fixture opening --threads 8 --repeats 3
+cargo run --release -p rustmoku-engine --example search_bench -- --depth 6 --fixture forced_defense --threads 8 --repeats 3
+cargo run --release -p rustmoku-engine --example search_bench -- --depth 6 --fixture non_vct_tactical --threads 8 --repeats 3
+```
+
+The full sweep substituted `--threads 1,2,4,8,16` one value at a time.
+`non_vct_tactical` is the additional nontrivial ordinary-search fixture; its
+root VCT attempt is not proven and normal Alpha-Beta still runs.
+
+| Fixture | T1: ms / work (p/h) | T2: ms / work (p/h) | T4: ms / work (p/h) | T8: ms / work (p/h) | T16: ms / work (p/h) |
+|---|---:|---:|---:|---:|---:|
+| opening, 129 / 19,180 | 111.939 / 123,704 (123,374/0) | 98.743 / 187,003 (96,105/90,568) | 65.805 / 243,266 (60,091/182,845) | 62.701 / 436,433 (58,910/377,193) | 81.277 / 829,754 (57,869/771,555) |
+| forced_defense, 112 / -243,380 | 173.765 / 189,211 (189,211/0) | 127.456 / 293,802 (147,233/146,569) | 100.579 / 400,620 (95,245/305,375) | 76.686 / 588,918 (77,901/511,017) | 85.524 / 930,615 (62,685/867,930) |
+| non_vct_tactical, 95 / 40,500 | 534.521 / 525,142 (524,812/0) | 374.932 / 794,794 (394,336/400,128) | 330.235 / 1,368,621 (350,596/1,017,695) | 307.903 / 2,605,062 (332,841/2,271,891) | 304.377 / 4,601,122 (304,577/4,296,215) |
+
+All five worker counts retained the same completed depth, best move and score
+for each fixture in this batch. Speedup and parallel efficiency (`T1/Tn` and
+speedup divided by `n`) were:
+
+| Fixture | T2 | T4 | T8 | T16 |
+|---|---:|---:|---:|---:|
+| opening | 1.13 / 56.7% | 1.70 / 42.5% | 1.79 / 22.3% | 1.38 / 8.6% |
+| forced_defense | 1.36 / 68.2% | 1.73 / 43.2% | 2.27 / 28.3% | 2.03 / 12.7% |
+| non_vct_tactical | 1.42 / 71.3% | 1.62 / 40.5% | 1.74 / 21.7% | 1.76 / 11.0% |
+
+Thread 1 remains the V0.8 semantic and performance reference: opening is
+129 / 19,180 at 111.939 ms versus the paired V0.8 111.623 ms, and forced defense
+is 112 / -243,380 at 173.765 ms versus 176.776 ms. The small timing differences
+are within normal host variation and do not show a greater-than-5% regression.
+The helper work is intentionally extra exploration, so total work rises with
+worker count. Eight workers were the fastest opening/forced-defense point here;
+16 was slower on opening and had low efficiency. Lazy SMP is not expected to
+scale linearly.
+
+### Shared TT capacity at eight workers
+
+Opening depth 6 was repeated with eight workers at 64, 256 and 512 MiB primary
+capacity. The semantic result was 129 / 19,180 in all three runs. `tt_memory_mib`
+describes primary bucket storage; the synchronization sidecar is included in
+the reported allocation.
+
+| Requested | Primary / sidecar / total | Buckets / entries | Nodes | Median ms | Hashfull / replacements |
+|---:|---:|---:|---:|---:|---:|
+| 64 MiB | 64 / 8 / 72 MiB | 1,048,576 / 4,194,304 | 399,443 | 59.850 | 5 / 0 |
+| 256 MiB | 256 / 32 / 288 MiB | 4,194,304 / 16,777,216 | 446,697 | 64.542 | 1 / 0 |
+| 512 MiB | 512 / 64 / 576 MiB | 8,388,608 / 33,554,432 | 419,679 | 59.976 | 0 / 0 |
+
+The larger tables reduce sampled occupancy and collision pressure, but this
+small depth-six workload shows no stable wall-time or node advantage; timings
+are affected by scheduling and cache state. The default remains a 64 MiB
+primary table (72 MiB including synchronization). A VCT fixture was also run at
+threads 1 and 16: both returned the same 915-work, 5-ply VCT proof, confirming
+that tactical root work remains coordinator-side rather than advertising VCT
+parallel speedup.
+
+The focused tests cover atomic payload/move round trips, same-bucket collisions,
+concurrent writers, exact global admission across workers, legal principal PVs,
+last-completed-depth cancellation behavior, helper shutdown as internal rather
+than public cancellation, evaluator/state restoration and Native/Arena request
+ownership. A final Release rerun after the lifecycle-state tightening retained
+the same depth, move and score for every matrix row. Its medians were 53.353 /
+39.813 / 28.826 / 27.724 / 36.044 ms for opening, 83.005 / 54.104 / 42.179 /
+34.931 / 45.084 ms for forced defense, and 246.837 / 180.736 / 139.625 /
+142.261 / 171.780 ms for non-VCT tactical at 1/2/4/8/16 workers. The matching
+64/256/512 MiB opening-capacity medians were 24.924 / 25.049 / 24.089 ms;
+primary/synchronization/total storage remained 64/8/72, 256/32/288 and
+512/64/576 MiB. The scaling, capacity and VCT checks are intentionally
+Release-only measurements, not ordinary tests.
+
+Final V0.9 validation from the workspace root:
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all -- --check` | Passed |
+| `cargo check --workspace --all-targets` | Passed |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | Passed |
+| `cargo test --workspace --all-features` | Passed: 160 tests across Core, Engine, Arena and Native |
+| `cargo test --release -p rustmoku-engine` | Passed: 134 tests |
+| `cargo build --release -p rustmoku-native` | Passed |
+| `cargo build --release -p rustmoku-arena` | Passed |
+| Release quick/scaling/capacity/VCT benchmarks and threaded Arena smoke | Passed |
+
+### Independent V0.9 review and repair (2026-09-06)
+
+Reviewed the complete official V0.8 `46bd2e7767d71bd9914af39e2d36520bb8ab6c6c`
+to V0.9 `d5c93a3c9686be805bd509e4b0935ecba027a24e` diff from a clean worktree,
+then repaired two confirmed findings:
+
+- **P0, ordinary TT publication:** `snapshot_bucket` could accept an old full
+  key with a new writer's payload. Acquire version reads around Relaxed fields
+  lacked a synchronization edge from the observed field to the writer's odd
+  claim. A Loom run of the actual table reproduced `key=1, score=50000,
+  depth=4, Exact` when key 1's published score was 1. Release field stores and
+  Acquire field loads repair that edge; the argument is in ARCHITECTURE.md.
+  Exhausted versions now reject stores until exclusive clear/resize, avoiding
+  ABA without a reader-duration assumption. No unsafe code was added.
+- **P2, benchmark sample association:** the driver paired the last search's
+  result/counters/occupancy with the median of independently sorted times.
+  Scheduling-dependent SMP work made the reported NPS and row inconsistent.
+  It now selects one complete median-time sample. The earlier V0.9 timing
+  medians remain timing measurements, but their adjacent work counts must not
+  be interpreted as belonging to those median runs.
+
+No further P1/P2 was confirmed in principal authority, exact global admission,
+stop-reason arbitration, coordinator-only proof solving, state restoration,
+directional BoundValidity, exact-depth/mate TT policy, or Native reconfiguration.
+Internal team completion cannot overwrite a public stop or create Cancelled.
+Scoped joins and exclusive engine reconfiguration exclude clear/resize races;
+one generation spans the team and ordinary TT history survives game edits.
+Search algorithms and their thread-one ordering were unchanged.
+
+Validation used rustc 1.98.1, `x86_64-pc-windows-msvc`, Release, PatternEvaluator,
+default proofs, 64 MiB primary TT, one untimed warm-up and three cold repetitions.
+Official V0.8 was built from its archived commit in a separate directory;
+unmodified V0.9's executable was saved before repair. Successive same-host runs
+compared all 28 shared result/work fields over ten fixture/depth cases: quick's
+five fixtures, three depth-six fixtures, VCF and VCT. They all matched, including
+completed depth, seldepth, best move, score and every common search counter.
+This is bounded regression evidence, not a universal minimax-equivalence claim.
+
+| Thread-one workload | V0.8 ms | Reviewed V0.9 ms | Repaired ms | Best / score | Work |
+|---|---:|---:|---:|---|---:|
+| Quick, sum of five medians | 6.151 | 6.697 | 6.469 | All unchanged | 17,199 |
+| opening D6 | 51.777 | 53.783 | 52.543 | 129 / 19,180 | 123,704 |
+| forced_defense D6 | 80.419 | 82.400 | 82.881 | 112 / -243,380 | 189,211 |
+| non_vct_tactical D6 | 237.851 | 244.116 | 240.388 | 95 / 40,500 | 525,142 |
+| vct_win | 0.257 | 0.303 | 0.303 | 112 / 99,999,995 | 915 |
+| vcf_win | 0.015 | 0.043 | 0.047 | 111 / 99,999,995 | 19 |
+
+The ordinary depth-six repair deltas versus reviewed V0.9 are -2.3%, +0.6% and
+-1.5%; there is no measured repair regression above 5%. Quick is 5.2% slower
+than V0.8 but 3.4% faster than reviewed V0.9, so that small aggregate overhead
+predates this repair. Very short proof measurements are dominated by setup and
+timing noise and are not evidence of changed proof work.
+
+The existing lean scaling sweep was rerun at D6 with the commands above,
+substituting each thread count. Each cell below is median ms / work from the
+**same** sample. Every row retained the same depth, move and score as thread one.
+
+| Fixture | T1 | T2 | T4 | T8 | T16 |
+|---|---:|---:|---:|---:|---:|
+| opening | 53.474 / 123,704 | 38.637 / 187,439 | 26.722 / 250,070 | 25.527 / 386,399 | 37.442 / 795,815 |
+| forced_defense | 82.207 / 189,211 | 62.889 / 303,529 | 43.585 / 396,910 | 36.627 / 672,284 | 45.729 / 1,188,912 |
+| non_vct_tactical | 241.948 / 525,142 | 173.752 / 845,430 | 167.196 / 1,472,720 | 174.345 / 2,245,988 | 278.959 / 4,002,060 |
+
+Eight workers gave 2.09x/2.24x on opening/forced defense. The non-VCT tactical
+fixture was fastest at four; sixteen workers were slower than one in this batch.
+Host load, scheduling and redundant helper work limit these measurements; no
+linear scaling or strength claim follows. The 64-byte bucket has no guaranteed
+cache-line alignment, adjacent version words can false-share, and colliding
+evictions still increment one global atomic statistic. Those are scaling risks
+under different occupancy/contention, not demonstrated bottlenecks in this lean
+batch. Exact capped admission also necessarily synchronizes visits; uncapped
+ordinary work retains local counters. No pool or speculative layout change was
+introduced.
+
+The T8 opening capacity check at 64/256/512 MiB retained 129 / 19,180; median
+times were 40.239/41.462/33.707 ms, with primary/sidecar/total allocation still
+64/8/72, 256/32/288 and 512/64/576 MiB. This separate late batch does not justify
+cross-batch speedup comparisons. VCT at T1/T16 returned the same complete
+five-ply proof, 915 work, and zero helper nodes. Arena smoke with two paired
+openings, depth 2, global 2,000 nodes/move, A=T1 and B=T4 completed all four games
+legally (184 searched moves, 307,311 work). Its B=4/A=0 result is not strength
+evidence.
+
+Executed successfully after repair:
+
+- `cargo fmt --all -- --check`
+- `cargo check --workspace --all-targets`
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+- `cargo test --workspace --all-features` (161 tests)
+- `cargo test --release -p rustmoku-engine` (135 tests)
+- `cargo build --release -p rustmoku-native`
+- `cargo build --release -p rustmoku-arena`
+- `cargo test -p rustmoku-engine --example search_bench` (median association)
+- `cargo test -p rustmoku-engine transposition_table::tests` (15 tests)
+- Two actual-TT Loom tests: unbounded single-writer model and competing
+  same-key/colliding writers with a preemption bound of two.
+- Release quick, D6 scaling, capacity, VCF/VCT and threaded Arena smoke above.
+- `git diff --check` and final diff review.
+
+Reproduce the separate memory-model test build in PowerShell:
+
+```powershell
+$savedRustFlags = $env:RUSTFLAGS
+try {
+    $env:RUSTFLAGS = '--cfg loom'
+    cargo test --release -p rustmoku-engine --lib tt_loom
+} finally {
+    $env:RUSTFLAGS = $savedRustFlags
+}
+```
+
+Loom is only enabled in that explicit instrumented configuration; the normal
+engine dependency tree still contains only Core. The model build emitted MSVC
+import-library informational linker warnings; normal strict Clippy passed.
+No weak-memory hardware run, saturated-table scaling profile, or manual Native
+visual acceptance was performed. Loom coverage complements the publication
+argument and does not exhaust every weak-memory execution or team size.

@@ -15,11 +15,16 @@ const CLOSED_TWO: i32 = 5;
 const EVALUATION_LIMIT: i32 = 10_000_000;
 
 /// Static position scoring from the side-to-move perspective.
-pub trait Evaluator {
+///
+/// The evaluator definition is immutable and may be borrowed by several
+/// Lazy-SMP workers. Mutable accumulator data is carried by the worker-local
+/// associated `State`; both associated values must therefore be movable into a
+/// worker thread.
+pub trait Evaluator: Sync {
     /// Evaluator-specific per-search state, excluding shared tactical patterns.
-    type State;
+    type State: Send;
     /// Consumed in strict LIFO order on the corresponding logical state.
-    type Undo;
+    type Undo: Send;
 
     fn initialize(&self, position: &Position) -> Self::State;
     /// Called only after Core has accepted the move; must complete infallibly.

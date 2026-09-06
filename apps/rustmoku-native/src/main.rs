@@ -12,6 +12,10 @@ const BOARD_COLOR: Color32 = Color32::from_rgb(216, 171, 103);
 const GRID_COLOR: Color32 = Color32::from_rgb(63, 45, 28);
 const LAST_MOVE_COLOR: Color32 = Color32::from_rgb(210, 48, 42);
 
+fn host_thread_count() -> usize {
+    std::thread::available_parallelism().map_or(1, |count| count.get())
+}
+
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -21,7 +25,7 @@ fn main() -> eframe::Result {
     };
 
     eframe::run_native(
-        "RustMoku V0.8",
+        "RustMoku V0.9",
         options,
         Box::new(|_creation_context| Ok(Box::new(RustMokuApp::new()?))),
     )
@@ -31,6 +35,7 @@ struct RustMokuApp {
     game: Game,
     human_stone: Stone,
     worker: SearchWorker,
+    engine_config: EngineConfig,
     search_limits: SearchLimits,
     last_search: Option<SearchInfo>,
     move_time_ms: u64,
@@ -45,16 +50,21 @@ struct RustMokuApp {
 
 impl RustMokuApp {
     fn new() -> std::io::Result<Self> {
-        Ok(Self::with_worker(SearchWorker::new(
-            EngineConfig::default(),
-        )?))
+        let config = EngineConfig::default();
+        Ok(Self::with_worker_config(SearchWorker::new(config)?, config))
     }
 
+    #[cfg(test)]
     fn with_worker(worker: SearchWorker) -> Self {
+        Self::with_worker_config(worker, EngineConfig::default())
+    }
+
+    fn with_worker_config(worker: SearchWorker, engine_config: EngineConfig) -> Self {
         Self {
             game: Game::default(),
             human_stone: Stone::Black,
             worker,
+            engine_config,
             move_time_ms: 0,
             search_limits: SearchLimits::default(),
             last_search: None,
@@ -221,7 +231,7 @@ impl RustMokuApp {
     }
 
     fn controls(&mut self, ui: &mut egui::Ui) {
-        ui.heading("RustMoku V0.8");
+        ui.heading("RustMoku V0.9");
         ui.horizontal(|ui| {
             ui.label("Play as:");
             let previous_stone = self.human_stone;
@@ -282,6 +292,32 @@ impl RustMokuApp {
                 ui.label(format!("Last: {at}"));
             }
         });
+        let previous_threads = self.engine_config.threads();
+        let previous_tt_memory = self.engine_config.tt_memory_mib();
+        let mut threads = previous_threads;
+        let mut tt_memory_mib = previous_tt_memory;
+        ui.horizontal(|ui| {
+            ui.label("Threads:");
+            ui.add(egui::DragValue::new(&mut threads).range(1..=host_thread_count()));
+            ui.label("TT MiB:");
+            ui.add(egui::DragValue::new(&mut tt_memory_mib).range(1..=4096));
+        });
+        if threads != previous_threads || tt_memory_mib != previous_tt_memory {
+            let config = self
+                .engine_config
+                .with_threads(threads)
+                .with_tt_memory_mib(tt_memory_mib);
+            self.engine_config = config;
+            self.last_search = None;
+            if let Err(error) = self.worker.reconfigure(config) {
+                self.message = Some(error.into());
+            } else {
+                // Reconfiguration invalidates the old request. If the restored
+                // game still needs an AI move, start it after the command so the
+                // worker processes FIFO: reconfigure, then replacement search.
+                self.play_ai_if_needed();
+            }
+        }
         ui.horizontal(|ui| {
             ui.strong(self.status_text());
             if let Some(message) = &self.message {
@@ -297,11 +333,12 @@ impl RustMokuApp {
         if let Some(search) = &self.last_search {
             ui.add(
                 egui::Label::new(format!(
-                    "AI: depth {} | seldepth {} | work {} (q {}) | score {}",
+                    "AI: depth {} | seldepth {} | work {} (q {}) | threads {} | score {}",
                     search.completed_depth,
                     search.seldepth,
                     search.statistics.work_nodes,
                     search.statistics.qnodes,
+                    search.statistics.worker_count,
                     search.score
                 ))
                 .truncate(),

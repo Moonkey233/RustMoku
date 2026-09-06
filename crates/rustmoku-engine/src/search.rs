@@ -93,6 +93,12 @@ pub struct SearchStatistics {
     pub vct_cache_hits: u64,
     pub vct_proven: u64,
     pub vct_budget_exhausted: u64,
+    /// Configured worker count for this public search.
+    pub worker_count: usize,
+    /// Alpha-Beta nodes searched by the principal worker.
+    pub principal_nodes: u64,
+    /// Alpha-Beta nodes searched by all helper workers.
+    pub helper_nodes: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -217,10 +223,28 @@ impl<E> AlphaBetaEngine<E> {
         self.table.statistics()
     }
 
+    #[must_use]
+    pub fn config(&self) -> EngineConfig {
+        self.config
+    }
+
     /// Replaces the table with an empty table of the requested capacity.
     pub fn resize_transposition_table(&mut self, memory_mib: usize) {
         self.table = TranspositionTable::new(memory_mib);
         self.generation = 0;
+        self.config = self.config.with_tt_memory_mib(memory_mib);
+    }
+
+    /// Reconfigures the engine between public searches. Changing TT capacity
+    /// is performed by the engine-owning thread and clears the old table.
+    pub fn reconfigure(&mut self, config: EngineConfig) {
+        if config.tt_memory_mib() != self.config.tt_memory_mib() {
+            self.resize_transposition_table(config.tt_memory_mib());
+        }
+        if config.tactical().vct_table_memory_mib != self.config.tactical().vct_table_memory_mib {
+            self.vct = VctSolver::new(config.tactical().vct_table_memory_mib);
+        }
+        self.config = config;
     }
 
     fn begin_search_generation(&mut self) {
@@ -247,12 +271,27 @@ impl<E: Evaluator> SearchEngine for AlphaBetaEngine<E> {
         self.vcf.begin_search(self.config.vcf_max_nodes());
         self.vct.begin_search(self.config.tactical().vct.max_nodes);
         let mut state = SearchState::new(position, &self.evaluator);
-        let mut statistics = SearchStatistics::default();
-        let mut result =
-            self.search_with_budget(&mut state, limits, &mut budget, &mut statistics, observer);
+        let mut statistics = SearchStatistics {
+            worker_count: self.config.threads(),
+            ..SearchStatistics::default()
+        };
+        let mut result = self.search_with_budget(
+            position,
+            &mut state,
+            limits,
+            &mut budget,
+            &mut statistics,
+            observer,
+        );
         // Final statistics include discarded partial work; score/PV/seldepth
         // still describe the last completed iteration or exact proof.
-        statistics.work_nodes = budget.work_nodes();
+        if self.config.threads() == 1 || statistics.work_nodes == 0 {
+            statistics.work_nodes = budget.work_nodes();
+        }
+        debug_assert_eq!(
+            budget.admitted_nodes(),
+            limits.max_nodes.map(|_| statistics.work_nodes)
+        );
         result.statistics = statistics;
         result.termination = budget.termination();
         result
@@ -262,6 +301,7 @@ impl<E: Evaluator> SearchEngine for AlphaBetaEngine<E> {
 impl<E: Evaluator> AlphaBetaEngine<E> {
     fn search_with_budget(
         &mut self,
+        root_position: &Position,
         state: &mut SearchState<E>,
         limits: SearchLimits,
         budget: &mut SearchBudget,
@@ -406,35 +446,227 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
             heuristics: SearchHeuristics::default(),
             budget,
         };
-        for depth in 1..=limits.max_depth {
-            if resources.budget.poll().is_err() {
-                break;
-            }
-            let Ok(iteration) =
-                self.search_iteration(state, depth, completed.score, &mut resources)
-            else {
-                break;
-            };
-            if resources.budget.poll().is_err() {
-                break;
-            }
-            resources.statistics.work_nodes = resources.budget.work_nodes();
-            completed = search_result(
-                iteration.best_move,
-                iteration.score,
-                limits,
-                depth,
-                *resources.seldepth,
-                resources.pv.root_line().to_vec(),
-                *resources.statistics,
-            );
-            observer.on_info(SearchInfo::from(&completed));
+        self.search_ordinary(
+            root_position,
+            state,
+            limits,
+            completed,
+            &mut resources,
+            observer,
+        )
+    }
+
+    fn search_ordinary(
+        &self,
+        root_position: &Position,
+        state: &mut SearchState<E>,
+        limits: SearchLimits,
+        completed: SearchResult,
+        resources: &mut SearchResources<'_>,
+        observer: &mut dyn SearchObserver,
+    ) -> SearchResult {
+        let threads = self.config.threads();
+        let principal = AbContext::new(&self.evaluator, &self.table, self.generation, 0);
+        if threads == 1 {
+            let mut completed =
+                run_principal_iterations(&principal, state, limits, resources, completed, observer);
+            resources.statistics.principal_nodes = resources.statistics.nodes;
+            resources.statistics.helper_nodes = 0;
+            completed.statistics = *resources.statistics;
+            return completed;
         }
+
+        let evaluator = &self.evaluator;
+        let table = &self.table;
+        let generation = self.generation;
+        let (completed, helper_results) = std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(threads.saturating_sub(1));
+            for worker_id in 1..threads {
+                let helper_budget = resources.budget.worker();
+                let helper_position = root_position;
+                let helper_evaluator = evaluator;
+                let helper_table = table;
+                handles.push(scope.spawn(move || {
+                    let mut helper_budget = helper_budget;
+                    let mut helper_state = SearchState::new(helper_position, helper_evaluator);
+                    let mut helper_statistics = SearchStatistics::default();
+                    let mut helper_pv = PvTable::new();
+                    let mut helper_seldepth = 0;
+                    let context =
+                        AbContext::new(helper_evaluator, helper_table, generation, worker_id);
+                    run_helper_iterations(
+                        &context,
+                        &mut helper_state,
+                        limits,
+                        &mut helper_budget,
+                        &mut helper_statistics,
+                        &mut helper_pv,
+                        &mut helper_seldepth,
+                    );
+                    HelperResult {
+                        statistics: helper_statistics,
+                        work_nodes: helper_budget.work_nodes(),
+                    }
+                }));
+            }
+
+            let completed =
+                run_principal_iterations(&principal, state, limits, resources, completed, observer);
+            // Principal completion and principal interruption both end this
+            // public team. Helpers interpret this only as an internal stop.
+            resources.budget.mark_team_done();
+            let helper_results: Vec<HelperResult> = handles
+                .drain(..)
+                .map(|handle| handle.join().expect("Alpha-Beta helper panicked"))
+                .collect();
+            (completed, helper_results)
+        });
+
+        resources.statistics.principal_nodes = resources.statistics.nodes;
+        resources.statistics.helper_nodes = 0;
+        let principal_work = resources.budget.work_nodes();
+        let mut helper_work = 0;
+        for helper in helper_results {
+            resources.statistics.helper_nodes += helper.statistics.nodes;
+            helper_work += helper.work_nodes;
+            resources.statistics.add_worker(helper.statistics);
+        }
+        resources.statistics.work_nodes = principal_work + helper_work;
+        let mut completed = completed;
+        completed.statistics = *resources.statistics;
         completed
+    }
+}
+
+impl SearchStatistics {
+    fn add_worker(&mut self, other: Self) {
+        self.nodes += other.nodes;
+        self.qnodes += other.qnodes;
+        self.pvs_researches += other.pvs_researches;
+        self.lmr_reductions += other.lmr_reductions;
+        self.lmr_researches += other.lmr_researches;
+        self.aspiration_fail_low += other.aspiration_fail_low;
+        self.aspiration_fail_high += other.aspiration_fail_high;
+        self.static_evaluations += other.static_evaluations;
+        self.beta_cutoffs += other.beta_cutoffs;
+        self.tt_probes += other.tt_probes;
+        self.tt_hits += other.tt_hits;
+        self.tt_cutoffs += other.tt_cutoffs;
+        self.tt_stores += other.tt_stores;
+        self.tt_replacements += other.tt_replacements;
+        self.vcf_nodes += other.vcf_nodes;
+        self.vcf_cache_hits += other.vcf_cache_hits;
+        self.vcf_probes += other.vcf_probes;
+        self.vcf_proven += other.vcf_proven;
+        self.vcf_budget_exhausted += other.vcf_budget_exhausted;
+        self.vct_nodes += other.vct_nodes;
+        self.vct_cache_hits += other.vct_cache_hits;
+        self.vct_proven += other.vct_proven;
+        self.vct_budget_exhausted += other.vct_budget_exhausted;
+    }
+}
+
+struct HelperResult {
+    statistics: SearchStatistics,
+    work_nodes: u64,
+}
+
+fn run_principal_iterations<E: Evaluator>(
+    context: &AbContext<'_, E>,
+    state: &mut SearchState<E>,
+    limits: SearchLimits,
+    resources: &mut SearchResources<'_>,
+    mut completed: SearchResult,
+    observer: &mut dyn SearchObserver,
+) -> SearchResult {
+    for depth in 1..=limits.max_depth {
+        if resources.budget.poll().is_err() {
+            break;
+        }
+        let Ok(iteration) =
+            context.search_iteration(state, depth, completed.score, &mut *resources)
+        else {
+            break;
+        };
+        if resources.budget.poll().is_err() {
+            break;
+        }
+        resources.statistics.work_nodes = resources.budget.work_nodes();
+        resources.statistics.principal_nodes = resources.statistics.nodes;
+        completed = search_result(
+            iteration.best_move,
+            iteration.score,
+            limits,
+            depth,
+            *resources.seldepth,
+            resources.pv.root_line().to_vec(),
+            *resources.statistics,
+        );
+        observer.on_info(SearchInfo::from(&completed));
+    }
+    completed
+}
+
+fn run_helper_iterations<E: Evaluator>(
+    context: &AbContext<'_, E>,
+    state: &mut SearchState<E>,
+    limits: SearchLimits,
+    budget: &mut SearchBudget,
+    statistics: &mut SearchStatistics,
+    pv: &mut PvTable,
+    seldepth: &mut u8,
+) {
+    let mut previous_score = state.evaluate(context.evaluator);
+    let mut resources = SearchResources {
+        seldepth,
+        pv,
+        statistics,
+        heuristics: SearchHeuristics::default(),
+        budget,
+    };
+    for depth in 1..=limits.max_depth {
+        if resources.budget.poll().is_err() {
+            break;
+        }
+        let Ok(iteration) = context.search_iteration(state, depth, previous_score, &mut resources)
+        else {
+            break;
+        };
+        if resources.budget.poll().is_err() {
+            break;
+        }
+        previous_score = iteration.score;
+        resources.statistics.work_nodes = resources.budget.work_nodes();
+    }
+}
+
+/// Borrowed immutable engine components plus worker-specific deterministic
+/// root diversity. Every mutable search structure remains in the call's
+/// `SearchResources` and `SearchState`.
+struct AbContext<'a, E: Evaluator> {
+    evaluator: &'a E,
+    table: &'a TranspositionTable,
+    generation: u8,
+    root_rotation: usize,
+}
+
+impl<'a, E: Evaluator> AbContext<'a, E> {
+    fn new(
+        evaluator: &'a E,
+        table: &'a TranspositionTable,
+        generation: u8,
+        root_rotation: usize,
+    ) -> Self {
+        Self {
+            evaluator,
+            table,
+            generation,
+            root_rotation,
+        }
     }
 
     fn search_iteration(
-        &mut self,
+        &self,
         state: &mut SearchState<E>,
         depth: u8,
         previous_score: i32,
@@ -468,7 +700,7 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
     // The false specialization is used only by the small Alpha-Beta oracle
     // tests. Production always uses PVS; no public algorithm switch is needed.
     fn search_root<const PVS: bool>(
-        &mut self,
+        &self,
         state: &mut SearchState<E>,
         depth: u8,
         mut alpha: i32,
@@ -521,12 +753,16 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
             &resources.heuristics,
             0,
         );
+        if self.root_rotation != 0 && !moves.is_empty() {
+            let rotation = self.root_rotation % moves.as_slice().len();
+            moves.as_mut_slice().rotate_left(rotation);
+        }
         let mut best_move = None;
         let mut best_score = -SEARCH_INFINITY;
 
         for (index, at) in moves.iter().enumerate() {
             let undo = state
-                .make_move(at, &self.evaluator)
+                .make_move(at, self.evaluator)
                 .expect("frontier moves are legal");
             let child = (|| {
                 let mut result;
@@ -560,7 +796,7 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
                 }
                 Ok::<_, Stopped>(result)
             })();
-            state.unmake_move(undo, &self.evaluator);
+            state.unmake_move(undo, self.evaluator);
             let result = child?;
             validity.include(result.validity, result.score, best_score);
             let score = result.score;
@@ -605,7 +841,7 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
     }
 
     fn negamax<const PVS: bool>(
-        &mut self,
+        &self,
         state: &mut SearchState<E>,
         depth: u8,
         mut alpha: i32,
@@ -679,7 +915,7 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
             };
 
             let undo = state
-                .make_move(at, &self.evaluator)
+                .make_move(at, self.evaluator)
                 .expect("frontier moves are legal");
             let child = (|| {
                 if reduction != 0 {
@@ -731,7 +967,7 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
                 }
                 Ok::<_, Stopped>((result, false))
             })();
-            state.unmake_move(undo, &self.evaluator);
+            state.unmake_move(undo, self.evaluator);
             let (result, reduced_fail_low) = child?;
             if reduced_fail_low {
                 // Unverified reduced values cannot improve alpha/PV or support
@@ -808,7 +1044,7 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
             // An immediate obligation survives the expansion cap. A chain of
             // forced replies still terminates because every ply fills a cell.
             let undo = state
-                .make_move(at, &self.evaluator)
+                .make_move(at, self.evaluator)
                 .expect("winning point is legal");
             let child = self.qsearch(
                 state,
@@ -818,13 +1054,13 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
                 (qply + 1).min(MAX_QSEARCH_PLY),
                 resources,
             );
-            state.unmake_move(undo, &self.evaluator);
+            state.unmake_move(undo, self.evaluator);
             let score = -child?;
             resources.pv.update(ply, at);
             return Ok(score);
         }
         resources.statistics.static_evaluations += 1;
-        let mut best_score = state.evaluate(&self.evaluator);
+        let mut best_score = state.evaluate(self.evaluator);
         if qply >= MAX_QSEARCH_PLY || best_score >= beta {
             return Ok(best_score);
         }
@@ -842,10 +1078,10 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
         order_moves(side, patterns, &mut moves, None, &resources.heuristics, ply);
         for at in moves.iter() {
             let undo = state
-                .make_move(at, &self.evaluator)
+                .make_move(at, self.evaluator)
                 .expect("forcing frontier moves are legal");
             let child = self.qsearch(state, -beta, -alpha, ply + 1, qply + 1, resources);
-            state.unmake_move(undo, &self.evaluator);
+            state.unmake_move(undo, self.evaluator);
             let score = -child?;
             if score > best_score {
                 best_score = score;
@@ -888,8 +1124,7 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
         }
     }
 
-    fn store_tt(&mut self, store: TtStore, statistics: &mut SearchStatistics) {
-        let previous_replacements = self.table.replacements();
+    fn store_tt(&self, store: TtStore, statistics: &mut SearchStatistics) {
         let entry = TtEntry::new(
             store.key,
             score_to_tt(store.score, store.ply),
@@ -898,10 +1133,85 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
             store.bound,
             self.generation,
         );
-        if self.table.store(entry) {
+        let outcome = self.table.store_with_outcome(entry);
+        if outcome.stored {
             statistics.tt_stores += 1;
         }
-        statistics.tt_replacements += self.table.replacements() - previous_replacements;
+        statistics.tt_replacements += u64::from(outcome.replacement);
+    }
+}
+
+// Keep the small private test/oracle surface attached to AlphaBetaEngine while
+// production workers use AbContext directly and borrow only Sync components.
+impl<E: Evaluator> AlphaBetaEngine<E> {
+    fn ab_context(&self) -> AbContext<'_, E> {
+        AbContext::new(&self.evaluator, &self.table, self.generation, 0)
+    }
+
+    #[cfg(test)]
+    fn search_iteration(
+        &self,
+        state: &mut SearchState<E>,
+        depth: u8,
+        previous_score: i32,
+        resources: &mut SearchResources<'_>,
+    ) -> Result<RootSearchResult, Stopped> {
+        self.ab_context()
+            .search_iteration(state, depth, previous_score, resources)
+    }
+
+    #[cfg(test)]
+    fn search_root<const PVS: bool>(
+        &self,
+        state: &mut SearchState<E>,
+        depth: u8,
+        alpha: i32,
+        beta: i32,
+        resources: &mut SearchResources<'_>,
+    ) -> Result<RootSearchResult, Stopped> {
+        self.ab_context()
+            .search_root::<PVS>(state, depth, alpha, beta, resources)
+    }
+
+    #[cfg(test)]
+    fn negamax<const PVS: bool>(
+        &self,
+        state: &mut SearchState<E>,
+        depth: u8,
+        alpha: i32,
+        beta: i32,
+        ply: u8,
+        resources: &mut SearchResources<'_>,
+    ) -> Result<NodeResult, Stopped> {
+        self.ab_context()
+            .negamax::<PVS>(state, depth, alpha, beta, ply, resources)
+    }
+
+    fn qsearch(
+        &self,
+        state: &mut SearchState<E>,
+        alpha: i32,
+        beta: i32,
+        ply: u8,
+        qply: u8,
+        resources: &mut SearchResources<'_>,
+    ) -> Result<i32, Stopped> {
+        self.ab_context()
+            .qsearch(state, alpha, beta, ply, qply, resources)
+    }
+
+    #[cfg(test)]
+    fn probe_tt(
+        &self,
+        state: &SearchState<E>,
+        depth: u8,
+        alpha: i32,
+        beta: i32,
+        ply: u8,
+        statistics: &mut SearchStatistics,
+    ) -> TtProbe {
+        self.ab_context()
+            .probe_tt(state, depth, alpha, beta, ply, statistics)
     }
 }
 
@@ -1254,6 +1564,22 @@ mod tests {
     }
 
     #[test]
+    fn resizing_transposition_table_keeps_public_configuration_coherent() {
+        let mut engine =
+            AlphaBetaEngine::with_config(ZeroEvaluator, EngineConfig::new(1).with_threads(3));
+        engine.resize_transposition_table(2);
+        assert_eq!(engine.config().tt_memory_mib(), 2);
+        assert_eq!(engine.config().threads(), 3);
+        assert_eq!(
+            engine.transposition_table_statistics().capacity_bytes,
+            2 * 1024 * 1024
+        );
+        engine.reconfigure(EngineConfig::new(4).with_threads(5));
+        assert_eq!(engine.config().tt_memory_mib(), 4);
+        assert_eq!(engine.config().threads(), 5);
+    }
+
+    #[test]
     fn actual_search_recursion_restores_all_incremental_state() {
         use crate::{PatternEvaluator, principal_variation::PvTable};
         let mut position = Position::default();
@@ -1263,7 +1589,7 @@ mod tests {
                 .unwrap();
         }
         let mut state = SearchState::new(&position, &PatternEvaluator);
-        let mut engine = AlphaBetaEngine::with_config(PatternEvaluator, EngineConfig::new(1));
+        let engine = AlphaBetaEngine::with_config(PatternEvaluator, EngineConfig::new(1));
         let mut statistics = SearchStatistics::default();
         let mut pv = PvTable::new();
         let mut seldepth = 0;
@@ -1294,7 +1620,7 @@ mod tests {
         let mut position = Position::default();
         position.make_move(Move::CENTER).unwrap();
         let state = SearchState::new(&position, &ZeroEvaluator);
-        let mut engine = AlphaBetaEngine::with_config(ZeroEvaluator, EngineConfig::new(0));
+        let engine = AlphaBetaEngine::with_config(ZeroEvaluator, EngineConfig::new(0));
         engine.table.store(TtEntry::new(
             state.key().value(),
             25,
@@ -1319,8 +1645,7 @@ mod tests {
     }
 
     fn fixed_search<const PVS: bool>(position: &Position, depth: u8) -> super::RootSearchResult {
-        let mut engine =
-            AlphaBetaEngine::with_config(crate::PatternEvaluator, EngineConfig::new(1));
+        let engine = AlphaBetaEngine::with_config(crate::PatternEvaluator, EngineConfig::new(1));
         let mut state = SearchState::new(position, &crate::PatternEvaluator);
         let mut statistics = SearchStatistics::default();
         let mut pv = crate::principal_variation::PvTable::new();
@@ -1381,7 +1706,7 @@ mod tests {
         let position = fixture(&[112, 97, 128, 113]);
         let reference = fixed_search::<false>(&position, 2);
         for offset in [-100_000, 100_000] {
-            let mut engine =
+            let engine =
                 AlphaBetaEngine::with_config(crate::PatternEvaluator, EngineConfig::new(1));
             let mut state = SearchState::new(&position, &crate::PatternEvaluator);
             let mut statistics = SearchStatistics::default();
@@ -1431,7 +1756,7 @@ mod tests {
             }
         }
         let position = fixture(&[112]);
-        let mut engine = AlphaBetaEngine::with_config(PenaltyEvaluator, EngineConfig::new(1));
+        let engine = AlphaBetaEngine::with_config(PenaltyEvaluator, EngineConfig::new(1));
         engine.table.store(TtEntry::new(
             PositionKey::from_position(&position).value(),
             0,
@@ -1722,7 +2047,7 @@ mod tests {
         }
         let position = fixture(&[112]);
         let mut state = SearchState::new(&position, &HorizonEvaluator);
-        let mut engine = AlphaBetaEngine::with_config(HorizonEvaluator, EngineConfig::new(1));
+        let engine = AlphaBetaEngine::with_config(HorizonEvaluator, EngineConfig::new(1));
         let mut statistics = SearchStatistics::default();
         let mut pv = crate::principal_variation::PvTable::new();
         let mut seldepth = 0;
@@ -1824,7 +2149,7 @@ mod tests {
             (Bound::Lower, 30, 10, 20),
             (Bound::Upper, -30, -20, -10),
         ] {
-            let mut engine = AlphaBetaEngine::with_config(ZeroEvaluator, EngineConfig::new(1));
+            let engine = AlphaBetaEngine::with_config(ZeroEvaluator, EngineConfig::new(1));
             let mut state = SearchState::new(&position, &ZeroEvaluator);
             let stored = crate::score::score_to_tt(score, 7);
             engine.table.store(TtEntry::new(
@@ -1946,8 +2271,7 @@ mod tests {
         );
         let late = moves.as_slice()[12];
         for initial_counter in [0, 50_000] {
-            let mut engine =
-                AlphaBetaEngine::with_config(LateEvaluator(late), EngineConfig::new(1));
+            let engine = AlphaBetaEngine::with_config(LateEvaluator(late), EngineConfig::new(1));
             let mut state = SearchState::new(&position, &engine.evaluator);
             let undo = state.make_move(late, &engine.evaluator).unwrap();
             engine.table.store(TtEntry::new(

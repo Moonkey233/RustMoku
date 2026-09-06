@@ -8,6 +8,13 @@ rust-version.workspace = true
 [dependencies]
 rustmoku-core.workspace = true
 
+# Only the explicit memory-model test build substitutes instrumented atomics.
+[target.'cfg(loom)'.dependencies]
+loom = "0.7.2"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+
 [features]
 bench-internals = []
 

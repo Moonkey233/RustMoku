@@ -39,6 +39,7 @@ impl Default for TacticalConfig {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EngineConfig {
     tt_memory_mib: usize,
+    threads: usize,
     tactical: TacticalConfig,
 }
 
@@ -51,6 +52,7 @@ impl EngineConfig {
     pub const fn new(tt_memory_mib: usize) -> Self {
         Self {
             tt_memory_mib,
+            threads: 1,
             tactical: TacticalConfig {
                 vcf: ProofLimits::new(Self::DEFAULT_VCF_MAX_PLIES, Self::DEFAULT_VCF_MAX_NODES),
                 vct: ProofLimits::new(9, 4_000),
@@ -62,6 +64,27 @@ impl EngineConfig {
     #[must_use]
     pub const fn tt_memory_mib(self) -> usize {
         self.tt_memory_mib
+    }
+
+    /// Number of CPU Alpha-Beta workers used by one public search.
+    #[must_use]
+    pub const fn threads(self) -> usize {
+        self.threads
+    }
+
+    /// Sets the number of CPU Alpha-Beta workers. Zero is normalized to the
+    /// smallest valid team so an invalid configuration cannot reach search.
+    #[must_use]
+    pub const fn with_threads(mut self, threads: usize) -> Self {
+        self.threads = if threads == 0 { 1 } else { threads };
+        self
+    }
+
+    /// Replaces the ordinary TT capacity while preserving all other settings.
+    #[must_use]
+    pub const fn with_tt_memory_mib(mut self, memory_mib: usize) -> Self {
+        self.tt_memory_mib = memory_mib;
+        self
     }
 
     #[must_use]
@@ -108,5 +131,17 @@ impl EngineConfig {
 impl Default for EngineConfig {
     fn default() -> Self {
         Self::new(Self::DEFAULT_TT_MEMORY_MIB)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::EngineConfig;
+
+    #[test]
+    fn thread_configuration_defaults_to_one_and_normalizes_zero() {
+        assert_eq!(EngineConfig::default().threads(), 1);
+        assert_eq!(EngineConfig::new(0).with_threads(0).threads(), 1);
+        assert_eq!(EngineConfig::new(0).with_threads(8).threads(), 8);
     }
 }
