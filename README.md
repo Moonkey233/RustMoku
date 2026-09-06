@@ -1,9 +1,23 @@
 # RustMoku
 
-RustMoku V0.9 is a 15 x 15 Freestyle Gomoku program and a small
+RustMoku V0.10 is a 15 x 15 Freestyle Gomoku program and a small
 research-oriented engine foundation. It prioritizes correct game semantics,
 clear crate boundaries, reproducible single-thread results, and measurable
 search behavior.
+
+## V0.10 - Threat-Aware Selectivity, History & QSearch
+
+- Signed gravity history with malus, countermoves, and one/two-ply continuation
+  history feeds the existing packed deterministic move order.
+- Adaptive depth/index LMR protects tactical, TT, killer, countermove, and
+  high-context moves; improving reduced searches retry at nominal depth.
+- Guarded LMP, move futility, reverse futility, razoring, IIR, exact mate-distance
+  bounds, and a one-ply path-bounded FourThree-or-stronger extension reduce work.
+- Directional bound validity prevents every heuristic shortcut from publishing
+  unsupported ordinary-TT Exact, Lower, or Upper evidence.
+- Qsearch reports recursive work, forcing edges, forced blocks, stand-pat
+  cutoffs, cap hits, and maximum qply. Measurement showed recursive expansion is
+  small, so the exact Four+ vocabulary and mandatory-response semantics remain.
 
 ## V0.9 - Multi-Core Lazy SMP & Shared TT
 
@@ -58,14 +72,15 @@ The established engine foundation remains:
   or White selection and New Game.
 - Fail-soft PVS with iterative deepening and exponentially widened aspiration
   windows; canonical equal-score root selection is preserved.
-- Per-search history and two killers per ply, subordinate to tactical priorities.
+- Per-search signed main/continuation history, countermoves, and two killers per
+  ply, subordinate to tactical priorities.
 - Cached profile bitsets and exact immediate tactics: win in one, unique forced
   block, or loss in two against multiple winning points, shared by all searches.
 - Threat quiescence expands only own Four-or-stronger continuations through
   bitsets. Its six-ply expansion cap never masks immediate wins or forced replies;
   potential opponent Four+ threats do not remove stand pat.
-- Conservative one-ply LMR for late, low-history Quiet moves at scout nodes;
-  improvements are re-searched at nominal depth before updating alpha/PV.
+- Adaptive LMR and conservative shallow selectivity for quiet scout-node work;
+  exact tactics and strong threats remain protected.
 - Deterministic incremental 64-bit Zobrist keys and a persistent, fixed-size,
   four-way clustered transposition table.
 - Mate-distance-safe TT scores, TT-aware tactical move ordering, and canonical
@@ -100,15 +115,24 @@ cargo test --workspace --all-features
 cargo run --release -p rustmoku-native
 ```
 
-The AI defaults to depth 4, one Alpha-Beta worker, a 64 MiB primary
-transposition table, and a gated VCF attempt limited to 11 proof plies / 2,000
-nodes with a separate 384 KiB proof table. VCT defaults to 9 plies / 4,000 node
+The Native app displays its Cargo package version automatically and defaults to
+the practical human-play profile: depth 8, Auto threads capped at eight logical
+workers, a 128 MiB primary transposition table, 15,000 ms per move, move numbers
+on, and Auto language. Auto selects Simplified Chinese for supported Chinese
+system locales and English otherwise; users can explicitly select English or
+Simplified Chinese. Native loads an existing Windows CJK font when needed and
+safely falls back to English if none is available.
+
+Library and Arena defaults remain the deterministic research profile: depth 4,
+one Alpha-Beta worker, and a 64 MiB primary transposition table. The engine also
+defaults to a gated VCF attempt limited to 11 proof plies / 2,000 nodes with a
+separate 384 KiB proof table. VCT defaults to 9 plies / 4,000 node
 inspections and a 16 MiB memory request (12 MiB actual bucket allocation). Roots
 without OpenThree-or-stronger candidates spend zero VCT nodes. A persistent
 worker owns the engine and ordinary TT. The UI remains responsive, displays
-completed search snapshots, and accepts New Game while searching. Depth, thread
-count, TT MiB and optional move time apply to the next request (0 ms means
-unlimited). Each invalidation cancels its token and advances the request ID; both
+completed search snapshots, and accepts New Game while searching. Depth,
+Auto/manual thread count, TT MiB and move time apply to the next request; setting
+move time to 0 ms means unlimited. Each invalidation cancels its token and advances the request ID; both
 old snapshots and old results are ignored. Application drop cancels, sends
 shutdown and joins the worker.
 
@@ -142,7 +166,7 @@ use rustmoku_engine::{AlphaBetaEngine, ClassicalEvaluator};
 let mut engine = AlphaBetaEngine::new(ClassicalEvaluator);
 ```
 
-The V0.8 lean performance check and V0.9 scaling measurements are recorded in
+The V0.8 lean performance check and V0.9/V0.10 measurements are recorded in
 [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md). Additional fixtures are `vcf_win`,
 `vct_win`, and `non_vct_tactical`; the default quick suite still has five positions.
 Use `--vcf-plies`, `--vcf-nodes`, `--vct-plies`, `--vct-nodes`, and `--vct-mib`.
@@ -302,11 +326,10 @@ search contracts.
 
 ## Current limits and roadmap
 
-V0.9 does not add additional selective pruning, advanced qsearch, NNUE, MCTS,
-opening book, server API, Renju, or Swap protocol. Parallel results with more
-than one worker are not promised bit-for-bit stable.
-LMR remains heuristic and may miss quiet resources; it does not prove equality
-with full-depth minimax. Quiescence omits ordinary Three expansion and optional
+V0.10 does not add Null Move, ProbCut, singular extension, interior VCF/VCT,
+NNUE, MCTS, opening book, server API, Renju, or Swap protocol. Parallel results
+with more than one worker are not promised bit-for-bit stable. Selective search
+does not prove equality with full-width minimax. Quiescence omits ordinary Three expansion and optional
 non-immediate defensive moves, and stops non-immediate forcing continuations at
 the cap. Pattern weights and LMR thresholds are untuned. Cancellation latency
 also depends on evaluator/observer cost; deadlines are not hard real-time guarantees.

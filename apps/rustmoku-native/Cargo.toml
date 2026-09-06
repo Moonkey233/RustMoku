@@ -9,3 +9,4 @@ rust-version.workspace = true
 eframe = { version = "0.36.1", default-features = false, features = ["default_fonts", "glow"] }
 rustmoku-core.workspace = true
 rustmoku-engine.workspace = true
+sys-locale = "0.3.2"

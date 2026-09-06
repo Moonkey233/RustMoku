@@ -202,7 +202,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Err("unknown fixture".into());
     }
     println!(
-        "fixture,evaluator,tt_mib,threads,repeats,requested_depth,completed_depth,seldepth,best_index,score,nodes,qnodes,principal_nodes,helper_nodes,pvs_researches,lmr_reductions,lmr_researches,aspiration_fail_low,aspiration_fail_high,static_evaluations,tt_probes,tt_hits,tt_cutoffs,tt_stores,tt_replacements,vcf_nodes,vcf_cache_hits,vcf_probes,vcf_proven,vcf_budget_exhausted,vct_nodes,vct_cache_hits,vct_proven,vct_budget_exhausted,capacity_bytes,synchronization_bytes,allocated_bytes,buckets,entries,hashfull_per_mille,median_ms,nps,work_nodes,termination"
+        "fixture,evaluator,tt_mib,threads,repeats,requested_depth,completed_depth,seldepth,best_index,score,nodes,qnodes,qsearch_recursive_nodes,qsearch_forcing_edges,qsearch_forced_blocks,qsearch_stand_pat_cutoffs,qsearch_cap_hits,max_qply,principal_nodes,helper_nodes,pvs_researches,lmr_reductions,lmr_researches,lmp_pruned_moves,futility_pruned_moves,rfp_attempts,rfp_cutoffs,razor_attempts,razor_cutoffs,iir_reductions,threat_extensions,aspiration_fail_low,aspiration_fail_high,static_evaluations,tt_probes,tt_hits,tt_cutoffs,tt_stores,tt_replacements,vcf_nodes,vcf_cache_hits,vcf_probes,vcf_proven,vcf_budget_exhausted,vct_nodes,vct_cache_hits,vct_proven,vct_budget_exhausted,capacity_bytes,synchronization_bytes,allocated_bytes,buckets,entries,hashfull_per_mille,median_ms,nps,work_nodes,termination"
     );
     for fixture in fixtures.iter().chain(&proof_fixtures) {
         if fixture_filter.is_none() && proof_fixtures.iter().any(|f| f.name == fixture.name) {
@@ -260,7 +260,7 @@ fn benchmark<E: Evaluator>(
     let tt = sample.table;
     let nps = stats.nodes as f64 / elapsed.as_secs_f64();
     println!(
-        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:.3},{:.0},{},{:?}",
+        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:.3},{:.0},{},{:?}",
         fixture.name,
         name,
         memory_mib,
@@ -275,11 +275,25 @@ fn benchmark<E: Evaluator>(
         result.score,
         stats.nodes,
         stats.qnodes,
+        stats.qsearch_recursive_nodes,
+        stats.qsearch_forcing_edges,
+        stats.qsearch_forced_blocks,
+        stats.qsearch_stand_pat_cutoffs,
+        stats.qsearch_cap_hits,
+        stats.max_qply,
         stats.principal_nodes,
         stats.helper_nodes,
         stats.pvs_researches,
         stats.lmr_reductions,
         stats.lmr_researches,
+        stats.lmp_pruned_moves,
+        stats.futility_pruned_moves,
+        stats.rfp_attempts,
+        stats.rfp_cutoffs,
+        stats.razor_attempts,
+        stats.razor_cutoffs,
+        stats.iir_reductions,
+        stats.threat_extensions,
         stats.aspiration_fail_low,
         stats.aspiration_fail_high,
         stats.static_evaluations,

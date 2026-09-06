@@ -1,9 +1,9 @@
-# RustMoku V0.9 Architecture
+# RustMoku V0.10 Architecture
 
-V0.9 builds on the V0.8 lifecycle, Arena and native adapter with CPU-only
-multi-core Lazy SMP and a Safe-Rust shared ordinary transposition table.
-Classical search remains the primary backend; this milestone adds no advanced
-selectivity or learned evaluation.
+V0.10 builds on the V0.9 CPU-only Lazy SMP and Safe-Rust shared ordinary
+transposition table with worker-local threat-aware selectivity, contextual
+history, and measured qsearch diagnostics. Classical search remains the primary
+backend; learned evaluation remains future work.
 Core remains authoritative for legality and wins; Native remains an adapter.
 All first-party crates forbid unsafe code. Concurrency uses only the standard library.
 Milestone scope and future work live in [ROADMAP.md](ROADMAP.md).
@@ -382,15 +382,19 @@ Move priorities use cached profiles and precomputed center bias. Ordered tiers:
 7. own OpenThree, then opponent OpenThree, then Three-like moves, then Quiet.
 
 Each tier distinguishes its exact structural class. Within it, TT preference,
-killer rank, history, own/opponent profile, center bias, and lower canonical
+countermove, killer rank, signed contextual history, own/opponent profile, center bias, and lower canonical
 index form a packed u64 total order. Fixed-capacity arrays and integer-only
 comparators avoid allocation and pattern calculation in sorting.
 
-SearchHeuristics owns `history[Stone][Move]` and two distinct killers per ply.
-Only beta-cutoff moves whose own and opponent profiles are both below Four are
-learned. The history bonus is min(depth squared, 1024), using bounded gravity
-below 16,384; killers keep the two latest distinct moves. Tactical tiers remain
-above TT, history, and killers, regardless of previously learned values.
+Each worker's `SearchHeuristics` owns signed main history, countermoves,
+one/two-ply array-indexed continuation histories, two killers per ply, and a
+fixed search stack. A quiet beta-cutoff receives a bounded gravity bonus; earlier
+searched quiets receive bounded malus without board-wide decay. The continuation
+arrays allocate once at worker initialization. Cutoff training occurs only when
+the cutoff move is genuinely quiet and its child carries verified Lower evidence;
+an unverified heuristic fail-high or tactical move may still cut off search but
+cannot update main/continuation history, countermoves, or killers. Tactical tiers
+remain above TT and every learned signal.
 
 Root comparisons explicitly prefer the smaller move
 index on equal exact scores. If a root child only returns an alpha-bound equal to
@@ -448,7 +452,10 @@ After stand-pat beta cutoff and alpha update, noisy moves are generated directly
 as `CandidateFrontier bits & own profile bits >= Four`, then ascending set-bit
 iteration materializes a fixed-capacity ordered list. No scan of ordinary
 candidates, ordinary Three/OpenThree/DoubleThree expansion, or optional enemy
-non-immediate defensive points is included in V0.9.
+non-immediate defensive points is included in V0.10. Diagnostics distinguish
+initial leaves from recursive forcing edges, forced blocks, stand-pat cutoffs,
+cap hits, and maximum qply. D6 measurements found only 6-8% recursive qnodes, so
+no broader vocabulary or unsupported delta bound was added.
 
 The expansion cap remains six qplies. At/after it, only exact immediate facts and
 forced-block chains continue; each reply fills a cell, so the 225-cell board is
@@ -456,13 +463,21 @@ the absolute bound. Quiet or non-immediate states at the cap return static
 evaluation. A zero nominal-depth public call reports qsearch score/statistics
 but keeps best_move=None and an empty public PV.
 
-### Conservative LMR
+### Threat-aware selectivity and directional validity
 
-Only normal non-root scout nodes (beta = alpha + 1) may reduce. Remaining depth
-must be at least 3, move index in the ordered list at least 8 (ninth move), both
-profiles exactly Quiet, history below 128, and killer rank zero. Hash moves,
-forced blocks, PV windows, and mate-range windows are excluded. Reduction is
-always one ply; no two-ply policy or reduction table is introduced.
+Only normal non-root scout nodes may reduce. A centralized integer depth/index
+rule supplies one to three plies; exact obligations, TT moves, non-Quiet profiles,
+killers, countermoves, and high contextual history are protected. Improving
+reduced searches repeat the nominal-depth PVS path before updating alpha or PV.
+
+Shallow LMP and move futility skip only genuinely quiet late moves outside PV,
+mate, forced, TT, tactical, killer, countermove, and strong-history contexts.
+Reverse futility and razor verification require a tactically stable shallow scout
+node. Their direct returns are explicitly unverified. IIR applies only at deep,
+tactically stable scout nodes without a useful TT move and stores evidence at the
+actually searched depth. Exact mate-distance bounds follow
+`MATE_SCORE - terminal_distance`. FourThree-or-stronger moves may receive one
+extra ply, with a path budget of one.
 
 The reduced child uses a null window. A score above alpha must repeat the normal
 PVS path at full nominal depth; a reduced fail-low never updates alpha or PV.
@@ -788,9 +803,13 @@ histories. Fresh engines and node limits provide reproducible Arena experiments.
 
 The eframe/egui UI draws public Game/Position state, translates validated Moves,
 and displays completed depth, seldepth, total work, qnodes, worker count, score,
-TT statistics, PV and proof distance. Depth (1..12), thread count and ordinary
-TT MiB apply to the next request; optional move time (0 = unlimited) remains a
-per-request limit. No search, rules or evaluator logic lives in presentation.
+TT statistics, PV and proof distance. Its human-play profile defaults to depth 8,
+Auto threads capped at eight logical workers, 128 MiB ordinary TT primary
+capacity, 15 seconds per move, and move numbers enabled. Depth (1..12), Auto or
+manual thread count, ordinary TT MiB, and optional move time (0 = unlimited)
+apply to the next request. Engine and Arena defaults remain the deterministic
+depth-four/one-worker/64-MiB research profile. No search, rules or evaluator
+logic lives in presentation.
 
 One persistent standard-library thread constructs and exclusively owns its
 AlphaBetaEngine. An mpsc request carries a monotonically increasing u64 ID, owned
@@ -827,7 +846,15 @@ cancels/advances its ID before mutation, clears displayed search state, and chec
 whether the restored side requires a new AI request. Game edits do not clear or
 resize the worker's ordinary TT.
 
-A fixed 238-point top controls panel and fixed 180-point history panel isolate
+A small Native-only text layer maps Auto/English/Simplified Chinese preferences.
+Auto maps zh, zh-CN, zh-SG and zh-Hans locales to Simplified Chinese and all
+others to English. Before rendering Chinese, Native safely loads an existing
+Windows Microsoft YaHei/SimHei/SimSun file as an egui fallback for proportional
+and monospace text. It bundles no font; if loading fails, the effective language
+stays English and one nonfatal message is shown. This presentation concern does
+not enter Core or Engine.
+
+A fixed 270-point top controls panel and fixed 180-point history panel isolate
 the remaining board rectangle. PV is one horizontal scroll row, and history is
 vertically bounded. Live proof/PV/error text cannot resize the board. Board labels
 occupy existing margins; click geometry stays shared with stone rendering. Move
@@ -856,9 +883,9 @@ are useful for scaling/strength experiments and may be schedule-dependent. There
 are no random openings, parallel matches, Elo estimates or tournament
 infrastructure.
 
-## Explicit V0.9 non-goals
+## Explicit V0.10 non-goals
 
-No advanced selective pruning, advanced qsearch redesign, interior VCF/VCT,
+No Null Move, ProbCut, singular extension, qsearch TT, interior VCF/VCT,
 NNUE, policy networks, SIMD optimization, unsafe code, MCTS, AlphaZero,
 Transformer evaluation, GPU compute, opening database, server/protocol layer,
 full-game clocks, SPRT/Elo framework, Renju, Swap/Swap2, or a generic persistent

@@ -64,67 +64,82 @@ are plans, not implemented capabilities or permission to expand a current task.
 - Focused payload, collision, concurrent-writer, lifecycle, PV-legality and
   helper-shutdown tests; full validation is recorded in `docs/PERFORMANCE.md`.
 
-## V0.10 — Advanced Alpha-Beta / Selectivity / QSearch (planned)
+## V0.10 — Advanced Alpha-Beta / Selectivity / QSearch (implemented)
 
-Evaluate each item behind regression, fixed-position benchmark, and engine-match
-evidence rather than adding chess techniques by analogy:
+- Signed gravity/malus main history, countermoves, and one/two-ply continuation
+  history with packed deterministic ordering.
+- Worker-local fixed search context and adaptive integer LMR with tactical, TT,
+  killer, countermove, history, and cut-node protection.
+- Guarded LMP, futility, reverse futility, razoring, IIR, exact mate-distance
+  pruning, and a one-ply path-bounded strong-threat extension.
+- Directional validity remains the TT firewall for every selective result; IIR
+  records actual searched depth and direct heuristic returns are never cached.
+- Qsearch instrumentation showed recursive forcing expansion is minor. Exact
+  immediate facts, forced blocks beyond caps, stand pat, and the own Four+
+  vocabulary remain unchanged; no unjustified Three expansion or delta bound was
+  added.
+- Null Move, ProbCut, singular extension, and interior proof probes were
+  deliberately deferred because their assumptions/evidence were insufficient.
 
-- Continuation History and Countermove History / Countermove Heuristic.
-- History Gravity + History Malus.
-- An adaptive LMR table using depth, move index, PV/scout status, history, TT
-  move, threat profile and cut-node context.
-- Late Move Pruning, Futility Pruning, Reverse Futility Pruning, Razoring,
-  ProbCut, Internal Iterative Reduction and Gomoku-adapted Singular Extension.
-- Bounded Threat Extension and Mate Distance Pruning.
-- Advanced Quiescence Search: better forcing filtering, stand-pat preservation,
-  forcing ordering, tactical quiet/noisy classification, and delta-style pruning
-  only where Gomoku semantics justify it.
-- Optional tiny/gated interior VCF or VCT probes only at strongly tactical,
-  narrow-branch nodes.
-- Cache/data-layout tuning when profile evidence exists.
+## V0.11 — Offline Solver & Proof Book (planned)
 
-Null Move Pruning remains experimental and disabled: the chess pass assumption is
-structurally unsafe in initiative-heavy Gomoku. Keep it disabled or deletable
-unless Arena evidence and tactical regressions support it.
+- Add an offline solver tool with D4 canonicalization for book/database use.
+- Orchestrate a best-first AND/OR frontier and bounded resources while reusing
+  exact Immediate, VCF, VCT and DFPN solving.
+- Produce a compact Freestyle Proof Book with proof metadata/certificates and
+  an independent verifier.
+- Query the Proof Book at runtime before ordinary online solving.
+- Keep opening D4 deduplication and empirical balance metadata separate from
+  proven strategy.
 
-Advanced QSearch is a first-class V0.10 target. V0.8 measurements showed that
-qsearch dominates some deeper positions (about 75k of 123k AB nodes in opening
-D6 and about 141k of 189k in forced defense D6). The large opening database,
-D4 deduplication, empirical balance suite and automatic filtering also belong to
-V0.10 infrastructure/tuning work.
+The semantic boundary is strict:
 
-## V0.11 — NNUE / learned policy / SIMD (planned)
+- Opening Suite / Opening Database: empirical experimental starts.
+- Proof Book: mathematically/search-proven strategy data.
+- Game Record: chronological played moves.
 
-- Incrementally updatable NNUE through `Evaluator::State` / `Undo`; BoardState
-  and tactical solvers remain NNUE-independent.
-- Scalar reference implementation first, then quantized inference and an AVX2
-  runtime path; later SIMD targets require evidence.
-- Training data from deep AB/self-play/game results and VCF/VCT labels.
-- A policy head or lightweight policy representation for move ordering.
-- Re-tune LMR, futility and ProbCut margins after evaluator distribution changes.
-- Any isolated unsafe optimization requires a later explicit policy change,
-  profiling evidence and differential tests; V0.9 remains Safe Rust.
+Empirical balance must never be described as proof.
 
-Rapfi/Figrid-style NNUE ideas may be studied conceptually, but GPL code is not
-copied.
+## V0.12 — Learned Local-Pattern Value + Policy + SIMD (planned)
 
-## V0.12 / research hardening if justified (planned)
+- Study an NNUE/MixNet-style learned local-pattern or codebook representation.
+- Maintain it incrementally through `Evaluator::State` / `Undo` while BoardState
+  and tactical solvers remain evaluator-independent.
+- Establish a scalar reference, then quantization and a Value head.
+- Add a lightweight Policy head for move ordering and, only later, measured
+  reduction modifiers.
+- Train from deep Alpha-Beta/self-play data plus exact tactical/proof labels,
+  with D4 augmentation.
+- Add AVX2 after differential validation; optional AVX-512/VNNI remains later
+  and evidence-gated.
+- Re-tune V0.10 evaluation-dependent margins after evaluator replacement.
 
-- Proof-guided Alpha-Beta budget allocation.
-- Learned or threat-aware decisions about when to invoke DFPN.
-- Threat-aware selective reduction and quiet-threat/dependency-TSS research.
-- TT/cache layout hardening, persistent search workers if thread-spawn cost is
-  measured, and NUMA/server scaling on real large-CPU hardware.
-- PGO/LTO/codegen tuning.
+Rapfi/Figrid-style learned-evaluation ideas may be studied conceptually, but GPL
+code is not copied.
 
-Do not create V0.12 merely to satisfy a version number.
+## V1.0 — Integrated Strength / Proof-Guided Search (planned)
 
-## Later separate neural-search route
+Experimentally evaluate rather than automatically retain:
 
-Keep a future `SearchEngine` backend for MCTS, AlphaZero, Gumbel AlphaZero,
-Transformer value/policy evaluation, and PNS/DFPN-assisted neural tree search.
-This route requires a training/self-play/GPU pipeline and is not part of
-V0.9–V0.11 classical-engine completion. It does not replace `AlphaBetaEngine`.
+- proof-guided Alpha-Beta/DFPN budget scheduling;
+- policy-based reductions;
+- guarded Null Move with verification;
+- ProbCut;
+- Singular Extension / excluded-move search;
+- tiny interior VCF/DFPN probes;
+- statistical Arena support with paired openings, Elo/LOS/SPRT/LLR;
+- final parameter tuning;
+- measured TT/cache/thread-pool/NUMA/PGO hardening.
+
+Every optional search technique remains only when correctness tests and measured
+playing strength support it.
+
+## Later V1.x/V2 research backend
+
+Keep a separate future `SearchEngine` backend for MCTS, AlphaZero/Gumbel
+AlphaZero, Transformer policy/value, and neural tree search with PNS/DFPN. It
+requires a training/self-play/GPU pipeline and does not replace
+`AlphaBetaEngine`.
 
 ## Long-term architecture
 
@@ -134,11 +149,11 @@ V0.9–V0.11 classical-engine completion. It does not replace `AlphaBetaEngine`.
 - Evaluator remains replaceable; board proof nodes do not update learned accumulators.
 - Core owns rules and legal transitions. Search consumes Position; apps are adapters.
 
-## Explicit V0.9 non-goals
+## Explicit V0.10 non-goals
 
-V0.9 does not implement V0.10 selective pruning, an advanced qsearch redesign,
-interior VCF/VCT, NNUE, policy networks, SIMD optimization, unsafe code, MCTS,
+V0.10 does not implement Null Move, ProbCut, singular extension, interior
+VCF/VCT, NNUE, policy networks, SIMD optimization, unsafe code, MCTS,
 AlphaZero/Gumbel AlphaZero, Transformer evaluation, GPU compute, a server or
 protocol layer, Renju/Standard rules, Swap/Swap2, a large opening database,
 SPRT/Elo infrastructure, or a generic thread-pool/runtime framework without
-measured need. Finish the small Lazy-SMP/shared-TT design first.
+measured need.

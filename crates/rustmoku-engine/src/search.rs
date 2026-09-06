@@ -5,10 +5,12 @@ use crate::{
     CancellationToken, EngineConfig, Evaluator, PatternEvaluator, SearchTermination,
     move_generation::MoveList,
     move_ordering::order_moves,
+    pattern::ThreatProfile,
     principal_variation::PvTable,
     score::{MATE_SCORE, MATE_THRESHOLD, SEARCH_INFINITY, score_from_tt, score_to_tt},
     search_control::{SearchBudget, Stopped},
     search_heuristics::SearchHeuristics,
+    search_params,
     search_state::SearchState,
     tactical::{forcing_moves, immediate_tactic},
     transposition_table::{Bound, TranspositionTable, TranspositionTableStatistics, TtEntry},
@@ -71,9 +73,24 @@ pub struct SearchStatistics {
     /// Alpha-Beta nodes, including qnodes and re-search work; proofs are separate.
     pub nodes: u64,
     pub qnodes: u64,
+    /// Qsearch visits below the initial depth-zero replacement node.
+    pub qsearch_recursive_nodes: u64,
+    pub qsearch_forcing_edges: u64,
+    pub qsearch_forced_blocks: u64,
+    pub qsearch_stand_pat_cutoffs: u64,
+    pub qsearch_cap_hits: u64,
+    pub max_qply: u8,
     pub pvs_researches: u64,
     pub lmr_reductions: u64,
     pub lmr_researches: u64,
+    pub lmp_pruned_moves: u64,
+    pub futility_pruned_moves: u64,
+    pub rfp_attempts: u64,
+    pub rfp_cutoffs: u64,
+    pub razor_attempts: u64,
+    pub razor_cutoffs: u64,
+    pub iir_reductions: u64,
+    pub threat_extensions: u64,
     pub aspiration_fail_low: u64,
     pub aspiration_fail_high: u64,
     pub static_evaluations: u64,
@@ -542,9 +559,23 @@ impl SearchStatistics {
     fn add_worker(&mut self, other: Self) {
         self.nodes += other.nodes;
         self.qnodes += other.qnodes;
+        self.qsearch_recursive_nodes += other.qsearch_recursive_nodes;
+        self.qsearch_forcing_edges += other.qsearch_forcing_edges;
+        self.qsearch_forced_blocks += other.qsearch_forced_blocks;
+        self.qsearch_stand_pat_cutoffs += other.qsearch_stand_pat_cutoffs;
+        self.qsearch_cap_hits += other.qsearch_cap_hits;
+        self.max_qply = self.max_qply.max(other.max_qply);
         self.pvs_researches += other.pvs_researches;
         self.lmr_reductions += other.lmr_reductions;
         self.lmr_researches += other.lmr_researches;
+        self.lmp_pruned_moves += other.lmp_pruned_moves;
+        self.futility_pruned_moves += other.futility_pruned_moves;
+        self.rfp_attempts += other.rfp_attempts;
+        self.rfp_cutoffs += other.rfp_cutoffs;
+        self.razor_attempts += other.razor_attempts;
+        self.razor_cutoffs += other.razor_cutoffs;
+        self.iir_reductions += other.iir_reductions;
+        self.threat_extensions += other.threat_extensions;
         self.aspiration_fail_low += other.aspiration_fail_low;
         self.aspiration_fail_high += other.aspiration_fail_high;
         self.static_evaluations += other.static_evaluations;
@@ -697,8 +728,8 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
         }
     }
 
-    // The false specialization is used only by the small Alpha-Beta oracle
-    // tests. Production always uses PVS; no public algorithm switch is needed.
+    // The false specialization is the small full-width, non-selective oracle
+    // used by tests. Production always uses PVS; there is no public policy switch.
     fn search_root<const PVS: bool>(
         &self,
         state: &mut SearchState<E>,
@@ -709,6 +740,7 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
     ) -> Result<RootSearchResult, Stopped> {
         resources.budget.charge()?;
         resources.statistics.nodes += 1;
+        resources.heuristics.begin_root();
         resources.pv.clear(0);
         if let Some(score) = terminal_score(state.position(), 0) {
             return Ok(RootSearchResult {
@@ -759,8 +791,11 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
         }
         let mut best_move = None;
         let mut best_score = -SEARCH_INFINITY;
+        let mut searched_quiets = MoveList::new();
 
         for (index, at) in moves.iter().enumerate() {
+            let quiet = SearchHeuristics::is_quiet(state.patterns(), side, at);
+            resources.heuristics.set_child(1, at, index != 0, 0);
             let undo = state
                 .make_move(at, self.evaluator)
                 .expect("frontier moves are legal");
@@ -800,6 +835,9 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
             let result = child?;
             validity.include(result.validity, result.score, best_score);
             let score = result.score;
+            if quiet {
+                searched_quiets.push(at);
+            }
             if score > best_score
                 || (score == best_score && best_move.is_none_or(|current| at < current))
             {
@@ -812,9 +850,17 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
                 // Unsearched siblings prevent an upper bound at this node.
                 validity.upper = false;
                 resources.statistics.beta_cutoffs += 1;
-                resources
-                    .heuristics
-                    .record_cutoff(side, at, depth, 0, state.patterns());
+                resources.heuristics.record_cutoff_with_context(
+                    result.validity.lower,
+                    side,
+                    at,
+                    depth,
+                    0,
+                    None,
+                    None,
+                    searched_quiets.as_slice(),
+                    state.patterns(),
+                );
                 break;
             }
         }
@@ -845,7 +891,7 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
         state: &mut SearchState<E>,
         depth: u8,
         mut alpha: i32,
-        beta: i32,
+        mut beta: i32,
         ply: u8,
         resources: &mut SearchResources<'_>,
     ) -> Result<NodeResult, Stopped> {
@@ -861,6 +907,7 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
         resources.statistics.nodes += 1;
         *resources.seldepth = (*resources.seldepth).max(ply);
         resources.pv.clear(ply);
+        resources.heuristics.begin_node(ply);
         if let Some(score) = terminal_score(state.position(), ply) {
             return Ok(NodeResult::complete(score));
         }
@@ -869,6 +916,20 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
             return Ok(NodeResult::complete(score));
         }
         let forced_block = tactic.forced_block();
+        let input_alpha = alpha;
+        let input_beta = beta;
+        match mate_distance_window(alpha, beta, ply) {
+            MateDistanceWindow::Search {
+                alpha: bounded_alpha,
+                beta: bounded_beta,
+            } => {
+                alpha = bounded_alpha;
+                beta = bounded_beta;
+            }
+            MateDistanceWindow::Cutoff(score) => {
+                return Ok(NodeResult::verified(score, input_alpha, input_beta));
+            }
+        }
         let mut validity = BoundValidity {
             lower: false,
             upper: true,
@@ -880,6 +941,65 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
             return Ok(NodeResult::verified(score, alpha, beta));
         }
         let side = state.position().side_to_move();
+        let candidate_bits = state.candidate_bits();
+        let strong_threats = !candidate_bits
+            .intersection(
+                state
+                    .patterns()
+                    .moves_at_least(side, ThreatProfile::OpenThree),
+            )
+            .is_empty()
+            || !candidate_bits
+                .intersection(
+                    state
+                        .patterns()
+                        .moves_at_least(side.opponent(), ThreatProfile::OpenThree),
+                )
+                .is_empty();
+        let selective_node = PVS
+            && scout_node
+            && forced_block.is_none()
+            && !strong_threats
+            && alpha.abs() < MATE_THRESHOLD
+            && beta.abs() < MATE_THRESHOLD;
+        let static_eval = if selective_node && depth <= 3 {
+            resources.statistics.static_evaluations += 1;
+            let score = state.evaluate(self.evaluator);
+            resources.heuristics.set_static_eval(ply, score);
+            Some(score)
+        } else {
+            resources.heuristics.static_eval(ply)
+        };
+        if selective_node && depth <= 3 {
+            resources.statistics.rfp_attempts += 1;
+            if static_eval
+                .is_some_and(|score| score - search_params::reverse_futility_margin(depth) >= beta)
+            {
+                resources.statistics.rfp_cutoffs += 1;
+                return Ok(NodeResult::unverified(
+                    static_eval.expect("computed static eval"),
+                ));
+            }
+        }
+        if selective_node
+            && depth <= 2
+            && static_eval.is_some_and(|score| score + search_params::razor_margin(depth) < alpha)
+        {
+            resources.statistics.razor_attempts += 1;
+            let score = self.qsearch(state, alpha, beta, ply, 0, resources)?;
+            if score <= alpha {
+                resources.statistics.razor_cutoffs += 1;
+                return Ok(NodeResult::unverified(score));
+            }
+        }
+        let iir = PVS
+            && scout_node
+            && forced_block.is_none()
+            && !strong_threats
+            && probe.best_move.is_none()
+            && depth >= search_params::IIR_MIN_DEPTH;
+        let searched_depth = depth - u8::from(iir);
+        resources.statistics.iir_reductions += u64::from(iir);
         let mut moves = if let Some(at) = forced_block {
             let mut moves = MoveList::new();
             moves.push(at);
@@ -900,20 +1020,69 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
         );
         let mut best_move = None;
         let mut best_score = -SEARCH_INFINITY;
+        let (previous, two_back) = resources.heuristics.previous_moves(ply);
+        let mut searched_quiets = MoveList::new();
         for (index, at) in moves.iter().enumerate() {
+            let quiet = SearchHeuristics::is_quiet(state.patterns(), side, at);
+            let strong_context = resources
+                .heuristics
+                .is_strong_context(side, at, ply, previous, two_back);
+            let late_quiet = selective_node
+                && index != 0
+                && quiet
+                && probe.best_move != Some(at)
+                && !strong_context;
+            if late_quiet
+                && searched_depth <= 3
+                && index >= search_params::lmp_threshold(searched_depth)
+            {
+                resources.statistics.lmp_pruned_moves += 1;
+                validity.upper = false;
+                continue;
+            }
+            if late_quiet
+                && searched_depth <= 2
+                && static_eval.is_some_and(|score| {
+                    score + search_params::futility_margin(searched_depth) <= alpha
+                })
+            {
+                resources.statistics.futility_pruned_moves += 1;
+                validity.upper = false;
+                continue;
+            }
+            let extension = u8::from(threat_extension(
+                state.patterns().profile(at, side),
+                resources.heuristics.extensions(ply),
+            ));
+            resources.statistics.threat_extensions += u64::from(extension);
+            let child_depth = searched_depth - 1 + extension;
             let reduction = if PVS
                 && scout_node
                 && forced_block.is_none()
                 && probe.best_move != Some(at)
                 && alpha.abs() < MATE_THRESHOLD
+                && extension == 0
             {
-                resources
-                    .heuristics
-                    .lmr_reduction(depth, index, side, at, ply, state.patterns())
+                resources.heuristics.adaptive_lmr_reduction(
+                    searched_depth,
+                    index,
+                    side,
+                    at,
+                    ply,
+                    previous,
+                    two_back,
+                    state.patterns(),
+                )
             } else {
                 0
             };
 
+            resources.heuristics.set_child(
+                ply + 1,
+                at,
+                scout_node && index != 0,
+                resources.heuristics.extensions(ply) + extension,
+            );
             let undo = state
                 .make_move(at, self.evaluator)
                 .expect("frontier moves are legal");
@@ -922,7 +1091,7 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
                     resources.statistics.lmr_reductions += 1;
                     let reduced = -self.negamax::<PVS>(
                         state,
-                        depth - 1 - reduction,
+                        child_depth - reduction,
                         -alpha - 1,
                         -alpha,
                         ply + 1,
@@ -938,7 +1107,7 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
                 if PVS && index != 0 {
                     result = -self.negamax::<PVS>(
                         state,
-                        depth - 1,
+                        child_depth,
                         -alpha - 1,
                         -alpha,
                         ply + 1,
@@ -948,7 +1117,7 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
                         resources.statistics.pvs_researches += 1;
                         result = -self.negamax::<PVS>(
                             state,
-                            depth - 1,
+                            child_depth,
                             -beta,
                             -alpha,
                             ply + 1,
@@ -958,7 +1127,7 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
                 } else {
                     result = -self.negamax::<PVS>(
                         state,
-                        depth - 1,
+                        child_depth,
                         -beta,
                         -alpha,
                         ply + 1,
@@ -977,10 +1146,16 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
                     validity.lower = false;
                 }
                 best_score = best_score.max(result.score);
+                if quiet {
+                    searched_quiets.push(at);
+                }
                 continue;
             }
             validity.include(result.validity, result.score, best_score);
             let score = result.score;
+            if quiet {
+                searched_quiets.push(at);
+            }
             if score > best_score {
                 best_score = score;
                 best_move = Some(at);
@@ -991,9 +1166,17 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
                 // Unsearched siblings prevent an upper bound at this node.
                 validity.upper = false;
                 resources.statistics.beta_cutoffs += 1;
-                resources
-                    .heuristics
-                    .record_cutoff(side, at, depth, ply, state.patterns());
+                resources.heuristics.record_cutoff_with_context(
+                    result.validity.lower,
+                    side,
+                    at,
+                    searched_depth,
+                    ply,
+                    previous,
+                    two_back,
+                    searched_quiets.as_slice(),
+                    state.patterns(),
+                );
                 break;
             }
         }
@@ -1005,7 +1188,7 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
                     key: state.key().value(),
                     score: best_score,
                     best_move,
-                    depth,
+                    depth: searched_depth,
                     bound: classify_bound(best_score, original_alpha, beta),
                     ply,
                 },
@@ -1014,7 +1197,11 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
         }
         Ok(NodeResult {
             score: best_score,
-            validity,
+            validity: if iir {
+                BoundValidity::UNVERIFIED
+            } else {
+                validity
+            },
         })
     }
 
@@ -1030,8 +1217,11 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
         resources.budget.charge()?;
         resources.statistics.nodes += 1;
         resources.statistics.qnodes += 1;
+        resources.statistics.qsearch_recursive_nodes += u64::from(qply > 0);
+        resources.statistics.max_qply = resources.statistics.max_qply.max(qply);
         *resources.seldepth = (*resources.seldepth).max(ply);
         resources.pv.clear(ply);
+        resources.heuristics.begin_node(ply);
         if let Some(score) = terminal_score(state.position(), ply) {
             return Ok(score);
         }
@@ -1041,8 +1231,15 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
             return Ok(score);
         }
         if let Some(at) = tactic.forced_block() {
+            resources.statistics.qsearch_forced_blocks += 1;
             // An immediate obligation survives the expansion cap. A chain of
             // forced replies still terminates because every ply fills a cell.
+            resources.heuristics.set_child(
+                ply + 1,
+                at,
+                false,
+                resources.heuristics.extensions(ply),
+            );
             let undo = state
                 .make_move(at, self.evaluator)
                 .expect("winning point is legal");
@@ -1061,7 +1258,12 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
         }
         resources.statistics.static_evaluations += 1;
         let mut best_score = state.evaluate(self.evaluator);
-        if qply >= MAX_QSEARCH_PLY || best_score >= beta {
+        if qply >= MAX_QSEARCH_PLY {
+            resources.statistics.qsearch_cap_hits += 1;
+            return Ok(best_score);
+        }
+        if best_score >= beta {
+            resources.statistics.qsearch_stand_pat_cutoffs += 1;
             return Ok(best_score);
         }
         alpha = alpha.max(best_score);
@@ -1077,6 +1279,13 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
         }
         order_moves(side, patterns, &mut moves, None, &resources.heuristics, ply);
         for at in moves.iter() {
+            resources.statistics.qsearch_forcing_edges += 1;
+            resources.heuristics.set_child(
+                ply + 1,
+                at,
+                false,
+                resources.heuristics.extensions(ply),
+            );
             let undo = state
                 .make_move(at, self.evaluator)
                 .expect("forcing frontier moves are legal");
@@ -1225,6 +1434,10 @@ struct BoundValidity {
 }
 
 impl BoundValidity {
+    const UNVERIFIED: Self = Self {
+        lower: false,
+        upper: false,
+    };
     const VERIFIED: Self = Self {
         lower: true,
         upper: true,
@@ -1256,6 +1469,13 @@ struct NodeResult {
 }
 
 impl NodeResult {
+    fn unverified(score: i32) -> Self {
+        Self {
+            score,
+            validity: BoundValidity::UNVERIFIED,
+        }
+    }
+
     fn verified(score: i32, alpha: i32, beta: i32) -> Self {
         let bound = classify_bound(score, alpha, beta);
         Self {
@@ -1344,6 +1564,29 @@ const fn classify_bound(best_score: i32, original_alpha: i32, beta: i32) -> Boun
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MateDistanceWindow {
+    Search { alpha: i32, beta: i32 },
+    Cutoff(i32),
+}
+
+fn mate_distance_window(alpha: i32, beta: i32, ply: u8) -> MateDistanceWindow {
+    let alpha = alpha.max(-MATE_SCORE + i32::from(ply));
+    if alpha >= beta {
+        return MateDistanceWindow::Cutoff(alpha);
+    }
+    let beta = beta.min(MATE_SCORE - i32::from(ply) - 1);
+    if alpha >= beta {
+        MateDistanceWindow::Cutoff(beta)
+    } else {
+        MateDistanceWindow::Search { alpha, beta }
+    }
+}
+
+fn threat_extension(profile: ThreatProfile, used: u8) -> bool {
+    profile >= ThreatProfile::FourThree && used < search_params::THREAT_EXTENSION_BUDGET
+}
+
 fn terminal_score(position: &Position, ply: u8) -> Option<i32> {
     if let Some(winner) = position.winner() {
         let distance = i32::from(ply);
@@ -1383,8 +1626,8 @@ mod tests {
     use rustmoku_core::{Move, Position};
 
     use super::{
-        AlphaBetaEngine, SearchEngine, SearchLimits, SearchStatistics, classify_bound,
-        tt_cutoff_score,
+        AlphaBetaEngine, MateDistanceWindow, SearchEngine, SearchLimits, SearchStatistics,
+        classify_bound, mate_distance_window, threat_extension, tt_cutoff_score,
     };
     use crate::transposition_table::{Bound, TtEntry};
     use crate::{EngineConfig, Evaluator, search_state::SearchState, zobrist::PositionKey};
@@ -1457,6 +1700,46 @@ mod tests {
                 assert_eq!(tt_cutoff_score(entry(5, score, bound), 4, -10, 10, 0), None);
             }
         }
+    }
+
+    #[test]
+    fn mate_distance_window_matches_terminal_distance_convention() {
+        assert_eq!(
+            mate_distance_window(
+                -crate::score::SEARCH_INFINITY,
+                crate::score::SEARCH_INFINITY,
+                5,
+            ),
+            MateDistanceWindow::Search {
+                alpha: -crate::score::MATE_SCORE + 5,
+                beta: crate::score::MATE_SCORE - 6,
+            }
+        );
+        assert_eq!(
+            mate_distance_window(
+                -crate::score::SEARCH_INFINITY,
+                -crate::score::MATE_SCORE + 4,
+                5
+            ),
+            MateDistanceWindow::Cutoff(-crate::score::MATE_SCORE + 5)
+        );
+        assert_eq!(
+            mate_distance_window(
+                crate::score::MATE_SCORE - 5,
+                crate::score::SEARCH_INFINITY,
+                5
+            ),
+            MateDistanceWindow::Cutoff(crate::score::MATE_SCORE - 6)
+        );
+    }
+
+    #[test]
+    fn threat_extension_is_strong_and_path_bounded() {
+        use crate::pattern::ThreatProfile;
+        assert!(!threat_extension(ThreatProfile::Four, 0));
+        assert!(threat_extension(ThreatProfile::FourThree, 0));
+        assert!(threat_extension(ThreatProfile::OpenFour, 0));
+        assert!(!threat_extension(ThreatProfile::OpenFour, 1));
     }
 
     #[test]
@@ -1642,6 +1925,142 @@ mod tests {
                 .unwrap();
         }
         position
+    }
+
+    #[derive(Clone, Copy)]
+    struct FixedEvaluator(i32);
+
+    impl Evaluator for FixedEvaluator {
+        type State = ();
+        type Undo = ();
+        fn initialize(&self, _: &Position) {}
+        fn make_move(&self, _: &mut (), _: Move, _: rustmoku_core::Stone) {}
+        fn unmake_move(&self, _: &mut (), _: ()) {}
+        fn evaluate(&self, _: &Position, _: &crate::PatternState, _: &()) -> i32 {
+            self.0
+        }
+    }
+
+    fn selective_probe(score: i32) -> (super::NodeResult, SearchStatistics, bool) {
+        let evaluator = FixedEvaluator(score);
+        let position = fixture(&[112]);
+        let mut state = SearchState::new(&position, &evaluator);
+        let engine = AlphaBetaEngine::with_config(evaluator, EngineConfig::new(1));
+        let mut statistics = SearchStatistics::default();
+        let mut pv = crate::principal_variation::PvTable::new();
+        let mut seldepth = 0;
+        let result = engine
+            .negamax::<true>(
+                &mut state,
+                2,
+                0,
+                1,
+                0,
+                &mut super::SearchResources {
+                    budget: &mut crate::search_control::SearchBudget::default(),
+                    seldepth: &mut seldepth,
+                    pv: &mut pv,
+                    statistics: &mut statistics,
+                    heuristics: crate::search_heuristics::SearchHeuristics::default(),
+                },
+            )
+            .unwrap();
+        state.assert_consistent(&evaluator);
+        let stored = engine.table.probe(state.key().value()).is_some();
+        (result, statistics, stored)
+    }
+
+    #[test]
+    fn direct_rfp_and_razor_results_cannot_publish_tt_bounds() {
+        let (rfp, rfp_stats, rfp_stored) = selective_probe(100_000);
+        assert_eq!((rfp_stats.rfp_attempts, rfp_stats.rfp_cutoffs), (1, 1));
+        assert_eq!(rfp.validity, super::BoundValidity::UNVERIFIED);
+        assert!(!rfp_stored);
+
+        let (razor, razor_stats, razor_stored) = selective_probe(-100_000);
+        assert_eq!(
+            (razor_stats.razor_attempts, razor_stats.razor_cutoffs),
+            (1, 1)
+        );
+        assert_eq!(razor.validity, super::BoundValidity::UNVERIFIED);
+        assert!(!razor_stored);
+    }
+
+    #[test]
+    fn iir_uses_actual_depth_restores_state_and_mismatched_tt_move_suppresses_it() {
+        let position = fixture(&[112]);
+        let key = PositionKey::from_position(&position).value();
+
+        let engine = AlphaBetaEngine::with_config(ZeroEvaluator, EngineConfig::new(1));
+        let mut state = SearchState::new(&position, &ZeroEvaluator);
+        let mut statistics = SearchStatistics::default();
+        let mut pv = crate::principal_variation::PvTable::new();
+        let mut seldepth = 0;
+        let result = engine
+            .negamax::<true>(
+                &mut state,
+                crate::search_params::IIR_MIN_DEPTH,
+                0,
+                1,
+                0,
+                &mut super::SearchResources {
+                    budget: &mut crate::search_control::SearchBudget::default(),
+                    seldepth: &mut seldepth,
+                    pv: &mut pv,
+                    statistics: &mut statistics,
+                    heuristics: crate::search_heuristics::SearchHeuristics::default(),
+                },
+            )
+            .unwrap();
+        assert!(statistics.iir_reductions > 0);
+        assert_eq!(result.validity, super::BoundValidity::UNVERIFIED);
+        assert!(
+            engine
+                .table
+                .probe(key)
+                .is_none_or(|entry| { entry.depth < crate::search_params::IIR_MIN_DEPTH })
+        );
+        assert_eq!(state.position(), &position);
+        state.assert_consistent(&ZeroEvaluator);
+
+        let guided = AlphaBetaEngine::with_config(ZeroEvaluator, EngineConfig::new(1));
+        let tt_move = Move::from_row_col(5, 5).unwrap();
+        guided
+            .table
+            .store(TtEntry::new(key, 0, Some(tt_move), 1, Bound::Exact, 1));
+        let mut guided_state = SearchState::new(&position, &ZeroEvaluator);
+        let mut guided_statistics = SearchStatistics::default();
+        let probe = guided.probe_tt(
+            &guided_state,
+            crate::search_params::IIR_MIN_DEPTH,
+            0,
+            1,
+            0,
+            &mut guided_statistics,
+        );
+        assert_eq!(probe.best_move, Some(tt_move));
+        assert_eq!(probe.cutoff_score, None);
+        let mut guided_pv = crate::principal_variation::PvTable::new();
+        let mut guided_seldepth = 0;
+        let _guided_result = guided
+            .negamax::<true>(
+                &mut guided_state,
+                crate::search_params::IIR_MIN_DEPTH,
+                0,
+                1,
+                0,
+                &mut super::SearchResources {
+                    budget: &mut crate::search_control::SearchBudget::default(),
+                    seldepth: &mut guided_seldepth,
+                    pv: &mut guided_pv,
+                    statistics: &mut guided_statistics,
+                    heuristics: crate::search_heuristics::SearchHeuristics::default(),
+                },
+            )
+            .unwrap();
+        assert_eq!(guided_statistics.iir_reductions, 0);
+        assert_eq!(guided_state.position(), &position);
+        guided_state.assert_consistent(&ZeroEvaluator);
     }
 
     fn fixed_search<const PVS: bool>(position: &Position, depth: u8) -> super::RootSearchResult {
@@ -1853,6 +2272,9 @@ mod tests {
         assert_eq!(score, crate::score::MATE_SCORE - 3);
         assert_eq!(pv.len(), 3);
         assert!(stats.qnodes >= 2);
+        assert_eq!(stats.qsearch_recursive_nodes, stats.qnodes - 1);
+        assert!(stats.qsearch_forcing_edges > 0);
+        assert!(stats.max_qply > 0);
         assert!((3..=super::MAX_QSEARCH_PLY).contains(&seldepth));
         // The explicit cap applies even to a forcing position.
         let (_, capped_pv, capped, capped_depth) = q_result(&position, super::MAX_QSEARCH_PLY);
@@ -1908,6 +2330,7 @@ mod tests {
         assert_eq!(pv, [Move::CENTER]);
         assert_eq!(score, result.score);
         assert_eq!(stats.qnodes, 2);
+        assert_eq!(stats.qsearch_forced_blocks, 1);
         let patterns = crate::PatternState::new(&position);
         assert_eq!(
             crate::tactical::immediate_tactic(&patterns, position.side_to_move()),
@@ -2031,7 +2454,7 @@ mod tests {
     }
 
     #[test]
-    fn lmr_quiet_improvement_is_researched_at_nominal_depth_and_restores_state() {
+    fn lmr_researches_improvements_and_selective_siblings_block_upper_tt_evidence() {
         // A shallow horizon prefers late moves, while the full horizon rejects
         // them. Only a full-depth re-search can distinguish these evaluations.
         struct HorizonEvaluator;
@@ -2068,15 +2491,15 @@ mod tests {
             )
             .unwrap();
         assert_eq!(score.score, -100);
-        assert!(score.validity.upper);
+        assert!(!score.validity.upper);
         assert!(statistics.lmr_reductions > 0);
         assert_eq!(statistics.lmr_researches, statistics.lmr_reductions);
         assert!(
             engine
                 .table
                 .probe(state.key().value())
-                .is_some_and(|entry| entry.depth == 3 && entry.bound == Bound::Upper),
-            "all reduced children were nominally verified, so the upper bound is cacheable"
+                .is_none_or(|entry| { entry.depth != 3 || entry.bound != Bound::Upper }),
+            "selectively skipped siblings cannot fabricate a nominal upper bound"
         );
         state.assert_consistent(&HorizonEvaluator);
         assert_eq!(state.position(), &position);

@@ -851,3 +851,38 @@ import-library informational linker warnings; normal strict Clippy passed.
 No weak-memory hardware run, saturated-table scaling profile, or manual Native
 visual acceptance was performed. Loom coverage complements the publication
 argument and does not exhaust every weak-memory execution or team size.
+
+## V0.10 threat-aware selectivity (2026-09-06)
+
+The official V0.9 `2c95d52` executable was saved before behavior changes. The
+same host, PatternEvaluator, 64 MiB TT, one worker, one untimed warm-up and three
+cold repetitions produced the upper-median samples below. Quick is the sum of
+its five fixture medians. This is a lean regression/work comparison, not strength
+or cross-machine evidence.
+
+| Workload | V0.9 ms / nodes / qnodes | V0.10 ms / nodes / qnodes | Best / score | Recursive qnodes | LMP / futility / RFP / razor / extensions |
+|---|---:|---:|---|---:|---:|
+| quick aggregate | 6.690 / 16,383 / 10,932 | 6.534 / 13,320 / 6,742 | all unchanged | 383 | 47 / 0 / 71 / 41 / 1,132 |
+| opening D6 | 53.885 / 123,374 / 75,116 | 52.595 / 108,405 / 56,300 | 129 / 19,180 | 4,724 | 0 / 0 / 59 / 14 / 9,640 |
+| forced_defense D6 | 83.956 / 189,211 / 140,782 | 76.412 / 154,276 / 104,177 | 112 / -243,380 | 8,461 | 1,249 / 0 / 433 / 227 / 11,756 |
+| non_vct_tactical D6 | 246.977 / 524,812 / 311,448 | 247.017 / 447,037 / 216,027 | 95 / 40,500 | 13,021 | 1,054 / 17 / 4,411 / 4,031 / 13,228 |
+
+Nodes fell 12.1%, 18.5%, and 14.8% in the three D6 rows. Opening and forced
+defense elapsed time improved 2.4% and 9.0%; non-VCT tactical time was flat.
+TT hits/stores changed from 28,125/22,774 to 27,915/22,698, from
+13,907/10,684 to 11,030/8,128, and from 102,957/90,647 to
+122,408/105,607 respectively. Recursive expansion was only 6-8% of D6 qnodes;
+the majority remained first-entry leaves. Therefore V0.10 kept the established
+Four+ forcing vocabulary and did not add Three expansion or delta pruning.
+
+The one required multi-worker integration smoke used opening D6, T8 and three
+repetitions: 129 / 19,180, completed depth 6, legal PV, 688,915 total work,
+44.560 ms. This was not a scaling sweep or strength measurement. IIR begins at
+depth 7 and consequently recorded zero reductions in this D6 batch.
+
+Final V0.10 validation passed: formatting, all-target workspace check, strict
+all-feature Clippy, the 166-test all-feature workspace suite, the 140-test
+Release engine suite, and Release builds of Native and Arena. The existing exact
+immediate, VCF/VCT, interruption/restoration, deterministic thread-one, and
+multi-worker legal-PV regressions all passed. Loom and the historical scaling,
+capacity, profiler, and large Arena matrices were intentionally not rerun.

@@ -13,21 +13,26 @@ pub(crate) fn order_moves(
     heuristics: &SearchHeuristics,
     ply: u8,
 ) {
-    // Packed total order: tactical 56..64, TT 55, killer 53..55,
-    // history 39..53, own 35..39, opponent 31..35, center 27..31,
+    // Packed total order: tactical 56..64, TT 55, countermove 54,
+    // killer 52..54, signed contextual history 36..52, own 32..36,
+    // opponent 28..32, center 24..28,
     // reversed canonical index 0..8. Comparisons only read integers.
     let mut priorities = [0_u64; CELL_COUNT];
     let len = moves.as_slice().len();
+    let (previous, two_back) = heuristics.previous_moves(ply);
     for (index, at) in moves.iter().enumerate() {
         let own = patterns.profile(at, side);
         let opponent = patterns.profile(at, side.opponent());
+        let contextual = i32::from(heuristics.contextual_score(side, at, previous, two_back))
+            - i32::from(i16::MIN);
         priorities[index] = (u64::from(tactical_class(own, opponent)) << 56)
             | (u64::from(Some(at) == tt_move) << 55)
-            | (u64::from(heuristics.killer_rank(ply, at)) << 53)
-            | (u64::from(heuristics.history(side, at)) << 39)
-            | ((own as u64) << 35)
-            | ((opponent as u64) << 31)
-            | (u64::from(CENTER_BIAS[at.index()]) << 27)
+            | (u64::from(heuristics.is_countermove(side, at, previous)) << 54)
+            | (u64::from(heuristics.killer_rank(ply, at)) << 52)
+            | ((contextual as u64) << 36)
+            | ((own as u64) << 32)
+            | ((opponent as u64) << 28)
+            | (u64::from(CENTER_BIAS[at.index()]) << 24)
             | (CELL_COUNT - 1 - at.index()) as u64;
     }
     priorities[..len].sort_unstable_by(|left, right| right.cmp(left));
@@ -159,6 +164,33 @@ mod tests {
             0,
         );
         assert_eq!(moves.as_slice().first().copied(), Some(move_at(7, 7)));
+    }
+
+    #[test]
+    fn countermove_and_continuation_context_order_equal_quiets() {
+        let position = position_from(&[(7, 7)]);
+        let patterns = PatternState::new(&position);
+        let side = position.side_to_move();
+        let mut moves = generate_candidates(&position);
+        let preferred = move_at(5, 5);
+        let previous = move_at(7, 7);
+        let older = move_at(6, 7);
+        let mut heuristics = SearchHeuristics::default();
+        heuristics.set_child(0, older, false, 0);
+        heuristics.set_child(1, previous, false, 0);
+        heuristics.record_cutoff_with_context(
+            true,
+            side,
+            preferred,
+            8,
+            1,
+            Some(previous),
+            Some(older),
+            &[],
+            &patterns,
+        );
+        order_moves(side, &patterns, &mut moves, None, &heuristics, 1);
+        assert_eq!(moves.as_slice().first().copied(), Some(preferred));
     }
 
     #[test]

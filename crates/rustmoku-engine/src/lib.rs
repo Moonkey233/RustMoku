@@ -23,6 +23,7 @@ mod score;
 mod search;
 mod search_control;
 mod search_heuristics;
+mod search_params;
 mod search_state;
 mod tactical;
 mod transposition_table;

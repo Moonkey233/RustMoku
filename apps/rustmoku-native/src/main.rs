@@ -4,16 +4,47 @@ use eframe::egui::{self, Color32, Pos2, Sense, Stroke, Vec2};
 use rustmoku_core::{BOARD_SIZE, Game, GameStatus, Move, MoveError, OPENINGS, RecordError, Stone};
 use rustmoku_engine::{EngineConfig, SearchInfo, SearchLimits, SearchTermination};
 use std::{sync::mpsc::TryRecvError, time::Duration};
+mod localization;
 mod worker;
+use localization::{LanguagePreference, TextKey, UiLanguage, UiText, install_windows_cjk_font};
 use worker::{SearchEvent, SearchWorker};
 
 const BOARD_MARGIN: f32 = 28.0;
 const BOARD_COLOR: Color32 = Color32::from_rgb(216, 171, 103);
 const GRID_COLOR: Color32 = Color32::from_rgb(63, 45, 28);
 const LAST_MOVE_COLOR: Color32 = Color32::from_rgb(210, 48, 42);
+const NATIVE_DEPTH: u8 = 8;
+const NATIVE_MAX_AUTO_THREADS: usize = 8;
+const NATIVE_TT_MEMORY_MIB: usize = 128;
+const NATIVE_MOVE_TIME_MS: u64 = 15_000;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeDefaults {
+    depth: u8,
+    threads: usize,
+    tt_memory_mib: usize,
+    move_time_ms: u64,
+    show_move_numbers: bool,
+    language: LanguagePreference,
+}
+
+fn auto_thread_count(available: usize) -> usize {
+    available.clamp(1, NATIVE_MAX_AUTO_THREADS)
+}
 
 fn host_thread_count() -> usize {
     std::thread::available_parallelism().map_or(1, |count| count.get())
+}
+
+fn native_defaults(available_threads: usize) -> NativeDefaults {
+    NativeDefaults {
+        depth: NATIVE_DEPTH,
+        threads: auto_thread_count(available_threads),
+        tt_memory_mib: NATIVE_TT_MEMORY_MIB,
+        move_time_ms: NATIVE_MOVE_TIME_MS,
+        show_move_numbers: true,
+        language: LanguagePreference::Auto,
+    }
 }
 
 fn main() -> eframe::Result {
@@ -24,10 +55,11 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
 
+    let title = format!("RustMoku V{}", env!("CARGO_PKG_VERSION"));
     eframe::run_native(
-        "RustMoku V0.9",
+        &title,
         options,
-        Box::new(|_creation_context| Ok(Box::new(RustMokuApp::new()?))),
+        Box::new(|creation_context| Ok(Box::new(RustMokuApp::new(&creation_context.egui_ctx)?))),
     )
 }
 
@@ -36,6 +68,8 @@ struct RustMokuApp {
     human_stone: Stone,
     worker: SearchWorker,
     engine_config: EngineConfig,
+    threads_auto: bool,
+    manual_threads: usize,
     search_limits: SearchLimits,
     last_search: Option<SearchInfo>,
     move_time_ms: u64,
@@ -46,36 +80,69 @@ struct RustMokuApp {
     record_open: bool,
     record_text: String,
     record_path: String,
+    language_preference: LanguagePreference,
+    text: UiText,
+    cjk_font_installed: bool,
 }
 
 impl RustMokuApp {
-    fn new() -> std::io::Result<Self> {
-        let config = EngineConfig::default();
-        Ok(Self::with_worker_config(SearchWorker::new(config)?, config))
+    fn new(ctx: &egui::Context) -> std::io::Result<Self> {
+        let defaults = native_defaults(host_thread_count());
+        let config = EngineConfig::default()
+            .with_threads(defaults.threads)
+            .with_tt_memory_mib(defaults.tt_memory_mib);
+        let mut app = Self::with_worker_config(SearchWorker::new(config)?, config, true);
+        app.apply_language(ctx, defaults.language);
+        Ok(app)
     }
 
     #[cfg(test)]
     fn with_worker(worker: SearchWorker) -> Self {
-        Self::with_worker_config(worker, EngineConfig::default())
+        Self::with_worker_config(worker, EngineConfig::default(), false)
     }
 
-    fn with_worker_config(worker: SearchWorker, engine_config: EngineConfig) -> Self {
+    fn with_worker_config(
+        worker: SearchWorker,
+        engine_config: EngineConfig,
+        threads_auto: bool,
+    ) -> Self {
+        let defaults = native_defaults(engine_config.threads());
         Self {
             game: Game::default(),
             human_stone: Stone::Black,
             worker,
             engine_config,
-            move_time_ms: 0,
-            search_limits: SearchLimits::default(),
+            threads_auto,
+            manual_threads: engine_config.threads(),
+            move_time_ms: defaults.move_time_ms,
+            search_limits: SearchLimits::new(defaults.depth),
             last_search: None,
             message: None,
             selected_opening: None,
             undo_floor: 0,
-            show_move_numbers: false,
+            show_move_numbers: defaults.show_move_numbers,
             record_open: false,
             record_text: String::new(),
             record_path: String::from("rustmoku-game.rmk"),
+            language_preference: LanguagePreference::Auto,
+            text: UiText::new(UiLanguage::English),
+            cjk_font_installed: false,
         }
+    }
+
+    fn apply_language(&mut self, ctx: &egui::Context, preference: LanguagePreference) {
+        let language = preference.resolve(sys_locale::get_locale().as_deref());
+        self.language_preference = preference;
+        if language == UiLanguage::SimplifiedChinese
+            && !self.cjk_font_installed
+            && !install_windows_cjk_font(ctx)
+        {
+            self.text = UiText::new(UiLanguage::English);
+            self.message = Some(self.text.get(TextKey::CjkFontMissing).into());
+            return;
+        }
+        self.cjk_font_installed |= language == UiLanguage::SimplifiedChinese;
+        self.text = UiText::new(language);
     }
 
     fn replace_game(&mut self, game: Game, undo_floor: usize) {
@@ -145,10 +212,10 @@ impl RustMokuApp {
                 self.play_ai_if_needed();
             }
             Err(MoveError::Occupied { .. }) => {
-                self.message = Some(String::from("That intersection is occupied."));
+                self.message = Some(self.text.get(TextKey::Occupied).into());
             }
             Err(error) => {
-                self.message = Some(error.to_string());
+                self.message = Some(self.text.detail(TextKey::MoveFailed, &error.to_string()));
             }
         }
     }
@@ -169,7 +236,7 @@ impl RustMokuApp {
                 .with_move_time(Duration::from_millis(self.move_time_ms))
         };
         if let Err(error) = self.worker.start(self.game.position(), limits) {
-            self.message = Some(error.into());
+            self.message = Some(self.text.detail(TextKey::SearchFailed, error));
         }
     }
 
@@ -190,11 +257,14 @@ impl RustMokuApp {
                     return;
                 }
                 let Some(at) = result.best_move else {
-                    self.message = Some("The engine found no legal move.".into());
+                    self.message = Some(self.text.get(TextKey::NoLegalMove).into());
                     return;
                 };
                 if let Err(error) = self.game.play_move(at) {
-                    self.message = Some(format!("Engine move failed: {error}"));
+                    self.message = Some(
+                        self.text
+                            .detail(TextKey::EngineMoveFailed, &error.to_string()),
+                    );
                 }
             }
         }
@@ -208,7 +278,7 @@ impl RustMokuApp {
                 Err(TryRecvError::Disconnected) => {
                     if self.worker.searching() {
                         self.worker.invalidate();
-                        self.message = Some("Search worker disconnected.".into());
+                        self.message = Some(self.text.get(TextKey::WorkerDisconnected).into());
                     }
                     break;
                 }
@@ -217,59 +287,106 @@ impl RustMokuApp {
     }
 
     fn status_text(&self) -> String {
-        match self.game.status() {
-            GameStatus::Won(stone) if stone == self.human_stone => String::from("You win!"),
-            GameStatus::Won(_) => String::from("AI wins."),
-            GameStatus::Draw => String::from("Draw."),
-            GameStatus::Ongoing if self.game.position().side_to_move() == self.human_stone => {
-                format!("Your turn ({})", stone_name(self.human_stone))
-            }
-            GameStatus::Ongoing => {
-                format!("AI searching ({})", stone_name(self.human_stone.opponent()))
-            }
-        }
+        let (won, draw) = match self.game.status() {
+            GameStatus::Won(stone) => (Some(stone), false),
+            GameStatus::Draw => (None, true),
+            GameStatus::Ongoing => (None, false),
+        };
+        self.text.status(
+            won,
+            draw,
+            self.human_stone,
+            self.game.position().side_to_move(),
+        )
     }
 
     fn controls(&mut self, ui: &mut egui::Ui) {
-        ui.heading("RustMoku V0.9");
+        let text = self.text;
+        ui.heading(format!("RustMoku V{}", env!("CARGO_PKG_VERSION")));
         ui.horizontal(|ui| {
-            ui.label("Play as:");
+            ui.label(text.get(TextKey::Language));
+            let previous = self.language_preference;
+            egui::ComboBox::from_id_salt("language")
+                .selected_text(match self.language_preference {
+                    LanguagePreference::Auto => text.get(TextKey::Auto),
+                    LanguagePreference::English => text.get(TextKey::English),
+                    LanguagePreference::SimplifiedChinese => text.get(TextKey::SimplifiedChinese),
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut self.language_preference,
+                        LanguagePreference::Auto,
+                        text.get(TextKey::Auto),
+                    );
+                    ui.selectable_value(
+                        &mut self.language_preference,
+                        LanguagePreference::English,
+                        text.get(TextKey::English),
+                    );
+                    ui.selectable_value(
+                        &mut self.language_preference,
+                        LanguagePreference::SimplifiedChinese,
+                        text.get(TextKey::SimplifiedChinese),
+                    );
+                });
+            if self.language_preference != previous {
+                self.apply_language(ui.ctx(), self.language_preference);
+            }
+        });
+        let text = self.text;
+        ui.horizontal(|ui| {
+            ui.label(text.get(TextKey::PlayAs));
             let previous_stone = self.human_stone;
-            ui.radio_value(&mut self.human_stone, Stone::Black, "Black");
-            ui.radio_value(&mut self.human_stone, Stone::White, "White");
+            ui.radio_value(
+                &mut self.human_stone,
+                Stone::Black,
+                text.get(TextKey::Black),
+            );
+            ui.radio_value(
+                &mut self.human_stone,
+                Stone::White,
+                text.get(TextKey::White),
+            );
             if self.human_stone != previous_stone {
                 self.new_game();
             }
-            if ui.button("New Game").clicked() {
+            if ui.button(text.get(TextKey::NewGame)).clicked() {
                 self.new_game();
             }
             if ui
-                .add_enabled(self.human_undo_plies() > 0, egui::Button::new("Undo turn"))
+                .add_enabled(
+                    self.human_undo_plies() > 0,
+                    egui::Button::new(text.get(TextKey::UndoTurn)),
+                )
                 .clicked()
             {
                 self.undo_to_human();
             }
-            if ui.button("Game record...").clicked() {
+            if ui.button(text.get(TextKey::GameRecord)).clicked() {
                 self.record_text = self.game.to_record();
                 self.record_open = true;
             }
-            ui.checkbox(&mut self.show_move_numbers, "Move numbers");
+            ui.checkbox(&mut self.show_move_numbers, text.get(TextKey::MoveNumbers));
         });
         ui.horizontal(|ui| {
-            ui.label("Opening:");
+            ui.label(text.get(TextKey::Opening));
             let previous = self.selected_opening;
             egui::ComboBox::from_id_salt("opening")
                 .selected_text(
                     self.selected_opening
-                        .map_or("Empty Board", |i| OPENINGS[i].name),
+                        .map_or(text.get(TextKey::EmptyBoard), |i| OPENINGS[i].name),
                 )
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.selected_opening, None, "Empty Board");
+                    ui.selectable_value(
+                        &mut self.selected_opening,
+                        None,
+                        text.get(TextKey::EmptyBoard),
+                    );
                     for (index, opening) in OPENINGS.iter().enumerate() {
                         ui.selectable_value(&mut self.selected_opening, Some(index), opening.name);
                     }
                 });
-            if ui.button("Next in suite").clicked() {
+            if ui.button(text.get(TextKey::NextInSuite)).clicked() {
                 self.selected_opening = Some(
                     self.selected_opening
                         .map_or(0, |i| (i + 1) % OPENINGS.len()),
@@ -278,31 +395,53 @@ impl RustMokuApp {
             if self.selected_opening != previous {
                 self.new_game();
             }
-            ui.small("Hand-authored test starts; no balance claim");
+            ui.small(text.get(TextKey::OpeningNote));
         });
         ui.horizontal(|ui| {
-            ui.label("Next depth:");
+            ui.label(text.get(TextKey::NextDepth));
             ui.add(egui::DragValue::new(&mut self.search_limits.max_depth).range(1..=12));
-            ui.label("Move ms (0 = unlimited):");
+            ui.label(text.get(TextKey::MoveTime));
             ui.add(egui::DragValue::new(&mut self.move_time_ms).range(0..=60_000));
+            ui.small(text.get(TextKey::UnlimitedHint));
             if self.worker.searching() {
                 ui.spinner();
             }
             if let Some(at) = self.game.position().last_move() {
-                ui.label(format!("Last: {at}"));
+                ui.label(format!("{}: {at}", text.get(TextKey::Last)));
             }
         });
         let previous_threads = self.engine_config.threads();
+        let previous_auto = self.threads_auto;
         let previous_tt_memory = self.engine_config.tt_memory_mib();
-        let mut threads = previous_threads;
         let mut tt_memory_mib = previous_tt_memory;
         ui.horizontal(|ui| {
-            ui.label("Threads:");
-            ui.add(egui::DragValue::new(&mut threads).range(1..=host_thread_count()));
-            ui.label("TT MiB:");
+            ui.label(text.get(TextKey::Threads));
+            ui.radio_value(
+                &mut self.threads_auto,
+                true,
+                format!(
+                    "{} ({})",
+                    text.get(TextKey::Auto),
+                    auto_thread_count(host_thread_count())
+                ),
+            );
+            ui.radio_value(&mut self.threads_auto, false, text.get(TextKey::Manual));
+            ui.add_enabled(
+                !self.threads_auto,
+                egui::DragValue::new(&mut self.manual_threads).range(1..=host_thread_count()),
+            );
+            ui.label(text.get(TextKey::TtPrimary));
             ui.add(egui::DragValue::new(&mut tt_memory_mib).range(1..=4096));
         });
-        if threads != previous_threads || tt_memory_mib != previous_tt_memory {
+        let threads = if self.threads_auto {
+            auto_thread_count(host_thread_count())
+        } else {
+            self.manual_threads.clamp(1, host_thread_count())
+        };
+        if self.threads_auto != previous_auto
+            || threads != previous_threads
+            || tt_memory_mib != previous_tt_memory
+        {
             let config = self
                 .engine_config
                 .with_threads(threads)
@@ -310,7 +449,7 @@ impl RustMokuApp {
             self.engine_config = config;
             self.last_search = None;
             if let Err(error) = self.worker.reconfigure(config) {
-                self.message = Some(error.into());
+                self.message = Some(text.detail(TextKey::ReconfigureFailed, error));
             } else {
                 // Reconfiguration invalidates the old request. If the restored
                 // game still needs an AI move, start it after the command so the
@@ -332,35 +471,33 @@ impl RustMokuApp {
         });
         if let Some(search) = &self.last_search {
             ui.add(
-                egui::Label::new(format!(
-                    "AI: depth {} | seldepth {} | work {} (q {}) | threads {} | score {}",
+                egui::Label::new(text.search_summary(
                     search.completed_depth,
                     search.seldepth,
                     search.statistics.work_nodes,
                     search.statistics.qnodes,
                     search.statistics.worker_count,
-                    search.score
+                    search.score,
                 ))
                 .truncate(),
             );
             ui.add(
-                egui::Label::new(format!(
-                    "TT: hits {} | cutoffs {} | probes {} | stores {}",
+                egui::Label::new(text.tt_summary(
                     search.statistics.tt_hits,
                     search.statistics.tt_cutoffs,
                     search.statistics.tt_probes,
-                    search.statistics.tt_stores
+                    search.statistics.tt_stores,
                 ))
                 .truncate(),
             );
             ui.label(search.tactical_proof.map_or_else(
-                || String::from("No exact tactical proof"),
-                |proof| format!("{:?} proven, {} plies", proof.kind, proof.plies),
+                || String::from(text.get(TextKey::NoProof)),
+                |proof| text.proof_summary(&format!("{:?}", proof.kind), proof.plies),
             ));
         } else {
-            ui.label("AI: waiting for a completed search depth");
-            ui.label("TT: -");
-            ui.label("No exact tactical proof");
+            ui.label(text.get(TextKey::Waiting));
+            ui.label(text.get(TextKey::TtEmpty));
+            ui.label(text.get(TextKey::NoProof));
         }
         egui::ScrollArea::horizontal()
             .id_salt("pv")
@@ -369,7 +506,7 @@ impl RustMokuApp {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.monospace("PV:");
+                    ui.monospace(text.get(TextKey::Pv));
                     if let Some(search) = &self.last_search {
                         for at in &search.principal_variation {
                             ui.monospace(at.to_string());
@@ -380,16 +517,17 @@ impl RustMokuApp {
     }
 
     fn move_history(&self, ui: &mut egui::Ui) {
-        ui.heading("Moves");
-        ui.small(format!("Undo floor: {} plies", self.undo_floor));
+        let text = self.text;
+        ui.heading(text.get(TextKey::Moves));
+        ui.small(text.undo_floor(self.undo_floor));
         egui::ScrollArea::vertical()
             .id_salt("history")
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 egui::Grid::new("move_list").striped(true).show(ui, |ui| {
                     ui.label("#");
-                    ui.label("Black");
-                    ui.label("White");
+                    ui.label(text.get(TextKey::Black));
+                    ui.label(text.get(TextKey::White));
                     ui.end_row();
                     let mut moves = self.game.history();
                     let mut turn = 1;
@@ -413,13 +551,12 @@ impl RustMokuApp {
             return;
         }
         let mut open = self.record_open;
-        egui::Window::new("Game record")
+        let text = self.text;
+        egui::Window::new(text.get(TextKey::GameRecord))
             .open(&mut open)
             .default_width(590.0)
             .show(ctx, |ui| {
-                ui.label(
-                    "Export the complete played sequence, or paste a RustMoku record to import.",
-                );
+                ui.label(text.get(TextKey::RecordHelp));
                 egui::ScrollArea::vertical()
                     .max_height(240.0)
                     .show(ui, |ui| {
@@ -431,43 +568,57 @@ impl RustMokuApp {
                         );
                     });
                 ui.horizontal(|ui| {
-                    if ui.button("Export current game").clicked() {
+                    if ui.button(text.get(TextKey::ExportGame)).clicked() {
                         self.record_text = self.game.to_record();
                     }
-                    if ui.button("Copy text").clicked() {
+                    if ui.button(text.get(TextKey::CopyText)).clicked() {
                         ctx.copy_text(self.record_text.clone());
                     }
-                    if ui.button("Import text").clicked() {
+                    if ui.button(text.get(TextKey::ImportText)).clicked() {
                         let text = self.record_text.clone();
                         if let Err(error) = self.import_record(&text) {
-                            self.message = Some(error.to_string());
+                            self.message =
+                                Some(self.text.detail(TextKey::ImportFailed, &error.to_string()));
                         } else {
-                            self.message = Some("Record imported.".into());
+                            self.message = Some(self.text.get(TextKey::RecordImported).into());
                         }
                     }
                 });
                 ui.horizontal(|ui| {
-                    ui.label("File:");
+                    ui.label(text.get(TextKey::File));
                     ui.text_edit_singleline(&mut self.record_path);
                 });
                 ui.horizontal(|ui| {
-                    if ui.button("Load file into editor").clicked() {
+                    if ui.button(text.get(TextKey::LoadFile)).clicked() {
                         match std::fs::read_to_string(&self.record_path) {
                             Ok(text) => {
                                 self.record_text = text;
                                 self.message = None;
                             }
-                            Err(error) => self.message = Some(format!("Load failed: {error}")),
+                            Err(error) => {
+                                self.message =
+                                    Some(self.text.detail(TextKey::LoadFailed, &error.to_string()));
+                            }
                         }
                     }
-                    if ui.button("Save editor to file (replace)").clicked() {
+                    if ui.button(text.get(TextKey::SaveFile)).clicked() {
                         // Validate before writing; output is canonical record syntax.
                         match Game::from_record(&self.record_text) {
                             Ok(game) => match std::fs::write(&self.record_path, game.to_record()) {
-                                Ok(()) => self.message = Some("Record saved.".into()),
-                                Err(error) => self.message = Some(format!("Save failed: {error}")),
+                                Ok(()) => {
+                                    self.message = Some(self.text.get(TextKey::RecordSaved).into());
+                                }
+                                Err(error) => {
+                                    self.message = Some(
+                                        self.text.detail(TextKey::SaveFailed, &error.to_string()),
+                                    );
+                                }
                             },
-                            Err(error) => self.message = Some(error.to_string()),
+                            Err(error) => {
+                                self.message = Some(
+                                    self.text.detail(TextKey::InvalidRecord, &error.to_string()),
+                                );
+                            }
                         }
                     }
                 });
@@ -595,7 +746,7 @@ impl eframe::App for RustMokuApp {
         }
         // Stable panel sizes isolate board geometry from PV/proof/history text.
         egui::Panel::top("controls")
-            .exact_size(238.0)
+            .exact_size(270.0)
             .resizable(false)
             .show(ui, |ui| {
                 egui::ScrollArea::vertical()
@@ -637,13 +788,6 @@ fn board_point(origin: Pos2, spacing: f32, row: usize, column: usize) -> Pos2 {
     )
 }
 
-const fn stone_name(stone: Stone) -> &'static str {
-    match stone {
-        Stone::Black => "Black",
-        Stone::White => "White",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -660,6 +804,26 @@ mod tests {
             .find(|&at| game.position().is_legal(at))
             .unwrap();
         game.play_move(at).unwrap();
+    }
+
+    #[test]
+    fn native_auto_threads_and_playing_defaults_are_bounded_and_separate() {
+        assert_eq!(auto_thread_count(1), 1);
+        assert_eq!(auto_thread_count(4), 4);
+        assert_eq!(auto_thread_count(8), 8);
+        assert_eq!(auto_thread_count(16), 8);
+
+        let defaults = native_defaults(16);
+        assert_eq!(defaults.depth, 8);
+        assert_eq!(defaults.threads, 8);
+        assert_eq!(defaults.tt_memory_mib, 128);
+        assert_eq!(defaults.move_time_ms, 15_000);
+        assert!(defaults.show_move_numbers);
+        assert_eq!(defaults.language, LanguagePreference::Auto);
+
+        assert_eq!(SearchLimits::default().max_depth, 4);
+        assert_eq!(EngineConfig::default().threads(), 1);
+        assert_eq!(EngineConfig::default().tt_memory_mib(), 64);
     }
 
     #[test]

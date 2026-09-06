@@ -1763,7 +1763,7 @@ dependencies = [
 
 [[package]]
 name = "rustmoku-arena"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "rustmoku-core",
  "rustmoku-engine",
@@ -1771,11 +1771,11 @@ dependencies = [
 
 [[package]]
 name = "rustmoku-core"
-version = "0.9.0"
+version = "0.10.0"
 
 [[package]]
 name = "rustmoku-engine"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "loom",
  "rustmoku-core",
@@ -1783,11 +1783,12 @@ dependencies = [
 
 [[package]]
 name = "rustmoku-native"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "eframe",
  "rustmoku-core",
  "rustmoku-engine",
+ "sys-locale",
 ]
 
 [[package]]
@@ -1999,6 +2000,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
+]
+
+[[package]]
+name = "sys-locale"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8eab9a99a024a169fe8a903cf9d4a3b3601109bcc13bd9e3c6fff259138626c4"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
