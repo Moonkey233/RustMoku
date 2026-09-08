@@ -131,7 +131,21 @@ pub struct SearchResult {
     pub principal_variation: Vec<Move>,
     pub statistics: SearchStatistics,
     pub proof: Option<Proof>,
+    pub origin: SearchOrigin,
     pub termination: SearchTermination,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SearchOrigin {
+    Analysis,
+    #[default]
+    Fallback,
+    AlphaBeta,
+    Terminal,
+    Immediate,
+    Vcf,
+    Vct,
+    ProofBook,
 }
 
 /// A completed iteration or exact tactical proof, never a partial aspiration PV.
@@ -145,6 +159,7 @@ pub struct SearchInfo {
     pub principal_variation: Vec<Move>,
     pub statistics: SearchStatistics,
     pub proof: Option<Proof>,
+    pub origin: SearchOrigin,
 }
 
 impl From<&SearchResult> for SearchInfo {
@@ -157,6 +172,7 @@ impl From<&SearchResult> for SearchInfo {
             principal_variation: result.principal_variation.clone(),
             statistics: result.statistics,
             proof: result.proof,
+            origin: result.origin,
         }
     }
 }
@@ -224,6 +240,13 @@ impl<E> AlphaBetaEngine<E> {
     pub fn clear_transposition_table(&mut self) {
         self.table.clear();
         self.generation = 0;
+    }
+
+    /// Replace the evaluator definition between searches. Ordinary TT scores
+    /// are evaluator-dependent and are therefore always invalidated.
+    pub fn replace_evaluator(&mut self, evaluator: E) {
+        self.evaluator = evaluator;
+        self.clear_transposition_table();
     }
 
     /// Attaches only independently verified, immutable strategy data.
@@ -334,7 +357,9 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
             // Exact facts remain usable even if admission is already stopped.
             // Never exceed the cap merely to account for a known root fact.
             statistics.nodes = u64::from(budget.charge().is_ok());
-            return search_result(None, score, limits, 0, 0, Vec::new(), *statistics);
+            let mut result = search_result(None, score, limits, 0, 0, Vec::new(), *statistics);
+            result.origin = SearchOrigin::Terminal;
+            return result;
         }
         let side = state.position().side_to_move();
         if limits.max_depth != 0
@@ -352,6 +377,8 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
                 pv.root_line().to_vec(),
                 *statistics,
             );
+            let mut result = result;
+            result.origin = SearchOrigin::Immediate;
             observer.on_info(SearchInfo::from(&result));
             return result;
         }
@@ -372,6 +399,7 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
             return completed;
         }
         if limits.max_depth == 0 {
+            completed.origin = SearchOrigin::Analysis;
             let outcome = self.qsearch(
                 state,
                 -SEARCH_INFINITY,
@@ -411,6 +439,7 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
                     source: ProofSource::ProofBook,
                     distance: hit.distance,
                 });
+                completed.origin = SearchOrigin::ProofBook;
                 completed.statistics.work_nodes = budget.work_nodes();
                 observer.on_info(SearchInfo::from(&completed));
                 return completed;
@@ -442,6 +471,7 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
                     source: ProofSource::Vcf,
                     distance: ProofDistance::Exact(plies),
                 });
+                completed.origin = SearchOrigin::Vcf;
                 completed.statistics.work_nodes = budget.work_nodes();
                 observer.on_info(SearchInfo::from(&completed));
                 return completed;
@@ -476,6 +506,7 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
                     source: ProofSource::Vct,
                     distance: ProofDistance::Exact(plies),
                 });
+                completed.origin = SearchOrigin::Vct;
                 completed.statistics.work_nodes = budget.work_nodes();
                 observer.on_info(SearchInfo::from(&completed));
                 return completed;
@@ -658,6 +689,7 @@ fn run_principal_iterations<E: Evaluator>(
             resources.pv.root_line().to_vec(),
             *resources.statistics,
         );
+        completed.origin = SearchOrigin::AlphaBeta;
         observer.on_info(SearchInfo::from(&completed));
     }
     completed
@@ -809,6 +841,7 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
             tt_move,
             &resources.heuristics,
             0,
+            |at| state.policy_score(self.evaluator, at),
         );
         if self.root_rotation != 0 && !moves.is_empty() {
             let rotation = self.root_rotation % moves.as_slice().len();
@@ -1042,6 +1075,7 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
             probe.best_move,
             &resources.heuristics,
             ply,
+            |at| state.policy_score(self.evaluator, at),
         );
         let mut best_move = None;
         let mut best_score = -SEARCH_INFINITY;
@@ -1302,7 +1336,15 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
         for at in noisy.iter() {
             moves.push(at);
         }
-        order_moves(side, patterns, &mut moves, None, &resources.heuristics, ply);
+        order_moves(
+            side,
+            patterns,
+            &mut moves,
+            None,
+            &resources.heuristics,
+            ply,
+            |at| state.policy_score(self.evaluator, at),
+        );
         for at in moves.iter() {
             resources.statistics.qsearch_forcing_edges += 1;
             resources.heuristics.set_child(
@@ -1638,6 +1680,7 @@ fn search_result(
         score,
         requested_depth: limits.max_depth,
         proof: None,
+        origin: SearchOrigin::Fallback,
         termination: SearchTermination::Completed,
         completed_depth,
         seldepth,
@@ -1666,9 +1709,9 @@ mod tests {
     impl Evaluator for ZeroEvaluator {
         type State = ();
         type Undo = ();
-        fn initialize(&self, _position: &Position) {}
-        fn make_move(&self, _state: &mut (), _at: Move, _stone: rustmoku_core::Stone) {}
-        fn unmake_move(&self, _state: &mut (), _undo: ()) {}
+        fn initialize(&self, _position: &Position, _patterns: &crate::PatternState) {}
+        fn make_move(&self, _state: &mut (), _delta: &crate::PatternDelta) {}
+        fn unmake_move(&self, _state: &mut (), _delta: &crate::PatternDelta, _undo: ()) {}
         fn evaluate(
             &self,
             _position: &Position,
@@ -1958,9 +2001,9 @@ mod tests {
     impl Evaluator for FixedEvaluator {
         type State = ();
         type Undo = ();
-        fn initialize(&self, _: &Position) {}
-        fn make_move(&self, _: &mut (), _: Move, _: rustmoku_core::Stone) {}
-        fn unmake_move(&self, _: &mut (), _: ()) {}
+        fn initialize(&self, _: &Position, _: &crate::PatternState) {}
+        fn make_move(&self, _: &mut (), _: &crate::PatternDelta) {}
+        fn unmake_move(&self, _: &mut (), _: &crate::PatternDelta, _: ()) {}
         fn evaluate(&self, _: &Position, _: &crate::PatternState, _: &()) -> i32 {
             self.0
         }
@@ -2189,9 +2232,9 @@ mod tests {
         impl Evaluator for PenaltyEvaluator {
             type State = ();
             type Undo = ();
-            fn initialize(&self, _: &Position) {}
-            fn make_move(&self, _: &mut (), _: Move, _: rustmoku_core::Stone) {}
-            fn unmake_move(&self, _: &mut (), _: ()) {}
+            fn initialize(&self, _: &Position, _: &crate::PatternState) {}
+            fn make_move(&self, _: &mut (), _: &crate::PatternDelta) {}
+            fn unmake_move(&self, _: &mut (), _: &crate::PatternDelta, _: ()) {}
             fn evaluate(&self, position: &Position, _: &crate::PatternState, _: &()) -> i32 {
                 -i32::from(
                     position.cell(Move::from_index(80).unwrap())
@@ -2486,9 +2529,9 @@ mod tests {
         impl Evaluator for HorizonEvaluator {
             type State = ();
             type Undo = ();
-            fn initialize(&self, _: &Position) {}
-            fn make_move(&self, _: &mut (), _: Move, _: rustmoku_core::Stone) {}
-            fn unmake_move(&self, _: &mut (), _: ()) {}
+            fn initialize(&self, _: &Position, _: &crate::PatternState) {}
+            fn make_move(&self, _: &mut (), _: &crate::PatternDelta) {}
+            fn unmake_move(&self, _: &mut (), _: &crate::PatternDelta, _: ()) {}
             fn evaluate(&self, _: &Position, _: &crate::PatternState, _: &()) -> i32 {
                 100
             }
@@ -2695,9 +2738,9 @@ mod tests {
         impl Evaluator for LateEvaluator {
             type State = ();
             type Undo = ();
-            fn initialize(&self, _: &Position) {}
-            fn make_move(&self, _: &mut (), _: Move, _: Stone) {}
-            fn unmake_move(&self, _: &mut (), _: ()) {}
+            fn initialize(&self, _: &Position, _: &crate::PatternState) {}
+            fn make_move(&self, _: &mut (), _: &crate::PatternDelta) {}
+            fn unmake_move(&self, _: &mut (), _: &crate::PatternDelta, _: ()) {}
             fn evaluate(&self, p: &Position, _: &crate::PatternState, _: &()) -> i32 {
                 if p.move_count() == 3 && p.cell(self.0) == Some(Stone::White) {
                     10
@@ -2716,6 +2759,7 @@ mod tests {
             None,
             &crate::search_heuristics::SearchHeuristics::default(),
             0,
+            |_| None,
         );
         let late = moves.as_slice()[12];
         for initial_counter in [0, 50_000] {

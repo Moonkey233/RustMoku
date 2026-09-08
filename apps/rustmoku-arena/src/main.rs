@@ -2,15 +2,23 @@
 
 use rustmoku_core::{Game, GameStatus, OPENINGS, Opening, Stone};
 use rustmoku_engine::{
-    AlphaBetaEngine, ClassicalEvaluator, EngineConfig, PatternEvaluator, SearchEngine,
-    SearchLimits, SearchResult,
+    AlphaBetaEngine, ClassicalEvaluator, EngineConfig, LearnedEvaluator, LearnedModel,
+    PatternEvaluator, SearchEngine, SearchLimits, SearchResult,
 };
-use std::{env, error::Error};
+use std::{env, error::Error, path::PathBuf, sync::Arc};
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
+enum EvaluatorConfig {
+    #[default]
+    Pattern,
+    Classical,
+    Learned(PathBuf),
+}
+
+#[derive(Clone, Debug, Default)]
 struct PlayerConfig {
     engine: EngineConfig,
-    classical: bool,
+    evaluator: EvaluatorConfig,
 }
 
 struct Options {
@@ -22,7 +30,7 @@ struct Options {
 impl Options {
     fn parse(args: impl Iterator<Item = String>) -> Result<Self, Box<dyn Error>> {
         let mut options = Self {
-            players: [PlayerConfig::default(); 2],
+            players: std::array::from_fn(|_| PlayerConfig::default()),
             limits: SearchLimits::new(3),
             pairs: 1,
         };
@@ -47,12 +55,18 @@ impl Options {
                     let mut tactical = config.engine.tactical();
                     match key {
                         "evaluator" => {
-                            config.classical = match value.as_str() {
-                                "pattern" => false,
-                                "classical" => true,
-                                _ => return Err("evaluator must be pattern or classical".into()),
-                            }
+                            config.evaluator = match value.as_str() {
+                                "pattern" => EvaluatorConfig::Pattern,
+                                "classical" => EvaluatorConfig::Classical,
+                                "learned" => EvaluatorConfig::Learned(PathBuf::new()),
+                                _ => {
+                                    return Err(
+                                        "evaluator must be pattern, classical, or learned".into()
+                                    );
+                                }
+                            };
                         }
+                        "model" => config.evaluator = EvaluatorConfig::Learned(value.into()),
                         "tt-mib" => {
                             config.engine = config.engine.with_tt_memory_mib(value.parse()?);
                         }
@@ -76,6 +90,12 @@ impl Options {
         if options.limits.max_depth == 0 {
             return Err("--depth must be positive; depth zero is analysis-only".into());
         }
+        for player in &options.players {
+            if matches!(&player.evaluator, EvaluatorConfig::Learned(path) if path.as_os_str().is_empty())
+            {
+                return Err("learned evaluator requires --a-model/--b-model FILE".into());
+            }
+        }
         Ok(options)
     }
 }
@@ -84,26 +104,34 @@ impl Options {
 enum Player {
     Pattern(AlphaBetaEngine),
     Classical(AlphaBetaEngine<ClassicalEvaluator>),
+    Learned(AlphaBetaEngine<LearnedEvaluator>),
 }
 
 impl Player {
-    fn new(config: PlayerConfig) -> Self {
-        if config.classical {
-            Self::Classical(AlphaBetaEngine::with_config(
+    fn new(config: &PlayerConfig) -> Result<Self, Box<dyn Error>> {
+        Ok(match &config.evaluator {
+            EvaluatorConfig::Classical => Self::Classical(AlphaBetaEngine::with_config(
                 ClassicalEvaluator,
                 config.engine,
-            ))
-        } else {
-            Self::Pattern(AlphaBetaEngine::with_config(
+            )),
+            EvaluatorConfig::Pattern => Self::Pattern(AlphaBetaEngine::with_config(
                 PatternEvaluator,
                 config.engine,
-            ))
-        }
+            )),
+            EvaluatorConfig::Learned(path) => {
+                let model = Arc::new(LearnedModel::read_from_path(path)?);
+                Self::Learned(AlphaBetaEngine::with_config(
+                    LearnedEvaluator::new(model),
+                    config.engine,
+                ))
+            }
+        })
     }
     fn search(&mut self, game: &Game, limits: SearchLimits) -> SearchResult {
         match self {
             Self::Pattern(engine) => engine.search(game.position(), limits),
             Self::Classical(engine) => engine.search(game.position(), limits),
+            Self::Learned(engine) => engine.search(game.position(), limits),
         }
     }
 }
@@ -140,13 +168,13 @@ struct GameResult {
 fn play(
     opening: &Opening,
     a_color: Stone,
-    configs: [PlayerConfig; 2],
+    configs: &[PlayerConfig; 2],
     limits: SearchLimits,
 ) -> Result<GameResult, Box<dyn Error>> {
     let mut game = opening.game()?;
     // Fresh per game, persistent between its moves. Paired legs cannot inherit
     // asymmetric ordinary TT history from one another.
-    let mut players = configs.map(Player::new);
+    let mut players = [Player::new(&configs[0])?, Player::new(&configs[1])?];
     let (mut work, mut moves) = (0, 0);
     loop {
         let winner = match game.status() {
@@ -201,13 +229,13 @@ impl Summary {
 fn main() -> Result<(), Box<dyn Error>> {
     if env::args().any(|arg| arg == "--help") {
         println!(
-            "RustMoku V0.9 Arena\n--pairs 1..12 --depth N --nodes N (optional global work cap per move)\nPlayer flags: --a- or --b- followed by evaluator pattern|classical, threads N,\ntt-mib N, vcf-plies N, vcf-nodes N, vct-plies N, vct-nodes N, vct-mib N.\nZero proof nodes/plies disables that solver. CSV stdout; configuration/summary stderr."
+            "RustMoku V0.12 Arena\n--pairs 1..12 --depth N --nodes N (optional global work cap per move)\nPlayer flags: --a- or --b- followed by evaluator pattern|classical|learned, model FILE, threads N,\ntt-mib N, vcf-plies N, vcf-nodes N, vct-plies N, vct-nodes N, vct-mib N.\nZero proof nodes/plies disables that solver. CSV stdout; configuration/summary stderr."
         );
         return Ok(());
     }
     let options = Options::parse(env::args().skip(1))?;
     eprintln!(
-        "RustMoku V0.9 Arena: {:?}; A={:?}; B={:?}",
+        "RustMoku V0.12 Arena: {:?}; A={:?}; B={:?}",
         options.limits, options.players[0], options.players[1]
     );
     println!("pair,opening,leg,a_color,winner,plies,searched_moves,work_nodes");
@@ -225,7 +253,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 .join(" ")
         );
         for (leg, a_color) in [Stone::Black, Stone::White].into_iter().enumerate() {
-            let result = play(opening, a_color, options.players, options.limits)?;
+            let result = play(opening, a_color, &options.players, options.limits)?;
             println!(
                 "{},{},{},{:?},{},{},{},{}",
                 pair + 1,
@@ -261,11 +289,12 @@ mod tests {
     fn paired_colors_and_accounting_use_the_same_legal_opening() {
         let config = PlayerConfig {
             engine: EngineConfig::new(0).with_vct_table_memory(0),
-            classical: false,
+            evaluator: EvaluatorConfig::Pattern,
         };
         let limits = SearchLimits::new(1).with_max_nodes(100);
-        let black = play(&OPENINGS[0], Stone::Black, [config; 2], limits).unwrap();
-        let white = play(&OPENINGS[0], Stone::White, [config; 2], limits).unwrap();
+        let configs = [config.clone(), config];
+        let black = play(&OPENINGS[0], Stone::Black, &configs, limits).unwrap();
+        let white = play(&OPENINGS[0], Stone::White, &configs, limits).unwrap();
         assert_eq!(
             (black.plies, black.moves, black.work),
             (white.plies, white.moves, white.work)
@@ -314,7 +343,10 @@ mod tests {
         assert_eq!(options.players[0].engine.threads(), 4);
         assert!(options.players[0].engine.tactical().vct.enabled());
         assert!(!options.players[1].engine.tactical().vct.enabled());
-        assert!(options.players[1].classical);
+        assert!(matches!(
+            options.players[1].evaluator,
+            EvaluatorConfig::Classical
+        ));
         assert_eq!(options.limits.max_nodes, Some(500));
         assert_eq!(options.pairs, 2);
         assert!(Options::parse(["--depth", "0"].map(String::from).into_iter()).is_err());
@@ -328,12 +360,13 @@ mod tests {
                 .with_vcf_limits(0, 0)
                 .with_vct_limits(0, 0)
                 .with_vct_table_memory(0),
-            classical: false,
+            evaluator: EvaluatorConfig::Pattern,
         };
+        let configs = [config.clone(), config];
         let result = play(
             &OPENINGS[0],
             Stone::Black,
-            [config; 2],
+            &configs,
             SearchLimits::new(1).with_max_nodes(100),
         )
         .unwrap();

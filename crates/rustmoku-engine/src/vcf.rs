@@ -692,11 +692,11 @@ mod tests {
         impl Evaluator for InaccessibleEvaluator {
             type State = ();
             type Undo = ();
-            fn initialize(&self, _: &Position) {}
-            fn make_move(&self, _: &mut (), _: Move, _: Stone) {
+            fn initialize(&self, _: &Position, _: &crate::PatternState) {}
+            fn make_move(&self, _: &mut (), _: &crate::PatternDelta) {
                 panic!("proof accessed evaluator");
             }
-            fn unmake_move(&self, _: &mut (), _: ()) {
+            fn unmake_move(&self, _: &mut (), _: &crate::PatternDelta, _: ()) {
                 panic!("proof accessed evaluator");
             }
             fn evaluate(&self, _: &Position, _: &crate::PatternState, _: &()) -> i32 {

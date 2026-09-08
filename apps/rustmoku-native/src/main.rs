@@ -2,8 +2,14 @@
 
 use eframe::egui::{self, Color32, Pos2, Sense, Stroke, Vec2};
 use rustmoku_core::{BOARD_SIZE, Game, GameStatus, Move, MoveError, OPENINGS, RecordError, Stone};
-use rustmoku_engine::{EngineConfig, SearchInfo, SearchLimits, SearchTermination};
-use std::{sync::mpsc::TryRecvError, time::Duration};
+use rustmoku_engine::{
+    EngineConfig, LearnedEvaluator, LearnedModel, RuntimeEvaluator, SearchInfo, SearchLimits,
+    SearchTermination,
+};
+use std::{
+    sync::{Arc, mpsc::TryRecvError},
+    time::{Duration, Instant},
+};
 mod localization;
 mod worker;
 use localization::{LanguagePreference, TextKey, UiLanguage, UiText, install_windows_cjk_font};
@@ -13,6 +19,7 @@ const BOARD_MARGIN: f32 = 28.0;
 const BOARD_COLOR: Color32 = Color32::from_rgb(216, 171, 103);
 const GRID_COLOR: Color32 = Color32::from_rgb(63, 45, 28);
 const LAST_MOVE_COLOR: Color32 = Color32::from_rgb(210, 48, 42);
+const HISTORY_PANEL_WIDTH: f32 = 260.0;
 const NATIVE_DEPTH: u8 = 8;
 const NATIVE_MAX_AUTO_THREADS: usize = 8;
 const NATIVE_TT_MEMORY_MIB: usize = 128;
@@ -63,6 +70,42 @@ fn main() -> eframe::Result {
     )
 }
 
+#[derive(Debug, Default)]
+struct MoveTimings {
+    history: Vec<Option<Duration>>,
+    future: Vec<Option<Duration>>,
+}
+
+impl MoveTimings {
+    fn reset(&mut self, plies: usize) {
+        self.history = vec![None; plies];
+        self.future.clear();
+    }
+
+    fn align_unknown_history(&mut self, plies: usize) {
+        if self.history.len() < plies {
+            self.history.resize(plies, None);
+        }
+    }
+
+    fn record_new(&mut self, elapsed: Option<Duration>) {
+        self.history.push(elapsed);
+        self.future.clear();
+    }
+
+    fn undo_plies(&mut self, plies: usize) {
+        for _ in 0..plies.min(self.history.len()) {
+            self.future.push(self.history.pop().unwrap());
+        }
+    }
+
+    fn redo(&mut self) {
+        if let Some(elapsed) = self.future.pop() {
+            self.history.push(elapsed);
+        }
+    }
+}
+
 struct RustMokuApp {
     game: Game,
     human_stone: Stone,
@@ -83,6 +126,10 @@ struct RustMokuApp {
     language_preference: LanguagePreference,
     text: UiText,
     cjk_font_installed: bool,
+    timings: MoveTimings,
+    turn_started: Option<Instant>,
+    model_path: String,
+    loaded_model: Option<String>,
 }
 
 impl RustMokuApp {
@@ -127,6 +174,10 @@ impl RustMokuApp {
             language_preference: LanguagePreference::Auto,
             text: UiText::new(UiLanguage::English),
             cjk_font_installed: false,
+            timings: MoveTimings::default(),
+            turn_started: Some(Instant::now()),
+            model_path: String::from("rustmoku-model.rmlp"),
+            loaded_model: None,
         }
     }
 
@@ -148,10 +199,13 @@ impl RustMokuApp {
     fn replace_game(&mut self, game: Game, undo_floor: usize) {
         self.worker.invalidate();
         self.game = game;
+        self.timings.reset(self.game.history().len());
         self.undo_floor = undo_floor;
         self.last_search = None;
         self.message = None;
+        self.turn_started = None;
         self.play_ai_if_needed();
+        self.start_human_timer_if_needed();
     }
 
     fn new_game(&mut self) {
@@ -192,10 +246,37 @@ impl RustMokuApp {
             return;
         }
         self.worker.invalidate();
-        self.game.undo_plies(plies);
+        self.timings
+            .align_unknown_history(self.game.history().len());
+        let undone = self.game.undo_plies(plies);
+        self.timings.undo_plies(undone);
         self.last_search = None;
         self.message = None;
+        self.turn_started = None;
         self.play_ai_if_needed();
+        self.start_human_timer_if_needed();
+    }
+
+    fn redo_to_human(&mut self) {
+        if !self.game.can_redo() {
+            return;
+        }
+        self.worker.invalidate();
+        self.last_search = None;
+        self.message = None;
+        self.turn_started = None;
+        while self.game.can_redo() {
+            self.game.redo();
+            self.timings.redo();
+            if self.game.status() != GameStatus::Ongoing
+                || self.game.position().side_to_move() == self.human_stone
+                || !self.game.can_redo()
+            {
+                break;
+            }
+        }
+        self.play_ai_if_needed();
+        self.start_human_timer_if_needed();
     }
 
     fn play_human_move(&mut self, at: Move) {
@@ -207,6 +288,9 @@ impl RustMokuApp {
 
         match self.game.play_move(at) {
             Ok(()) => {
+                let elapsed = self.turn_started.map(|started| started.elapsed());
+                self.timings.record_new(elapsed);
+                self.turn_started = None;
                 self.worker.invalidate();
                 self.message = None;
                 self.play_ai_if_needed();
@@ -237,6 +321,57 @@ impl RustMokuApp {
         };
         if let Err(error) = self.worker.start(self.game.position(), limits) {
             self.message = Some(self.text.detail(TextKey::SearchFailed, error));
+            self.turn_started = None;
+        } else {
+            self.turn_started = Some(Instant::now());
+        }
+    }
+
+    fn start_human_timer_if_needed(&mut self) {
+        if self.turn_started.is_none()
+            && self.game.status() == GameStatus::Ongoing
+            && self.game.position().side_to_move() == self.human_stone
+        {
+            self.turn_started = Some(Instant::now());
+        }
+    }
+
+    fn use_pattern_evaluator(&mut self) {
+        self.last_search = None;
+        self.loaded_model = None;
+        if let Err(error) = self.worker.replace_evaluator(RuntimeEvaluator::Pattern) {
+            self.message = Some(self.text.detail(TextKey::ReconfigureFailed, error));
+        } else {
+            self.message = None;
+            self.turn_started = None;
+            self.play_ai_if_needed();
+            self.start_human_timer_if_needed();
+        }
+    }
+
+    fn load_learned_model(&mut self) {
+        match LearnedModel::read_from_path(&self.model_path) {
+            Ok(model) => {
+                let evaluator = RuntimeEvaluator::Learned(LearnedEvaluator::new(Arc::new(model)));
+                self.last_search = None;
+                if let Err(error) = self.worker.replace_evaluator(evaluator) {
+                    self.message = Some(self.text.detail(TextKey::ReconfigureFailed, error));
+                    return;
+                }
+                self.loaded_model = Some(self.model_path.clone());
+                self.message = None;
+                self.turn_started = None;
+                self.play_ai_if_needed();
+                self.start_human_timer_if_needed();
+            }
+            Err(error) => {
+                self.loaded_model = None;
+                let _ = self.worker.replace_evaluator(RuntimeEvaluator::Pattern);
+                self.message = Some(error.to_string());
+                self.turn_started = None;
+                self.play_ai_if_needed();
+                self.start_human_timer_if_needed();
+            }
         }
     }
 
@@ -246,7 +381,9 @@ impl RustMokuApp {
         }
         match event {
             SearchEvent::Info { info, .. } => self.last_search = Some(info),
-            SearchEvent::Finished { result, .. } => {
+            SearchEvent::Finished {
+                result, elapsed, ..
+            } => {
                 self.last_search = Some(SearchInfo::from(&result));
                 if result.termination == SearchTermination::Cancelled {
                     return;
@@ -265,6 +402,10 @@ impl RustMokuApp {
                         self.text
                             .detail(TextKey::EngineMoveFailed, &error.to_string()),
                     );
+                } else {
+                    self.timings.record_new(Some(elapsed));
+                    self.turn_started = None;
+                    self.start_human_timer_if_needed();
                 }
             }
         }
@@ -362,6 +503,15 @@ impl RustMokuApp {
             {
                 self.undo_to_human();
             }
+            if ui
+                .add_enabled(
+                    self.game.can_redo(),
+                    egui::Button::new(text.get(TextKey::RedoTurn)),
+                )
+                .clicked()
+            {
+                self.redo_to_human();
+            }
             if ui.button(text.get(TextKey::GameRecord)).clicked() {
                 self.record_text = self.game.to_record();
                 self.record_open = true;
@@ -406,8 +556,27 @@ impl RustMokuApp {
             if self.worker.searching() {
                 ui.spinner();
             }
+            if let Some(started) = self.turn_started {
+                ui.label(text.current_move_time(started.elapsed()));
+            }
             if let Some(at) = self.game.position().last_move() {
-                ui.label(format!("{}: {at}", text.get(TextKey::Last)));
+                ui.label(text.last_move(at, self.timings.history.last().copied().flatten()));
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label(text.get(TextKey::Evaluator));
+            ui.label(
+                self.loaded_model
+                    .as_deref()
+                    .unwrap_or_else(|| text.get(TextKey::PatternEval)),
+            );
+            ui.label(text.get(TextKey::ModelPath));
+            ui.text_edit_singleline(&mut self.model_path);
+            if ui.button(text.get(TextKey::LoadModel)).clicked() {
+                self.load_learned_model();
+            }
+            if ui.button(text.get(TextKey::UsePattern)).clicked() {
+                self.use_pattern_evaluator();
             }
         });
         let previous_threads = self.engine_config.threads();
@@ -490,19 +659,15 @@ impl RustMokuApp {
                 ))
                 .truncate(),
             );
-            ui.label(search.proof.map_or_else(
-                || String::from(text.get(TextKey::NoProof)),
-                |proof| {
-                    text.proof_summary(
-                        &format!("{:?}", proof.source),
-                        &format!("{:?}", proof.distance),
-                    )
-                },
-            ));
+            ui.label(text.result_summary(search));
         } else {
             ui.label(text.get(TextKey::Waiting));
             ui.label(text.get(TextKey::TtEmpty));
-            ui.label(text.get(TextKey::NoProof));
+            ui.label(if self.worker.searching() {
+                text.get(TextKey::Searching)
+            } else {
+                text.get(TextKey::Waiting)
+            });
         }
         egui::ScrollArea::horizontal()
             .id_salt("pv")
@@ -525,27 +690,40 @@ impl RustMokuApp {
         let text = self.text;
         ui.heading(text.get(TextKey::Moves));
         ui.small(text.undo_floor(self.undo_floor));
-        egui::ScrollArea::vertical()
+        egui::ScrollArea::both()
             .id_salt("history")
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 egui::Grid::new("move_list").striped(true).show(ui, |ui| {
                     ui.label("#");
                     ui.label(text.get(TextKey::Black));
+                    ui.label(text.get(TextKey::Time));
                     ui.label(text.get(TextKey::White));
+                    ui.label(text.get(TextKey::Time));
                     ui.end_row();
-                    let mut moves = self.game.history();
-                    let mut turn = 1;
-                    while let Some(black) = moves.next() {
+                    let moves: Vec<_> = self.game.history().collect();
+                    for (turn_index, pair) in moves.chunks(2).enumerate() {
+                        let turn = turn_index + 1;
                         ui.label(turn.to_string());
+                        let black = pair[0];
                         ui.monospace(black.to_string());
+                        ui.monospace(text.history_time(
+                            self.timings.history.get((turn - 1) * 2).copied().flatten(),
+                        ));
                         ui.monospace(
-                            moves
-                                .next()
+                            pair.get(1)
                                 .map_or_else(String::new, |white| white.to_string()),
                         );
+                        ui.monospace(
+                            text.history_time(
+                                self.timings
+                                    .history
+                                    .get((turn - 1) * 2 + 1)
+                                    .copied()
+                                    .flatten(),
+                            ),
+                        );
                         ui.end_row();
-                        turn += 1;
                     }
                 });
             });
@@ -746,8 +924,8 @@ impl RustMokuApp {
 impl eframe::App for RustMokuApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll_search();
-        if self.worker.searching() {
-            ui.ctx().request_repaint_after(Duration::from_millis(16));
+        if self.turn_started.is_some() {
+            ui.ctx().request_repaint_after(Duration::from_millis(100));
         }
         // Stable panel sizes isolate board geometry from PV/proof/history text.
         egui::Panel::top("controls")
@@ -760,7 +938,10 @@ impl eframe::App for RustMokuApp {
                     .show(ui, |ui| self.controls(ui));
             });
         egui::Panel::right("history_panel")
-            .exact_size(180.0)
+            // Five columns need room for both localized color names and
+            // fixed-precision timings. Keep a horizontal scrollbar as a
+            // fallback for unusually long session durations.
+            .exact_size(HISTORY_PANEL_WIDTH)
             .resizable(false)
             .show(ui, |ui| self.move_history(ui));
         egui::CentralPanel::default().show(ui, |ui| {
@@ -895,6 +1076,7 @@ mod tests {
         app.handle_event(old);
         assert_eq!(app.game, Game::default());
         assert!(app.last_search.is_none());
+        assert!(app.timings.history.is_empty());
 
         app.play_human_move(Move::CENTER);
         let position = app.game.position().clone();
@@ -917,11 +1099,127 @@ mod tests {
         app.undo_floor = 1;
         let record = "RustMoku 1\nrules=freestyle\nmoves=H8 H9 G8 I8\n";
         app.import_record(record).unwrap();
-        app.handle_event(SearchEvent::Finished { id, result });
+        app.handle_event(SearchEvent::Finished {
+            id,
+            result,
+            elapsed: Duration::ZERO,
+        });
         assert_eq!(app.game.to_record(), record);
         assert_eq!(app.undo_floor, 0);
         assert!(!app.worker.searching());
         assert!(app.last_search.is_none());
+    }
+
+    #[test]
+    fn completed_turn_undo_redo_restores_moves_and_original_timings() {
+        let mut app = test_app();
+        let human = Move::CENTER;
+        let ai = Move::from_row_col(6, 7).unwrap();
+        app.game.play_move(human).unwrap();
+        app.timings.record_new(Some(Duration::from_millis(1230)));
+        app.game.play_move(ai).unwrap();
+        app.timings.record_new(Some(Duration::from_millis(4560)));
+        let completed = app.game.position().clone();
+
+        app.undo_to_human();
+        assert_eq!(app.game.history().len(), 0);
+        assert!(app.timings.history.is_empty());
+        assert_eq!(
+            app.timings.future,
+            vec![
+                Some(Duration::from_millis(4560)),
+                Some(Duration::from_millis(1230))
+            ]
+        );
+        app.redo_to_human();
+        assert_eq!(app.game.position(), &completed);
+        assert_eq!(
+            app.timings.history,
+            vec![
+                Some(Duration::from_millis(1230)),
+                Some(Duration::from_millis(4560))
+            ]
+        );
+        assert!(
+            !app.worker.searching(),
+            "historical AI reply must not be searched again"
+        );
+    }
+
+    #[test]
+    fn partial_thinking_undo_redo_restores_human_time_and_restarts_ai() {
+        let mut app = test_app();
+        app.search_limits = SearchLimits::new(1);
+        app.game.play_move(Move::CENTER).unwrap();
+        app.timings.record_new(Some(Duration::from_millis(875)));
+        app.undo_to_human();
+        assert!(!app.worker.searching());
+        app.redo_to_human();
+        assert_eq!(app.game.history().collect::<Vec<_>>(), [Move::CENTER]);
+        assert_eq!(app.timings.history, [Some(Duration::from_millis(875))]);
+        assert!(app.worker.searching(), "no historical AI reply remains");
+    }
+
+    #[test]
+    fn timing_metadata_follows_branch_success_and_failure() {
+        let mut app = test_app();
+        let first = Move::CENTER;
+        let reply = Move::from_row_col(6, 7).unwrap();
+        let second_human = Move::from_row_col(7, 6).unwrap();
+        let second_reply = Move::from_row_col(6, 6).unwrap();
+        app.game.play_move(first).unwrap();
+        app.timings.record_new(Some(Duration::from_secs(1)));
+        app.game.play_move(reply).unwrap();
+        app.timings.record_new(Some(Duration::from_secs(2)));
+        app.game.play_move(second_human).unwrap();
+        app.timings.record_new(Some(Duration::from_secs(3)));
+        app.game.play_move(second_reply).unwrap();
+        app.timings.record_new(Some(Duration::from_secs(4)));
+        app.undo_to_human();
+        let future = app.timings.future.clone();
+        app.play_human_move(first);
+        assert_eq!(
+            app.timings.future, future,
+            "illegal move preserves timing future"
+        );
+        let branch = Move::from_row_col(7, 8).unwrap();
+        app.play_human_move(branch);
+        assert!(app.timings.future.is_empty());
+        assert_eq!(app.game.redo_len(), 0);
+        assert!(!app.game.to_record().contains("time"));
+    }
+
+    #[test]
+    fn current_cancelled_result_cannot_record_ai_timing() {
+        let mut app = test_app();
+        app.search_limits = SearchLimits::new(1);
+        app.play_human_move(Move::CENTER);
+        let event = next_event(&app);
+        let id = match event {
+            SearchEvent::Info { id, .. } | SearchEvent::Finished { id, .. } => id,
+        };
+        let mut result =
+            AlphaBetaEngine::with_config(rustmoku_engine::PatternEvaluator, EngineConfig::new(1))
+                .search(app.game.position(), SearchLimits::new(1));
+        result.termination = SearchTermination::Cancelled;
+        app.handle_event(SearchEvent::Finished {
+            id,
+            result,
+            elapsed: Duration::from_secs(99),
+        });
+        assert_eq!(app.game.history().len(), 1);
+        assert_eq!(app.timings.history.len(), 1);
+    }
+
+    #[test]
+    fn imported_and_opening_moves_have_unknown_session_timing() {
+        let mut app = test_app();
+        app.import_record("RustMoku 1\nrules=freestyle\nmoves=H8 H9 G8 I8\n")
+            .unwrap();
+        assert_eq!(app.timings.history, [None; 4]);
+        app.selected_opening = Some(0);
+        app.new_game();
+        assert_eq!(app.timings.history, vec![None; OPENINGS[0].moves.len()]);
     }
 
     fn next_event(app: &RustMokuApp) -> SearchEvent {
@@ -959,6 +1257,7 @@ mod tests {
         app.handle_event(SearchEvent::Finished {
             id: old_id,
             result: result.clone(),
+            elapsed: Duration::ZERO,
         });
         assert_eq!(app.game.position().move_count(), 0);
         assert!(app.last_search.is_none());
@@ -975,6 +1274,7 @@ mod tests {
         app.handle_event(SearchEvent::Finished {
             id: current_id,
             result,
+            elapsed: Duration::ZERO,
         });
         assert_eq!(app.game.position().move_count(), 1);
     }

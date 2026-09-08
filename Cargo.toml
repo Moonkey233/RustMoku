@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "apps/rustmoku-arena",
+    "apps/rustmoku-data",
     "apps/rustmoku-native",
     "apps/rustmoku-solver",
     "crates/rustmoku-core",
@@ -9,7 +10,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.11.0"
+version = "0.12.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.98"

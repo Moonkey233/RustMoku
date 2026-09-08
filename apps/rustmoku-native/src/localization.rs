@@ -1,7 +1,9 @@
 use std::{ffi::OsString, path::PathBuf, sync::Arc};
 
 use eframe::egui::{self, FontData, FontDefinitions, FontFamily};
-use rustmoku_core::Stone;
+use rustmoku_core::{Move, Stone};
+use rustmoku_engine::{ProofDistance, SearchInfo, SearchOrigin};
+use std::time::Duration;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum LanguagePreference {
@@ -27,6 +29,7 @@ pub(super) enum TextKey {
     White,
     NewGame,
     UndoTurn,
+    RedoTurn,
     GameRecord,
     MoveNumbers,
     Opening,
@@ -40,7 +43,14 @@ pub(super) enum TextKey {
     Threads,
     Manual,
     TtPrimary,
-    NoProof,
+    Searching,
+    Evaluator,
+    PatternEval,
+    ModelPath,
+    LoadModel,
+    UsePattern,
+    CurrentMove,
+    Time,
     Waiting,
     Moves,
     RecordHelp,
@@ -101,6 +111,7 @@ impl UiText {
             (UiLanguage::English, TextKey::White) => "White",
             (UiLanguage::English, TextKey::NewGame) => "New Game",
             (UiLanguage::English, TextKey::UndoTurn) => "Undo turn",
+            (UiLanguage::English, TextKey::RedoTurn) => "Redo turn",
             (UiLanguage::English, TextKey::GameRecord) => "Game record...",
             (UiLanguage::English, TextKey::MoveNumbers) => "Move numbers",
             (UiLanguage::English, TextKey::Opening) => "Opening:",
@@ -116,7 +127,14 @@ impl UiText {
             (UiLanguage::English, TextKey::Threads) => "Threads:",
             (UiLanguage::English, TextKey::Manual) => "Manual",
             (UiLanguage::English, TextKey::TtPrimary) => "TT primary MiB:",
-            (UiLanguage::English, TextKey::NoProof) => "No exact tactical proof",
+            (UiLanguage::English, TextKey::Searching) => "Searching...",
+            (UiLanguage::English, TextKey::Evaluator) => "Evaluator:",
+            (UiLanguage::English, TextKey::PatternEval) => "Pattern",
+            (UiLanguage::English, TextKey::ModelPath) => "Model:",
+            (UiLanguage::English, TextKey::LoadModel) => "Load model",
+            (UiLanguage::English, TextKey::UsePattern) => "Use Pattern",
+            (UiLanguage::English, TextKey::CurrentMove) => "Current move",
+            (UiLanguage::English, TextKey::Time) => "Time",
             (UiLanguage::English, TextKey::Waiting) => "AI: waiting for a completed search depth",
             (UiLanguage::English, TextKey::Moves) => "Moves",
             (UiLanguage::English, TextKey::RecordHelp) => {
@@ -155,6 +173,7 @@ impl UiText {
             (UiLanguage::SimplifiedChinese, TextKey::White) => "白棋",
             (UiLanguage::SimplifiedChinese, TextKey::NewGame) => "新对局",
             (UiLanguage::SimplifiedChinese, TextKey::UndoTurn) => "悔棋",
+            (UiLanguage::SimplifiedChinese, TextKey::RedoTurn) => "重做",
             (UiLanguage::SimplifiedChinese, TextKey::GameRecord) => "棋谱...",
             (UiLanguage::SimplifiedChinese, TextKey::MoveNumbers) => "显示手数",
             (UiLanguage::SimplifiedChinese, TextKey::Opening) => "开局：",
@@ -168,7 +187,14 @@ impl UiText {
             (UiLanguage::SimplifiedChinese, TextKey::Threads) => "线程：",
             (UiLanguage::SimplifiedChinese, TextKey::Manual) => "手动",
             (UiLanguage::SimplifiedChinese, TextKey::TtPrimary) => "置换表主容量 MiB：",
-            (UiLanguage::SimplifiedChinese, TextKey::NoProof) => "无精确战术证明",
+            (UiLanguage::SimplifiedChinese, TextKey::Searching) => "搜索中……",
+            (UiLanguage::SimplifiedChinese, TextKey::Evaluator) => "评估器：",
+            (UiLanguage::SimplifiedChinese, TextKey::PatternEval) => "模式评估",
+            (UiLanguage::SimplifiedChinese, TextKey::ModelPath) => "模型：",
+            (UiLanguage::SimplifiedChinese, TextKey::LoadModel) => "载入模型",
+            (UiLanguage::SimplifiedChinese, TextKey::UsePattern) => "使用模式评估",
+            (UiLanguage::SimplifiedChinese, TextKey::CurrentMove) => "本手用时",
+            (UiLanguage::SimplifiedChinese, TextKey::Time) => "用时",
             (UiLanguage::SimplifiedChinese, TextKey::Waiting) => "AI：等待完成搜索深度",
             (UiLanguage::SimplifiedChinese, TextKey::Moves) => "着法",
             (UiLanguage::SimplifiedChinese, TextKey::RecordHelp) => {
@@ -271,10 +297,110 @@ impl UiText {
         }
     }
 
-    pub(super) fn proof_summary(self, kind: &str, distance: &str) -> String {
+    pub(super) fn result_summary(self, search: &SearchInfo) -> String {
+        let proof_distance = search
+            .proof
+            .map(|proof| match (self.language, proof.distance) {
+                (UiLanguage::English, ProofDistance::Exact(plies)) => {
+                    format!("exact {plies} plies")
+                }
+                (UiLanguage::English, ProofDistance::AtMost(plies)) => {
+                    format!("within {plies} plies")
+                }
+                (UiLanguage::SimplifiedChinese, ProofDistance::Exact(plies)) => {
+                    format!("精确 {plies} 层")
+                }
+                (UiLanguage::SimplifiedChinese, ProofDistance::AtMost(plies)) => {
+                    format!("最多 {plies} 层")
+                }
+            });
+        match (self.language, search.origin) {
+            (UiLanguage::English, SearchOrigin::Analysis) => "Analysis only".into(),
+            (UiLanguage::SimplifiedChinese, SearchOrigin::Analysis) => "仅分析".into(),
+            (UiLanguage::English, SearchOrigin::Fallback) => "Result: fallback".into(),
+            (UiLanguage::SimplifiedChinese, SearchOrigin::Fallback) => "结果来源：回退结果".into(),
+            (UiLanguage::English, SearchOrigin::AlphaBeta) => "Result: Alpha-Beta".into(),
+            (UiLanguage::SimplifiedChinese, SearchOrigin::AlphaBeta) => {
+                "结果来源：Alpha-Beta".into()
+            }
+            (UiLanguage::English, SearchOrigin::Terminal) => "Result: terminal position".into(),
+            (UiLanguage::SimplifiedChinese, SearchOrigin::Terminal) => "结果来源：终局".into(),
+            (UiLanguage::English, SearchOrigin::Immediate) => {
+                "Result: exact immediate tactic".into()
+            }
+            (UiLanguage::SimplifiedChinese, SearchOrigin::Immediate) => {
+                "结果来源：即时精确战术".into()
+            }
+            (UiLanguage::English, SearchOrigin::Vcf) => format!(
+                "Proof: VCF · {}",
+                proof_distance.unwrap_or_else(|| "verified".into())
+            ),
+            (UiLanguage::SimplifiedChinese, SearchOrigin::Vcf) => format!(
+                "证明：VCF · {}",
+                proof_distance.unwrap_or_else(|| "已验证".into())
+            ),
+            (UiLanguage::English, SearchOrigin::Vct) => format!(
+                "Proof: VCT/DFPN · {}",
+                proof_distance.unwrap_or_else(|| "verified".into())
+            ),
+            (UiLanguage::SimplifiedChinese, SearchOrigin::Vct) => format!(
+                "证明：VCT/DFPN · {}",
+                proof_distance.unwrap_or_else(|| "已验证".into())
+            ),
+            (UiLanguage::English, SearchOrigin::ProofBook) => format!(
+                "Proof: Verified Proof Book · {}",
+                proof_distance.unwrap_or_else(|| "verified".into())
+            ),
+            (UiLanguage::SimplifiedChinese, SearchOrigin::ProofBook) => format!(
+                "证明：已验证证明库 · {}",
+                proof_distance.unwrap_or_else(|| "已验证".into())
+            ),
+        }
+    }
+
+    pub(super) fn current_move_time(self, elapsed: Duration) -> String {
         match self.language {
-            UiLanguage::English => format!("{kind} proven, {distance}"),
-            UiLanguage::SimplifiedChinese => format!("已证明 {kind}，{distance}"),
+            UiLanguage::English => format!(
+                "{}: {:.1} s",
+                self.get(TextKey::CurrentMove),
+                elapsed.as_secs_f64()
+            ),
+            UiLanguage::SimplifiedChinese => format!(
+                "{}：{:.1} 秒",
+                self.get(TextKey::CurrentMove),
+                elapsed.as_secs_f64()
+            ),
+        }
+    }
+
+    pub(super) fn last_move(self, at: Move, elapsed: Option<Duration>) -> String {
+        match (self.language, elapsed) {
+            (UiLanguage::English, Some(elapsed)) => {
+                format!(
+                    "{}: {at} · {:.2} s",
+                    self.get(TextKey::Last),
+                    elapsed.as_secs_f64()
+                )
+            }
+            (UiLanguage::SimplifiedChinese, Some(elapsed)) => {
+                format!(
+                    "{}：{at} · {:.2} 秒",
+                    self.get(TextKey::Last),
+                    elapsed.as_secs_f64()
+                )
+            }
+            (UiLanguage::English, None) => format!("{}: {at}", self.get(TextKey::Last)),
+            (UiLanguage::SimplifiedChinese, None) => format!("{}：{at}", self.get(TextKey::Last)),
+        }
+    }
+
+    pub(super) fn history_time(self, elapsed: Option<Duration>) -> String {
+        match (self.language, elapsed) {
+            (UiLanguage::English, Some(elapsed)) => format!("{:.2}s", elapsed.as_secs_f64()),
+            (UiLanguage::SimplifiedChinese, Some(elapsed)) => {
+                format!("{:.2}秒", elapsed.as_secs_f64())
+            }
+            (_, None) => "—".into(),
         }
     }
 
@@ -325,6 +451,20 @@ pub(super) fn install_windows_cjk_font(ctx: &egui::Context) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustmoku_engine::{Proof, ProofSource, SearchStatistics};
+
+    fn search_info(origin: SearchOrigin, proof: Option<Proof>) -> SearchInfo {
+        SearchInfo {
+            completed_depth: 0,
+            seldepth: 0,
+            best_move: None,
+            score: 0,
+            principal_variation: Vec::new(),
+            statistics: SearchStatistics::default(),
+            proof,
+            origin,
+        }
+    }
 
     #[test]
     fn locale_mapping_and_representative_translations_are_centralized() {
@@ -355,6 +495,40 @@ mod tests {
         assert_eq!(
             UiText::new(UiLanguage::SimplifiedChinese).get(TextKey::Waiting),
             "AI：等待完成搜索深度"
+        );
+    }
+
+    #[test]
+    fn result_origins_and_proof_distances_are_worded_honestly() {
+        let english = UiText::new(UiLanguage::English);
+        let chinese = UiText::new(UiLanguage::SimplifiedChinese);
+        assert_eq!(
+            english.result_summary(&search_info(SearchOrigin::AlphaBeta, None)),
+            "Result: Alpha-Beta"
+        );
+        assert_eq!(
+            chinese.result_summary(&search_info(SearchOrigin::Immediate, None)),
+            "结果来源：即时精确战术"
+        );
+        assert_eq!(
+            english.result_summary(&search_info(
+                SearchOrigin::Vcf,
+                Some(Proof {
+                    source: ProofSource::Vcf,
+                    distance: ProofDistance::Exact(5),
+                }),
+            )),
+            "Proof: VCF · exact 5 plies"
+        );
+        assert_eq!(
+            chinese.result_summary(&search_info(
+                SearchOrigin::ProofBook,
+                Some(Proof {
+                    source: ProofSource::ProofBook,
+                    distance: ProofDistance::AtMost(17),
+                }),
+            )),
+            "证明：已验证证明库 · 最多 17 层"
         );
     }
 }

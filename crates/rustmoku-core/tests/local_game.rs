@@ -37,6 +37,54 @@ fn history_and_repeated_undo_restore_every_position_field_and_terminal_status() 
 }
 
 #[test]
+fn undo_redo_is_exact_and_branching_is_atomic() {
+    let mut game = Game::default();
+    let sequence = ["H8", "H9", "G8", "I8"];
+    let mut positions = vec![game.position().clone()];
+    for text in sequence {
+        game.play_move(at(text)).unwrap();
+        positions.push(game.position().clone());
+    }
+    let completed = game.position().clone();
+    assert_eq!(game.undo_plies(2), 2);
+    assert_eq!(game.position(), &positions[2]);
+    assert_eq!(game.redo_len(), 2);
+    assert_eq!(game.redo(), Some(at("G8")));
+    assert_eq!(game.position(), &positions[3]);
+    assert_eq!(game.redo(), Some(at("I8")));
+    assert_eq!(game.position(), &completed);
+    assert!(!game.can_redo());
+
+    game.undo_plies(2);
+    assert_eq!(
+        game.play_move(at("H8")),
+        Err(MoveError::Occupied { at: at("H8") })
+    );
+    assert_eq!(game.redo_len(), 2, "failed branches preserve the future");
+    game.play_move(at("F8")).unwrap();
+    assert_eq!(game.redo_len(), 0, "successful branches discard the future");
+    assert_eq!(
+        game.history().collect::<Vec<_>>(),
+        [at("H8"), at("H9"), at("F8")]
+    );
+}
+
+#[test]
+fn terminal_status_round_trips_through_undo_and_redo() {
+    let mut game = Game::default();
+    for text in ["D8", "A1", "E8", "C1", "F8", "E1", "G8", "G1", "H8"] {
+        game.play_move(at(text)).unwrap();
+    }
+    let won = game.position().clone();
+    assert_eq!(game.status(), GameStatus::Won(Stone::Black));
+    assert_eq!(game.undo(), Some(at("H8")));
+    assert_eq!(game.status(), GameStatus::Ongoing);
+    assert_eq!(game.redo(), Some(at("H8")));
+    assert_eq!(game.status(), GameStatus::Won(Stone::Black));
+    assert_eq!(game.position(), &won);
+}
+
+#[test]
 fn shared_notation_maps_corners_center_and_all_valid_moves() {
     for (text, row, col) in [
         ("A1", 14, 0),

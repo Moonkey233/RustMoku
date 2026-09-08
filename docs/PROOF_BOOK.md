@@ -1,6 +1,6 @@
 # RustMoku Freestyle Proof Book
 
-RustMoku V0.11 separates three concepts:
+RustMoku V0.12 preserves the V0.11 separation of three concepts:
 
 - an opening suite is an empirical list of starts;
 - a solver checkpoint is resumable, untrusted working state;
@@ -62,6 +62,18 @@ bytes before allocation or verification. Verification additionally rejects
 illegal roots/transitions, key or symmetry mismatches, missing defender
 children, wrong tactical moves/distances, inconsistent proof distances, cycles,
 and unreachable entries.
+
+Untrusted tactical leaves are preflighted against an explicit verification
+policy. The default accepts at most 31 tactical plies and 1,000,000 nodes per
+leaf; larger encoded requests require a caller-supplied opt-in policy. Within one
+verification call, independently checked canonical entries memoize only their
+verified distance, while a separate recursion stack still detects cycles. A new
+call starts with no trusted memo.
+
+Solver checkpoints retain canonical/source provenance for exact ProvenWin and
+Refuted cache hits; cached nonterminal refutations can never be decoded as
+terminal evidence. The loader and atomic writer share the same 100,000 resident
+node limit. Over-limit saves fail before replacing the previous checkpoint.
 
 ## Runtime
 

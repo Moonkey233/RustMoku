@@ -60,9 +60,11 @@ Dependencies must remain one-way:
 * `rustmoku-engine` must not depend on GUI or application code.
 
 Do not move domain rules into the UI or search implementation for convenience.
-Played-game history and opaque undo tokens belong to Game, never Position.
+Played-game current/future history and opaque undo tokens belong to Game, never Position.
 Human notation and record/opening replay semantics belong to Core. Native owns
 I/O and its human-decision undo floor; imports/openings use legal Game replay.
+Redo replays through normal legal transitions with fresh undo tokens; only a
+successful branch move clears the future, and normal records omit it.
 
 ## 3. Position Is the Engine Boundary
 
@@ -112,6 +114,12 @@ strategy verification succeeds.
 
 Evaluation scores are always documented with an explicit perspective. The initial evaluator returns scores from the side-to-move perspective.
 
+Learned evaluator state must be incrementally maintained and exactly reversible
+from PatternState's bounded feature delta. Tactical facts and proof caches remain
+evaluator-independent. Learned Policy is ordering-only and never outranks exact
+tactical classes or a legal TT preference within its tactical class. Replacing
+an evaluator/model invalidates evaluator-dependent ordinary TT scores.
+
 Terminal win/loss values use mate-distance semantics so the engine prefers faster wins and delays forced losses.
 
 Transposition-table probes may use a score or bound only when the stored depth is sufficient and the full Zobrist key matches. The fixed-depth baseline additionally requires equal remaining depth for score/bound reuse, because deeper heuristic values have a different horizon; legal TT moves may still order at any depth. Mate scores must be normalized by ply when stored and denormalized when probed. Cached moves must be validated before use. Quiescence scores must not share ordinary TT depth/bound semantics; history and killers remain per-public-search and subordinate to tactical ordering.
@@ -151,6 +159,9 @@ Persistent transposition state may change nodes, hit counts, and wall time betwe
 Move ordering must have a deterministic tie-break rule.
 
 Do not introduce implicit randomness.
+
+Training datasets split by whole game/trajectory before position sampling or D4
+augmentation. Seeded data diversity remains outside normal engine search.
 
 Future randomized play must use explicit configuration and an explicit reproducible seed.
 

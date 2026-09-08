@@ -4,11 +4,12 @@ use std::{
     io,
     sync::mpsc,
     thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
 
 use rustmoku_core::Position;
 use rustmoku_engine::{
-    AlphaBetaEngine, CancellationToken, EngineConfig, PatternEvaluator, SearchEngine, SearchInfo,
+    AlphaBetaEngine, CancellationToken, EngineConfig, RuntimeEvaluator, SearchEngine, SearchInfo,
     SearchLimits, SearchResult,
 };
 
@@ -22,12 +23,20 @@ struct SearchRequest {
 enum Command {
     Search(Box<SearchRequest>),
     Reconfigure(EngineConfig),
+    ReplaceEvaluator(RuntimeEvaluator),
     Shutdown,
 }
 
 pub(super) enum SearchEvent {
-    Info { id: u64, info: SearchInfo },
-    Finished { id: u64, result: SearchResult },
+    Info {
+        id: u64,
+        info: SearchInfo,
+    },
+    Finished {
+        id: u64,
+        result: SearchResult,
+        elapsed: Duration,
+    },
 }
 
 pub(super) struct SearchWorker {
@@ -45,7 +54,7 @@ impl SearchWorker {
         let handle = thread::Builder::new()
             .name("rustmoku-search".into())
             .spawn(move || {
-                let mut engine = AlphaBetaEngine::with_config(PatternEvaluator, config);
+                let mut engine = AlphaBetaEngine::with_config(RuntimeEvaluator::Pattern, config);
                 while let Ok(command) = incoming.recv() {
                     match command {
                         Command::Search(request) => {
@@ -53,6 +62,7 @@ impl SearchWorker {
                                 continue;
                             }
                             let id = request.id;
+                            let started = Instant::now();
                             let result = engine.search_controlled(
                                 &request.position,
                                 request.limits,
@@ -63,11 +73,22 @@ impl SearchWorker {
                                     let _ = outgoing.send(SearchEvent::Info { id, info });
                                 },
                             );
-                            if outgoing.send(SearchEvent::Finished { id, result }).is_err() {
+                            let elapsed = started.elapsed();
+                            if outgoing
+                                .send(SearchEvent::Finished {
+                                    id,
+                                    result,
+                                    elapsed,
+                                })
+                                .is_err()
+                            {
                                 break;
                             }
                         }
                         Command::Reconfigure(config) => engine.reconfigure(config),
+                        Command::ReplaceEvaluator(evaluator) => {
+                            engine.replace_evaluator(evaluator);
+                        }
                         Command::Shutdown => break,
                     }
                 }
@@ -120,6 +141,16 @@ impl SearchWorker {
         self.invalidate();
         self.requests
             .send(Command::Reconfigure(config))
+            .map_err(|_| "Search worker disconnected.")
+    }
+
+    pub(super) fn replace_evaluator(
+        &mut self,
+        evaluator: RuntimeEvaluator,
+    ) -> Result<(), &'static str> {
+        self.invalidate();
+        self.requests
+            .send(Command::ReplaceEvaluator(evaluator))
             .map_err(|_| "Search worker disconnected.")
     }
 
@@ -221,6 +252,21 @@ mod tests {
                 break;
             }
             assert!(std::time::Instant::now() < until);
+        }
+    }
+
+    #[test]
+    fn finished_event_carries_worker_measured_elapsed() {
+        let mut worker = SearchWorker::new(EngineConfig::new(0)).unwrap();
+        worker
+            .start(&Position::default(), SearchLimits::new(1))
+            .unwrap();
+        loop {
+            let event = worker.events.recv_timeout(Duration::from_secs(5)).unwrap();
+            if let SearchEvent::Finished { elapsed, .. } = event {
+                assert!(elapsed <= Duration::from_secs(5));
+                break;
+            }
         }
     }
 }

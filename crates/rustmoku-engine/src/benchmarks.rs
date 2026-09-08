@@ -1,10 +1,10 @@
 use crate::{
-    ClassicalEvaluator, Evaluator, PatternEvaluator, PatternState,
-    candidate_frontier::CandidateFrontier, move_generation::generate_candidates,
-    move_ordering::order_moves, search_state::SearchState,
+    ClassicalEvaluator, Evaluator, LearnedEvaluator, LearnedModel, LearnedModelError,
+    PatternEvaluator, PatternState, candidate_frontier::CandidateFrontier,
+    move_generation::generate_candidates, move_ordering::order_moves, search_state::SearchState,
 };
 use rustmoku_core::{Move, Position};
-use std::{hint::black_box, time::Instant};
+use std::{hint::black_box, path::Path, sync::Arc, time::Instant};
 
 /// Runs one warm-up and five samples per operation on the historical balanced
 /// midgame. Reports the median nanoseconds per call/pair. No timing assertions.
@@ -86,9 +86,69 @@ pub fn run_hotpath(iterations: usize) {
             None,
             &crate::search_heuristics::SearchHeuristics::default(),
             0,
+            |_| None,
         );
         black_box(moves);
     });
+}
+
+/// Measures the production scalar quantized Value/Policy and reversible state
+/// update paths using an explicitly supplied model artifact.
+pub fn run_learned_hotpath(
+    iterations: usize,
+    model_path: impl AsRef<Path>,
+) -> Result<(), LearnedModelError> {
+    let model = Arc::new(LearnedModel::read_from_path(model_path)?);
+    let evaluator = LearnedEvaluator::new(model);
+    let mut position = Position::default();
+    for (row, column) in [
+        (7, 7),
+        (7, 8),
+        (8, 8),
+        (6, 6),
+        (8, 7),
+        (6, 8),
+        (9, 6),
+        (5, 9),
+        (9, 8),
+        (5, 7),
+        (6, 9),
+        (8, 6),
+    ] {
+        position
+            .make_move(Move::from_row_col(row, column).expect("fixture coordinates are valid"))
+            .expect("fixture moves are legal");
+    }
+    let patterns = PatternState::new(&position);
+    let evaluator_state = evaluator.initialize(&position, &patterns);
+    let mut search_state = SearchState::new(&position, &evaluator);
+    let moves = search_state.candidates();
+    println!("operation,iterations,repeats,median_ns");
+    measure("learned_value", iterations, |_| {
+        black_box(evaluator.evaluate(
+            black_box(&position),
+            black_box(&patterns),
+            black_box(&evaluator_state),
+        ));
+    });
+    measure("learned_policy_candidate", iterations, |index| {
+        let at = moves.as_slice()[index % moves.as_slice().len()];
+        black_box(evaluator.policy_score(
+            black_box(&position),
+            black_box(&patterns),
+            black_box(&evaluator_state),
+            at,
+        ));
+    });
+    measure("learned_make_unmake_pair", iterations, |index| {
+        let at = moves.as_slice()[index % moves.as_slice().len()];
+        let undo = search_state
+            .make_move(at, &evaluator)
+            .expect("fixture candidate must be legal");
+        black_box(&search_state);
+        search_state.unmake_move(undo, &evaluator);
+    });
+    Ok(())
 }
 
 fn measure(name: &str, iterations: usize, mut operation: impl FnMut(usize)) {

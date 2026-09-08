@@ -12,10 +12,11 @@ pub(crate) fn order_moves(
     tt_move: Option<Move>,
     heuristics: &SearchHeuristics,
     ply: u8,
+    mut policy_score: impl FnMut(Move) -> Option<i32>,
 ) {
-    // Packed total order: tactical 56..64, TT 55, countermove 54,
-    // killer 52..54, signed contextual history 36..52, own 32..36,
-    // opponent 28..32, center 24..28,
+    // Packed total order: tactical 56..64, TT 55, learned policy 39..55,
+    // countermove 38, killer 36..38, signed contextual history 20..36,
+    // own 16..20, opponent 12..16, center 8..12,
     // reversed canonical index 0..8. Comparisons only read integers.
     let mut priorities = [0_u64; CELL_COUNT];
     let len = moves.as_slice().len();
@@ -25,14 +26,19 @@ pub(crate) fn order_moves(
         let opponent = patterns.profile(at, side.opponent());
         let contextual = i32::from(heuristics.contextual_score(side, at, previous, two_back))
             - i32::from(i16::MIN);
+        let policy = policy_score(at)
+            .unwrap_or(0)
+            .clamp(i32::from(i16::MIN), i32::from(i16::MAX))
+            - i32::from(i16::MIN);
         priorities[index] = (u64::from(tactical_class(own, opponent)) << 56)
             | (u64::from(Some(at) == tt_move) << 55)
-            | (u64::from(heuristics.is_countermove(side, at, previous)) << 54)
-            | (u64::from(heuristics.killer_rank(ply, at)) << 52)
-            | ((contextual as u64) << 36)
-            | ((own as u64) << 32)
-            | ((opponent as u64) << 28)
-            | (u64::from(CENTER_BIAS[at.index()]) << 24)
+            | ((policy as u64) << 39)
+            | (u64::from(heuristics.is_countermove(side, at, previous)) << 38)
+            | (u64::from(heuristics.killer_rank(ply, at)) << 36)
+            | ((contextual as u64) << 20)
+            | ((own as u64) << 16)
+            | ((opponent as u64) << 12)
+            | (u64::from(CENTER_BIAS[at.index()]) << 8)
             | (CELL_COUNT - 1 - at.index()) as u64;
     }
     priorities[..len].sort_unstable_by(|left, right| right.cmp(left));
@@ -103,6 +109,7 @@ mod tests {
             Some(tt_move),
             &SearchHeuristics::default(),
             0,
+            |_| None,
         );
         assert_eq!(moves.as_slice().first().copied(), Some(tt_move));
     }
@@ -127,9 +134,46 @@ mod tests {
             Some(move_at(5, 5)),
             &SearchHeuristics::default(),
             0,
+            |_| None,
         );
         let first = moves.as_slice()[0];
         assert!(position.would_win(first, Stone::Black));
+    }
+
+    #[test]
+    fn learned_policy_orders_within_but_never_across_tactical_classes() {
+        let position = position_from(&[
+            (7, 3),
+            (0, 0),
+            (7, 4),
+            (0, 2),
+            (7, 5),
+            (1, 0),
+            (7, 6),
+            (1, 2),
+        ]);
+        let patterns = PatternState::new(&position);
+        let win = move_at(7, 2);
+        let favored_quiet = move_at(5, 5);
+        let mut moves = generate_candidates(&position);
+        order_moves(
+            position.side_to_move(),
+            &patterns,
+            &mut moves,
+            None,
+            &SearchHeuristics::default(),
+            0,
+            |at| {
+                Some(if at == favored_quiet {
+                    i32::MAX
+                } else {
+                    i32::MIN
+                })
+            },
+        );
+        assert!(position.would_win(moves.as_slice()[0], Stone::Black));
+        assert_ne!(moves.as_slice()[0], favored_quiet);
+        assert!(moves.as_slice().contains(&win));
     }
 
     #[test]
@@ -162,6 +206,7 @@ mod tests {
             Some(move_at(5, 5)),
             &heuristics,
             0,
+            |_| None,
         );
         assert_eq!(moves.as_slice().first().copied(), Some(move_at(7, 7)));
     }
@@ -189,7 +234,7 @@ mod tests {
             &[],
             &patterns,
         );
-        order_moves(side, &patterns, &mut moves, None, &heuristics, 1);
+        order_moves(side, &patterns, &mut moves, None, &heuristics, 1, |_| None);
         assert_eq!(moves.as_slice().first().copied(), Some(preferred));
     }
 
@@ -236,6 +281,7 @@ mod tests {
                     tt_move,
                     &SearchHeuristics::default(),
                     0,
+                    |_| None,
                 );
                 assert_eq!(moves.as_slice(), reference);
             }

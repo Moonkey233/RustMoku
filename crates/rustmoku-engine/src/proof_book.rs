@@ -16,6 +16,32 @@ const VERSION: u16 = 1;
 const MAX_ROOTS: usize = 1_024;
 const MAX_ENTRIES: usize = 1_000_000;
 
+/// Resource policy applied before any untrusted tactical leaf is rerun.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProofBookVerifyLimits {
+    pub max_tactical_plies: u8,
+    pub max_tactical_nodes_per_leaf: u64,
+}
+
+impl ProofBookVerifyLimits {
+    #[must_use]
+    pub const fn new(max_tactical_plies: u8, max_tactical_nodes_per_leaf: u64) -> Self {
+        Self {
+            max_tactical_plies,
+            max_tactical_nodes_per_leaf,
+        }
+    }
+}
+
+impl Default for ProofBookVerifyLimits {
+    fn default() -> Self {
+        // Deliberately above the normal V0.11 generator defaults (7 plies,
+        // 2k nodes), while still preventing an encoded u64 from becoming an
+        // effectively unbounded verification request.
+        Self::new(31, 1_000_000)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProofSource {
     Vcf,
@@ -324,6 +350,13 @@ impl ProofBook {
     }
 
     pub fn verify(self) -> Result<VerifiedProofBook, ProofBookError> {
+        self.verify_with_limits(ProofBookVerifyLimits::default())
+    }
+
+    pub fn verify_with_limits(
+        self,
+        limits: ProofBookVerifyLimits,
+    ) -> Result<VerifiedProofBook, ProofBookError> {
         if self.roots.is_empty() {
             return Err(ProofBookError::Invalid("Proof Book has no roots"));
         }
@@ -335,7 +368,30 @@ impl ProofBook {
         if entries.len() != self.entries.len() {
             return Err(ProofBookError::Invalid("duplicate Proof Book entry"));
         }
+        for entry in &self.entries {
+            let budget = match entry.action {
+                StoredAction::Vcf {
+                    max_plies,
+                    max_nodes,
+                    ..
+                }
+                | StoredAction::Vct {
+                    max_plies,
+                    max_nodes,
+                    ..
+                } => Some((max_plies, max_nodes)),
+                _ => None,
+            };
+            if budget.is_some_and(|(plies, nodes)| {
+                plies > limits.max_tactical_plies || nodes > limits.max_tactical_nodes_per_leaf
+            }) {
+                return Err(ProofBookError::VerificationLimit(
+                    "tactical leaf exceeds verification policy",
+                ));
+            }
+        }
         let mut visited = BTreeSet::new();
+        let mut memo = BTreeMap::new();
         let mut seen_roots = BTreeSet::new();
         for root in &self.roots {
             let mut game = Game::new(RuleSet::Freestyle);
@@ -358,6 +414,7 @@ impl ProofBook {
                 &entries,
                 &mut visited,
                 &mut stack,
+                &mut memo,
             )?;
         }
         if visited.len() != entries.len() {
@@ -376,6 +433,7 @@ fn verify_position(
     entries: &BTreeMap<EntryKey, StoredEntry>,
     visited: &mut BTreeSet<EntryKey>,
     stack: &mut BTreeSet<EntryKey>,
+    memo: &mut BTreeMap<EntryKey, ProofDistance>,
 ) -> Result<ProofDistance, ProofBookError> {
     if let Some(winner) = position.winner() {
         return if winner == attacker {
@@ -395,6 +453,10 @@ fn verify_position(
     let entry = entries
         .get(&key)
         .ok_or(ProofBookError::Invalid("missing strategy entry"))?;
+    if let Some(&distance) = memo.get(&key) {
+        visited.insert(key);
+        return Ok(distance);
+    }
     if !stack.insert(key) {
         return Err(ProofBookError::Invalid("cycle in Proof Book strategy"));
     }
@@ -412,7 +474,9 @@ fn verify_position(
             child
                 .make_move(at)
                 .map_err(|_| ProofBookError::Invalid("illegal attacker transition"))?;
-            add_one(verify_position(&child, attacker, entries, visited, stack)?)
+            add_one(verify_position(
+                &child, attacker, entries, visited, stack, memo,
+            )?)
         }
         StoredAction::DefenderAll => {
             if position.side_to_move() == attacker {
@@ -427,7 +491,7 @@ fn verify_position(
                     .make_move(at)
                     .map_err(|_| ProofBookError::Invalid("illegal defender transition"))?;
                 longest = longest
-                    .max(verify_position(&child, attacker, entries, visited, stack)?.plies());
+                    .max(verify_position(&child, attacker, entries, visited, stack, memo)?.plies());
             }
             if !found {
                 return Err(ProofBookError::Invalid(
@@ -479,6 +543,7 @@ fn verify_position(
     if computed != entry.distance {
         return Err(ProofBookError::Invalid("inconsistent Proof Book distance"));
     }
+    memo.insert(key, computed);
     Ok(computed)
 }
 
@@ -572,6 +637,7 @@ fn metadata(roots: &[StoredRoot], entries: &[StoredEntry]) -> ProofBookMetadata 
 pub enum ProofBookError {
     Io(io::Error),
     Invalid(&'static str),
+    VerificationLimit(&'static str),
 }
 
 impl fmt::Display for ProofBookError {
@@ -579,6 +645,9 @@ impl fmt::Display for ProofBookError {
         match self {
             Self::Io(error) => write!(formatter, "Proof Book I/O error: {error}"),
             Self::Invalid(message) => write!(formatter, "invalid Proof Book: {message}"),
+            Self::VerificationLimit(message) => {
+                write!(formatter, "Proof Book verification limit: {message}")
+            }
         }
     }
 }
@@ -587,7 +656,7 @@ impl std::error::Error for ProofBookError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(error) => Some(error),
-            Self::Invalid(_) => None,
+            Self::Invalid(_) | Self::VerificationLimit(_) => None,
         }
     }
 }
@@ -742,4 +811,86 @@ fn sibling_path(path: &Path, suffix: &str) -> PathBuf {
         .map_or_else(|| "rustmoku".into(), |name| name.to_os_string());
     name.push(format!(".{suffix}"));
     path.with_file_name(name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn immediate_fixture(symmetry: rustmoku_core::Symmetry) -> Game {
+        let mut game = Game::new(RuleSet::Freestyle);
+        for index in [0, 15, 1, 16, 2, 17, 3, 30] {
+            game.play_move(symmetry.transform(Move::from_index(index).unwrap()))
+                .unwrap();
+        }
+        game
+    }
+
+    #[test]
+    fn verification_memo_reuses_a_canonical_diamond_and_new_pass_rechecks() {
+        let first = immediate_fixture(rustmoku_core::Symmetry::Identity);
+        let second = immediate_fixture(rustmoku_core::Symmetry::Rotate90);
+        let first_canonical = CanonicalPosition::new(first.position());
+        let second_canonical = CanonicalPosition::new(second.position());
+        assert_eq!(first_canonical.key(), second_canonical.key());
+        let key = EntryKey {
+            attacker: StoneKey::Black,
+            position: first_canonical.key(),
+        };
+        let entry = StoredEntry {
+            key,
+            distance: ProofDistance::AtMost(1),
+            action: StoredAction::AttackerMove(
+                first_canonical.move_to_canonical(Move::from_index(4).unwrap()),
+            ),
+        };
+        let mut entries = BTreeMap::from([(key, entry)]);
+        let mut visited = BTreeSet::new();
+        let mut stack = BTreeSet::new();
+        let mut memo = BTreeMap::new();
+        assert_eq!(
+            verify_position(
+                first.position(),
+                Stone::Black,
+                &entries,
+                &mut visited,
+                &mut stack,
+                &mut memo,
+            )
+            .unwrap(),
+            ProofDistance::AtMost(1)
+        );
+
+        // This represents the second arm of a D4/transposition diamond. A
+        // corrupted backing entry is ignored only because the same key was
+        // independently verified earlier in this verification session.
+        entries.get_mut(&key).unwrap().distance = ProofDistance::AtMost(9);
+        assert_eq!(
+            verify_position(
+                second.position(),
+                Stone::Black,
+                &entries,
+                &mut visited,
+                &mut stack,
+                &mut memo,
+            )
+            .unwrap(),
+            ProofDistance::AtMost(1)
+        );
+        assert_eq!(memo.len(), 1);
+
+        // A new ProofBook::verify pass starts empty and must independently
+        // reject the same corrupted entry.
+        assert!(
+            verify_position(
+                second.position(),
+                Stone::Black,
+                &entries,
+                &mut BTreeSet::new(),
+                &mut BTreeSet::new(),
+                &mut BTreeMap::new(),
+            )
+            .is_err()
+        );
+    }
 }

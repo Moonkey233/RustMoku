@@ -1,5 +1,5 @@
 use super::*;
-use rustmoku_core::Stone;
+use crate::zobrist::PositionKey;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 fn fixture(indices: &[usize]) -> Position {
@@ -25,6 +25,50 @@ fn same_iteration(result: &SearchResult, info: &SearchInfo) {
     assert_eq!(result.best_move, info.best_move);
     assert_eq!(result.score, info.score);
     assert_eq!(result.principal_variation, info.principal_variation);
+    assert_eq!(result.origin, info.origin);
+}
+
+#[test]
+fn root_completion_paths_report_explicit_origins() {
+    let empty = Position::default();
+    let analysis = AlphaBetaEngine::with_config(PatternEvaluator, config())
+        .search(&empty, SearchLimits::new(0));
+    assert_eq!(analysis.origin, SearchOrigin::Analysis);
+
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+    let fallback = AlphaBetaEngine::with_config(PatternEvaluator, config()).search_controlled(
+        &empty,
+        SearchLimits::new(1),
+        cancellation,
+        &mut |_| {},
+    );
+    assert_eq!(fallback.origin, SearchOrigin::Fallback);
+
+    let ordinary = fixture(&[112, 97, 128, 113]);
+    let alpha_beta = AlphaBetaEngine::with_config(PatternEvaluator, config())
+        .search(&ordinary, SearchLimits::new(1));
+    assert_eq!(alpha_beta.origin, SearchOrigin::AlphaBeta);
+
+    let mut immediate = fixture(&[0, 15, 1, 16, 2, 17, 3, 30]);
+    let tactic = AlphaBetaEngine::with_config(PatternEvaluator, config())
+        .search(&immediate, SearchLimits::new(1));
+    assert_eq!(tactic.origin, SearchOrigin::Immediate);
+    immediate.make_move(Move::from_index(4).unwrap()).unwrap();
+    let terminal = AlphaBetaEngine::with_config(PatternEvaluator, config())
+        .search(&immediate, SearchLimits::new(1));
+    assert_eq!(terminal.origin, SearchOrigin::Terminal);
+}
+
+#[test]
+fn replacing_an_evaluator_clears_evaluator_dependent_tt_entries() {
+    let position = fixture(&[112, 97, 128, 113]);
+    let mut engine = AlphaBetaEngine::with_config(PatternEvaluator, config());
+    engine.search(&position, SearchLimits::new(2));
+    let key = PositionKey::from_position(&position).value();
+    assert!(engine.table.probe(key).is_some());
+    engine.replace_evaluator(PatternEvaluator);
+    assert!(engine.table.probe(key).is_none());
 }
 
 #[test]
@@ -179,22 +223,23 @@ struct AuditEvaluator<'a> {
 impl Evaluator for AuditEvaluator<'_> {
     type State = usize;
     type Undo = usize;
-    fn initialize(&self, position: &Position) -> usize {
+    fn initialize(&self, position: &Position, _patterns: &crate::PatternState) -> usize {
         Move::all()
             .filter(|&at| position.cell(at).is_some())
             .map(|at| at.index() + 1)
             .sum()
     }
-    fn make_move(&self, state: &mut usize, at: Move, _stone: Stone) -> usize {
+    fn make_move(&self, state: &mut usize, delta: &crate::PatternDelta) -> usize {
         let undo = *state;
+        let at = delta.played_move();
         *state += at.index() + 1;
         undo
     }
-    fn unmake_move(&self, state: &mut usize, undo: usize) {
+    fn unmake_move(&self, state: &mut usize, _delta: &crate::PatternDelta, undo: usize) {
         *state = undo;
     }
     fn evaluate(&self, position: &Position, patterns: &crate::PatternState, state: &usize) -> i32 {
-        assert_eq!(*state, self.initialize(position));
+        assert_eq!(*state, self.initialize(position, patterns));
         if self.armed.swap(false, Ordering::Relaxed) {
             if let Some(delay) = self.delay {
                 std::thread::sleep(delay);
@@ -257,6 +302,7 @@ fn deadline_inside_an_iteration_returns_previous_depth_and_zero_time_falls_back(
     );
     assert_eq!(zero.termination, SearchTermination::TimeLimit);
     assert_eq!(zero.completed_depth, 0);
+    assert_eq!(zero.origin, SearchOrigin::Fallback);
     let armed = AtomicBool::new(false);
     // Depth one on an empty board visits two nodes. The long margin avoids
     // wall-clock races during that setup, then the evaluator crosses the limit.
@@ -348,9 +394,12 @@ fn interrupted_recursion_restores_all_sidecars_and_does_not_store_root_bound() {
 
 #[test]
 fn proof_work_shares_outer_limit_but_local_exhaustion_falls_through_and_proofs_emit_info() {
-    for (indices, vcf) in [
-        (&[108, 107, 109, 0, 110, 2, 66, 4, 81, 6][..], true),
-        (&[110, 0, 111, 14, 82, 210, 97, 224][..], false),
+    for (indices, expected_origin) in [
+        (
+            &[108, 107, 109, 0, 110, 2, 66, 4, 81, 6][..],
+            SearchOrigin::Vcf,
+        ),
+        (&[110, 0, 111, 14, 82, 210, 97, 224][..], SearchOrigin::Vct),
     ] {
         let position = fixture(indices);
         let config = EngineConfig::new(1);
@@ -363,7 +412,7 @@ fn proof_work_shares_outer_limit_but_local_exhaustion_falls_through_and_proofs_e
             limited.statistics.vcf_budget_exhausted + limited.statistics.vct_budget_exhausted,
             0
         );
-        let config = if vcf {
+        let config = if expected_origin == SearchOrigin::Vcf {
             config.with_vcf_limits(11, 1).with_vct_limits(0, 0)
         } else {
             config.with_vct_limits(9, 1)
@@ -385,6 +434,7 @@ fn proof_work_shares_outer_limit_but_local_exhaustion_falls_through_and_proofs_e
                 &mut |info| infos.push(info),
             );
         assert_eq!(proof.termination, SearchTermination::Completed);
+        assert_eq!(proof.origin, expected_origin);
         assert_eq!(infos.len(), 1);
         assert!(infos[0].proof.is_some());
         same_iteration(&proof, &infos[0]);

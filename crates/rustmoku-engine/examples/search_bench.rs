@@ -1,13 +1,15 @@
 use std::{
     env,
     error::Error,
+    path::PathBuf,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
 use rustmoku_core::{Move, Position};
 use rustmoku_engine::{
-    AlphaBetaEngine, ClassicalEvaluator, EngineConfig, Evaluator, PatternEvaluator, SearchEngine,
-    SearchLimits, SearchResult, TranspositionTableStatistics,
+    AlphaBetaEngine, ClassicalEvaluator, EngineConfig, Evaluator, LearnedEvaluator, LearnedModel,
+    PatternEvaluator, SearchEngine, SearchLimits, SearchResult, TranspositionTableStatistics,
 };
 
 const OPENING: &[(usize, usize)] = &[(7, 7), (6, 7), (8, 8), (7, 8)];
@@ -94,12 +96,19 @@ struct Fixture {
     depth: u8,
 }
 
+enum EvaluatorChoice {
+    Pattern,
+    Classical,
+    Learned(PathBuf),
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let mut depth = 4;
-    let mut classical = false;
+    let mut evaluator = EvaluatorChoice::Pattern;
     let mut memory_mib = 64;
     let mut threads = 1;
     let mut repeats = 5;
+    let mut max_nodes = None;
     let mut fixture_filter = None;
     let mut vcf_plies = EngineConfig::DEFAULT_VCF_MAX_PLIES;
     let mut vcf_nodes = EngineConfig::DEFAULT_VCF_MAX_NODES;
@@ -116,15 +125,22 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
             }
             "--evaluator" => {
-                classical = match args.next().as_deref() {
-                    Some("pattern") => false,
-                    Some("classical") => true,
-                    _ => return Err("--evaluator requires pattern or classical".into()),
-                }
+                evaluator = match args.next().as_deref() {
+                    Some("pattern") => EvaluatorChoice::Pattern,
+                    Some("classical") => EvaluatorChoice::Classical,
+                    Some("learned") => EvaluatorChoice::Learned(PathBuf::new()),
+                    _ => {
+                        return Err("--evaluator requires pattern, classical, or learned".into());
+                    }
+                };
+            }
+            "--model" => {
+                evaluator = EvaluatorChoice::Learned(args.next().ok_or("missing model")?.into())
             }
             "--depth" => depth = args.next().ok_or("missing depth")?.parse()?,
             "--tt-mib" => memory_mib = args.next().ok_or("missing MiB")?.parse()?,
             "--threads" => threads = args.next().ok_or("missing threads")?.parse()?,
+            "--nodes" => max_nodes = Some(args.next().ok_or("missing nodes")?.parse()?),
             "--repeats" => repeats = args.next().ok_or("missing repeats")?.parse::<usize>()?,
             "--vcf-plies" => vcf_plies = args.next().ok_or("missing VCF plies")?.parse()?,
             "--vcf-nodes" => vcf_nodes = args.next().ok_or("missing VCF nodes")?.parse()?,
@@ -137,6 +153,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     if repeats == 0 {
         return Err("repeats must be positive".into());
+    }
+    if matches!(&evaluator, EvaluatorChoice::Learned(path) if path.as_os_str().is_empty()) {
+        return Err("learned evaluator requires --model FILE".into());
     }
     let fixtures = [
         Fixture {
@@ -214,10 +233,38 @@ fn main() -> Result<(), Box<dyn Error>> {
         {
             continue;
         }
-        if classical {
-            benchmark(fixture, ClassicalEvaluator, "classical", config, repeats);
-        } else {
-            benchmark(fixture, PatternEvaluator, "pattern", config, repeats);
+        match &evaluator {
+            EvaluatorChoice::Pattern => {
+                benchmark(
+                    fixture,
+                    PatternEvaluator,
+                    "pattern",
+                    config,
+                    repeats,
+                    max_nodes,
+                );
+            }
+            EvaluatorChoice::Classical => {
+                benchmark(
+                    fixture,
+                    ClassicalEvaluator,
+                    "classical",
+                    config,
+                    repeats,
+                    max_nodes,
+                );
+            }
+            EvaluatorChoice::Learned(path) => {
+                let model = Arc::new(LearnedModel::read_from_path(path)?);
+                benchmark(
+                    fixture,
+                    LearnedEvaluator::new(model),
+                    "learned",
+                    config,
+                    repeats,
+                    max_nodes,
+                );
+            }
         }
     }
     Ok(())
@@ -229,11 +276,15 @@ fn benchmark<E: Evaluator>(
     name: &str,
     config: EngineConfig,
     repeats: usize,
+    max_nodes: Option<u64>,
 ) {
     let position = build_position(fixture.moves);
     let memory_mib = config.tt_memory_mib();
     let mut engine = AlphaBetaEngine::with_config(evaluator, config);
-    let limits = SearchLimits::new(fixture.depth);
+    let limits = max_nodes.map_or_else(
+        || SearchLimits::new(fixture.depth),
+        |nodes| SearchLimits::new(fixture.depth).with_max_nodes(nodes),
+    );
     let reference = engine.search(&position, limits); // Untimed warm-up, cold TT below.
     let mut samples = Vec::with_capacity(repeats);
     for _ in 0..repeats {

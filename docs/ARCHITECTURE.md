@@ -1,9 +1,9 @@
-# RustMoku V0.11 Architecture
+# RustMoku V0.12 Architecture
 
-V0.11 adds a deterministic offline AND/OR proof solver, exact D4 identity,
-resumable generation, and an independently verified Freestyle Proof Book to the
-V0.10 classical engine. Classical recursive search and its V0.9/V0.10 TT and
-selectivity protocols remain unchanged; learned evaluation remains future work.
+V0.12 adds a reversible game timeline, a quantized learned local-pattern
+Value/Policy evaluator, deterministic teacher datasets and offline PyTorch
+tooling. It also hardens V0.11 checkpoints and Proof Book verification. Classical
+recursive search and its V0.9/V0.10 TT/selectivity protocols remain intact.
 Core remains authoritative for legality and wins; Native remains an adapter.
 All first-party crates forbid unsafe code. Concurrency uses only the standard library.
 Milestone scope and future work live in [ROADMAP.md](ROADMAP.md).
@@ -16,6 +16,7 @@ rustmoku-native -> rustmoku-core
 rustmoku-native -> rustmoku-engine
 rustmoku-arena -> rustmoku-core + rustmoku-engine
 rustmoku-solver -> rustmoku-core + rustmoku-engine
+rustmoku-data -> rustmoku-core + rustmoku-engine
 ```
 
 `rustmoku-core` has no third-party dependencies and owns Gomoku semantics.
@@ -73,10 +74,13 @@ checked. There are no forbidden moves or Swap protocols.
 `Game` owns real-game status (`Ongoing`, `Won`, or `Draw`) separately from
 `Position`. Search consumes `&Position`, never `Game` or GUI state.
 
-Game owns a private Vec of played Move plus opaque MoveUndo, appended only after
-a legal transition. `history()` is a read-only chronological Move iterator.
-`undo()` consumes the last token; `undo_plies(n)` removes up to n plies and safely
-stops at empty. Position, side, last move and winner are restored by Core undo;
+Game owns a private current line of Move plus opaque MoveUndo and a future Move
+stack. `history()` is a read-only chronological iterator over only the current
+line. `undo()` consumes the last token and pushes its Move into the future;
+`redo()` replays the next historical Move through normal legality/status logic
+and creates a fresh token. Batched operations stop at their respective ends.
+A successful new move after Undo clears the future only after Core accepts it;
+an illegal attempt preserves the branch. Position, side, last move and winner are restored by Core undo;
 the predecessor of every accepted game move was Ongoing, so status restores to
 Ongoing. Tokens remain private record implementation data and are never exported.
 History allocation occurs only for played/imported games, never in search nodes.
@@ -87,7 +91,7 @@ parsing accepts lowercase, rejecting out-of-range or malformed coordinates.
 Internal coordinates, Zobrist and pattern geometry are unchanged. Every adapter
 uses this codec; even board-axis labels derive from formatted Moves.
 
-Records contain `RustMoku 1`, `rules=freestyle` and `moves=` followed by the complete
+Records contain `RustMoku 1`, `rules=freestyle` and `moves=` followed by the current
 ordered sequence. Core's Game::from_record creates a fresh Game and calls
 play_move for every token. Version/rules/syntax/coordinate errors and illegal
 replay errors include the relevant line or ply. Formatting is deterministic with
@@ -114,12 +118,13 @@ never ordinary TT lookup, move generation, or recursive Alpha-Beta.
 ## Engine boundary and ownership
 
 The intentionally small public surface includes `Evaluator`, `ClassicalEvaluator`,
-`PatternEvaluator`, opaque `PatternState`,
+`PatternEvaluator`, `LearnedModel`, `LearnedEvaluator`, `RuntimeEvaluator`,
+opaque `PatternState` and `PatternDelta`,
 `SearchEngine`, `AlphaBetaEngine`, `EngineConfig`, `TacticalConfig`, `ProofLimits`, `SearchLimits`,
 `SearchResult`, `SearchInfo`, `SearchObserver`, `CancellationToken`,
-`SearchTermination`, `Proof`, `ProofSource`, `ProofDistance`, `SearchStatistics`, and
-`TranspositionTableStatistics`. `PatternUndo` is private; the public PatternState
-API debt is deferred to the NNUE/custom-evaluator milestone. Candidate lists,
+`SearchTermination`, `SearchOrigin`, `Proof`, `ProofSource`, `ProofDistance`, `SearchStatistics`, and
+`TranspositionTableStatistics`. `PatternUndo` and line geometry stay private;
+evaluators receive only the opaque bounded delta needed by their lifecycle. Candidate lists,
 ordering, hashes, search-side state, TT entries, and PV tables remain private.
 
 `SearchEngine::search` takes `&mut self` because `AlphaBetaEngine` owns the
@@ -140,7 +145,7 @@ AlphaBetaEngine<E>                  evaluator configuration + ordinary TT + VCF/
       PositionKey                  incremental Zobrist key
       CandidateFrontier            occupancy/frontier bits and neighbor counts
       PatternState                 exactly one shared tactical state
-    E::State                       evaluator-specific only (currently unit)
+    E::State                       worker-local evaluator state
 ```
 
 Normal recursion calls SearchState make/unmake, coordinating BoardUndo with
@@ -165,17 +170,28 @@ cancellation remain Unknown. Static evaluation and Alpha-Beta scores are never
 proof evidence. Completed results may be reused only under the collision-free
 D4 key plus rules/attacker context; unresolved nodes remain an ordinary tree.
 
+Every exact cache value, ProvenWin or Refuted, retains a canonical source node;
+cache hits use explicit Cached evidence and never masquerade as terminal facts.
+An unresolved selected node rechecks this cache before expansion, reducing
+avoidable duplicate transposition work while retaining the deterministic tree.
+
 Solver checkpoints have their own magic/version and store the root record, tree,
 expansion cursors, proof numbers, evidence, and cumulative diagnostics. Loading
 legally replays the root and every parent transition and validates identities,
 counts, links, numbers, and ordering. A temporary sibling is synced before the
-previous checkpoint is replaced. Checkpoints are not Proof Books.
+previous checkpoint is replaced. Reader, writer and resident defaults share a
+100,000-node persistence cap; the writer rejects excess with a typed error before
+atomic replacement. Checkpoints are not Proof Books.
 
 The Proof Book codec is documented in [PROOF_BOOK.md](PROOF_BOOK.md). Parsed
 `ProofBook` is structurally valid but untrusted. Verification starts from every
 ordered root, follows normal legal transitions, recomputes D4 keys, checks each
 attacker action, enumerates every defender legal reply, rejects cycles and
 unreachable records, and reruns tactical leaves with fresh board-only solvers.
+Default verification rejects encoded tactical requests above 31 plies or
+1,000,000 nodes per leaf before search. Within one pass, a verified canonical
+entry/distance is memoized separately from the recursion-stack cycle detector;
+every new verify call starts empty.
 Only `VerifiedProofBook` can be attached to `AlphaBetaEngine` through immutable
 `Arc` ownership.
 
@@ -203,12 +219,37 @@ perspective. Transition callbacks are infallible after Core accepts a move;
 callers preserve the lifecycle and LIFO contract.
 
 SearchState owns exactly one always-present `PatternState`, independently of the
-evaluator. Ordering and qsearch read this same tactical state. Both current
-evaluators have `State = ()`, `Undo = ()`: PatternEvaluator reads the shared
-counts; ClassicalEvaluator ignores patterns and retains full reference scoring.
-Future evaluators can own their own accumulator through the existing lifecycle.
-On Windows x64, profile bitsets add 576 bytes: default SearchState is now 4,344
-bytes (V0.4: 3,768), still with exactly one PatternState and unit evaluator state.
+evaluator. Ordering and qsearch read this same tactical state. Pattern and
+Classical use unit state. Learned uses immutable shared model weights plus one
+independent pair of 16-dimensional i32 accumulators per Alpha-Beta worker.
+`RuntimeEvaluator` is a static enum adapter, not per-node dynamic dispatch.
+Replacing its definition clears all ordinary TT entries; proof caches remain
+evaluator-independent.
+
+The learned feature table covers every u16 `LineKey` without hashing. One root
+scan sums 225 x 4 side-relative embeddings. Thereafter the opaque fixed-capacity
+`PatternDelta` carries only the old/new keys for the at-most-32 line influences
+already maintained by PatternState. Make/unmake subtracts/adds those embeddings
+exactly, with no Vec, lock, allocation, or duplicated geometry. Value is clamped
+to +/-10,000,000; Policy scores only candidate moves and cannot affect pruning,
+reduction, proof, or tactical classification.
+
+### Dataset and training boundary
+
+`rustmoku-data` is an allocating offline app. It labels replayed records or
+seeded self-play with one persistent thread-one teacher engine per data worker;
+workers share no engine or TT. Game seeds derive only from the explicit base
+seed and stable game index, and output is sorted by `(game_id, ply)` before its
+checked fixed-width little-endian encoding. Records carry the canonical 58-byte
+position, explicit D4 transform, teacher Value and canonical best move, result
+origin/exact flag, game ID and ply. The format is Freestyle-only and does not
+contain Native timing.
+
+Python memory-maps and validates this format, partitions whole game IDs before
+sampling, and applies D4 only to training examples. Validation/test keep the
+canonical unaugmented view. PyTorch float checkpoints remain offline artifacts;
+only explicitly quantized, bounded model version 1 files enter the Rust parser.
+The exact model contract is in [LEARNED_MODEL.md](LEARNED_MODEL.md).
 
 ### Zobrist
 
@@ -306,6 +347,8 @@ changed direction, and updates its packed DirectionSet. If its class changes,
 an empty center's profile is refreshed; counts change only if the profile did.
 Playing a cell removes its own profile; undo restores it using its cached keys.
 Occupied-center keys/classes are also maintained, so undo needs no line snapshot.
+Each accepted move also returns the corresponding opaque old/new `PatternDelta`
+to the evaluator lifecycle; the delta is Copy and fixed-size.
 
 `PatternEvaluator::evaluate` reads nine counter differences, applies centralized
 weights, chooses the side-to-move perspective, and clamps to +/-10,000,000. It
@@ -623,6 +666,8 @@ and `vcf_budget_exhausted` report proof work separately from Alpha-Beta nodes/qn
 - `seldepth`: maximum ply visited or resolved in an immediate proof prefix;
 - `proof`: optional VCF/VCT/ProofBook source and exact/at-most distance metadata,
   with no completed nominal iteration;
+- `origin`: explicit Analysis/Fallback/AlphaBeta/Terminal/Immediate/VCF/VCT/Book
+  provenance, separate from mathematical proof;
 - `principal_variation`: a legal searched prefix whose first move equals
   `best_move` when one exists.
 
@@ -856,7 +901,7 @@ histories. Fresh engines and node limits provide reproducible Arena experiments.
 
 The eframe/egui UI draws public Game/Position state, translates validated Moves,
 and displays completed depth, seldepth, total work, qnodes, worker count, score,
-TT statistics, PV and proof distance. Its human-play profile defaults to depth 8,
+TT statistics, PV, honest result origin and proof distance. Its human-play profile defaults to depth 8,
 Auto threads capped at eight logical workers, 128 MiB ordinary TT primary
 capacity, 15 seconds per move, and move numbers enabled. Depth (1..12), Auto or
 manual thread count, ordinary TT MiB, and optional move time (0 = unlimited)
@@ -869,7 +914,7 @@ AlphaBetaEngine. An mpsc request carries a monotonically increasing u64 ID, owne
 Position snapshot, limits and fresh token. During one request the engine
 temporarily scopes its principal plus helper Alpha-Beta workers; the outer Native
 worker remains persistent. A separate mpsc channel returns tagged SearchInfo and
-SearchResult events. Request payloads are boxed once off the hot path; channels
+a final SearchResult plus worker-measured elapsed time. Request payloads are boxed once off the hot path; channels
 never block the search on UI consumption, and events are coarse. Ordinary TT
 allocation/history survives consecutive moves unless the user changes TT MiB,
 which is sent as an owner-thread reconfiguration and starts an empty table.
@@ -882,19 +927,24 @@ Threads or TT MiB first cancels/invalidates the active ID, sends a FIFO command
 to the owning thread, and starts a replacement search only when the game still
 needs one. Only a current,
 non-cancelled result can call Game::play_move, with an ongoing game and AI turn.
-Input cannot enqueue duplicate AI moves. While searching, UI frames poll events
-and request repaint every 16 ms; New Game invalidates immediately, regardless
+Input cannot enqueue duplicate AI moves. While a live turn timer exists, UI
+frames poll events and request repaint about every 100 ms; New Game invalidates immediately, regardless
 of when the old worker search notices cancellation. Drop cancels, sends Shutdown
 and joins; no engine lock, async runtime or detached thread exists.
 
 ### Native local-game session and stable layout
 
-The UI stores an undo_floor separate from Game/Position. Selecting an opening
+The UI stores an undo_floor and timing metadata parallel to Game's current/future
+timeline, separate from Game/Position. Selecting an opening
 sets it to that replayed history length; importing a record starts with floor
 zero. Human-decision Undo locates the last human stone after the floor and undoes
 it and subsequent replies. A pending AI reply means one ply is removed; a finished
 reply normally means two. Terminal states use the same rule. There is no prior
-human decision behind an initial AI move, so Undo is disabled there. The UI
+human decision behind an initial AI move, so Undo is disabled there. Redo replays
+historical human and AI moves to the next decision without searching; a partial
+timeline launches AI only when no historical AI move remains. Original finalized
+times follow replay. Imported/opening moves have no fabricated time, and timing
+never enters records. The UI
 cancels/advances its ID before mutation, clears displayed search state, and checks
 whether the restored side requires a new AI request. Game edits do not clear or
 resize the worker's ordinary TT.
@@ -922,7 +972,7 @@ replays one of twelve shared fixed legal opening prefixes through Game for each
 paired leg: A is Black then White on the same board. Both engines are fresh per
 game; their ordinary TTs persist between that game's moves. Player-specific
 EngineConfig includes an independent Alpha-Beta thread count, TT size and
-Pattern/Classical evaluator selection; a move may temporarily fan out its own
+Pattern/Classical/Learned evaluator selection and optional model path; a move may temporarily fan out its own
 Lazy-SMP team. Common positive depth and optional global node limits apply per
 move. The board fills or Core declares a winner; there is no heuristic
 adjudication or arbitrary move cutoff.
@@ -936,10 +986,10 @@ are useful for scaling/strength experiments and may be schedule-dependent. There
 are no random openings, parallel matches, Elo estimates or tournament
 infrastructure.
 
-## Explicit V0.10 non-goals
+## Explicit V0.12 non-goals
 
 No Null Move, ProbCut, singular extension, qsearch TT, interior VCF/VCT,
-NNUE, policy networks, SIMD optimization, unsafe code, MCTS, AlphaZero,
+policy-based reduction/pruning, explicit SIMD optimization, unsafe code, MCTS, AlphaZero,
 Transformer evaluation, GPU compute, opening database, server/protocol layer,
 full-game clocks, SPRT/Elo framework, Renju, Swap/Swap2, or a generic persistent
 thread pool. Core's backing storage remains 225 cells. Future scope is in

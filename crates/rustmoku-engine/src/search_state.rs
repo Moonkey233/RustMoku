@@ -20,9 +20,11 @@ pub(crate) struct SearchUndo<U> {
 
 impl<E: Evaluator> SearchState<E> {
     pub(crate) fn new(position: &Position, evaluator: &E) -> Self {
+        let board = BoardState::new(position);
+        let evaluator_state = evaluator.initialize(board.position(), board.patterns());
         Self {
-            board: BoardState::new(position),
-            evaluator_state: evaluator.initialize(position),
+            board,
+            evaluator_state,
         }
     }
 
@@ -44,6 +46,10 @@ impl<E: Evaluator> SearchState<E> {
 
     pub(crate) fn evaluate(&self, evaluator: &E) -> i32 {
         evaluator.evaluate(self.position(), self.patterns(), &self.evaluator_state)
+    }
+
+    pub(crate) fn policy_score(&self, evaluator: &E, at: Move) -> Option<i32> {
+        evaluator.policy_score(self.position(), self.patterns(), &self.evaluator_state, at)
     }
 
     /// The solver restores the board before returning an owned result. No mutable
@@ -73,14 +79,17 @@ impl<E: Evaluator> SearchState<E> {
         at: Move,
         evaluator: &E,
     ) -> Result<SearchUndo<E::Undo>, MoveError> {
-        let stone = self.position().side_to_move();
         let board = self.board.make_move(at)?;
-        let evaluator = evaluator.make_move(&mut self.evaluator_state, at, stone);
+        let evaluator = evaluator.make_move(&mut self.evaluator_state, &board.pattern_delta());
         Ok(SearchUndo { board, evaluator })
     }
 
     pub(crate) fn unmake_move(&mut self, undo: SearchUndo<E::Undo>, evaluator: &E) {
-        evaluator.unmake_move(&mut self.evaluator_state, undo.evaluator);
+        evaluator.unmake_move(
+            &mut self.evaluator_state,
+            &undo.board.pattern_delta(),
+            undo.evaluator,
+        );
         self.board.unmake_move(undo.board);
     }
 
@@ -90,15 +99,12 @@ impl<E: Evaluator> SearchState<E> {
         E::State: std::fmt::Debug + PartialEq,
     {
         self.board.assert_consistent();
-        let reference = evaluator.initialize(self.position());
+        let reference_patterns = PatternState::reference(self.position());
+        let reference = evaluator.initialize(self.position(), &reference_patterns);
         assert_eq!(self.evaluator_state, reference);
         assert_eq!(
             self.evaluate(evaluator),
-            evaluator.evaluate(
-                self.position(),
-                &PatternState::reference(self.position()),
-                &reference
-            )
+            evaluator.evaluate(self.position(), &reference_patterns, &reference)
         );
     }
 }

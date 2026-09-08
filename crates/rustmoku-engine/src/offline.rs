@@ -31,7 +31,11 @@ const INFINITY: u64 = u64::MAX / 4;
 const WIDEN_BATCH: usize = 4;
 const CHECKPOINT_MAGIC: &[u8; 8] = b"RMPCHK01";
 const CHECKPOINT_VERSION: u16 = 1;
-const MAX_CHECKPOINT_NODES: usize = 100_000;
+/// A persisted node contains a full 225-cell Position plus three Vec headers and
+/// proof metadata. Capping checkpoints at 100k nodes bounds both the resident
+/// tree and loader allocation to a practical few-dozen-MiB baseline before the
+/// variable move/child buffers are counted.
+pub const MAX_PERSISTED_SOLVER_NODES: usize = 100_000;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ProofOutcome {
@@ -56,7 +60,7 @@ impl SolverLimits {
         Self {
             max_work_nodes,
             max_duration: None,
-            max_resident_nodes: None,
+            max_resident_nodes: Some(MAX_PERSISTED_SOLVER_NODES),
             vcf: ProofLimits::new(7, 1_000),
             vct: ProofLimits::new(7, 2_000),
         }
@@ -70,7 +74,11 @@ impl SolverLimits {
 
     #[must_use]
     pub const fn with_max_resident_nodes(mut self, nodes: usize) -> Self {
-        self.max_resident_nodes = Some(nodes);
+        self.max_resident_nodes = Some(if nodes < MAX_PERSISTED_SOLVER_NODES {
+            nodes
+        } else {
+            MAX_PERSISTED_SOLVER_NODES
+        });
         self
     }
 
@@ -131,6 +139,7 @@ pub struct SolverResult {
 pub enum SolverError {
     Io(io::Error),
     Invalid(&'static str),
+    PersistedNodeLimit { nodes: usize, maximum: usize },
     Incomplete,
 }
 
@@ -139,6 +148,10 @@ impl fmt::Display for SolverError {
         match self {
             Self::Io(error) => write!(formatter, "offline solver I/O error: {error}"),
             Self::Invalid(message) => write!(formatter, "invalid solver state: {message}"),
+            Self::PersistedNodeLimit { nodes, maximum } => write!(
+                formatter,
+                "solver has {nodes} resident nodes, exceeding checkpoint limit {maximum}"
+            ),
             Self::Incomplete => formatter.write_str("the root is not a proven win"),
         }
     }
@@ -148,7 +161,7 @@ impl std::error::Error for SolverError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(error) => Some(error),
-            Self::Invalid(_) | Self::Incomplete => None,
+            Self::Invalid(_) | Self::PersistedNodeLimit { .. } | Self::Incomplete => None,
         }
     }
 }
@@ -215,7 +228,7 @@ impl Node {
 #[derive(Clone, Copy, Debug)]
 struct Cached {
     outcome: ProofOutcome,
-    source: Option<usize>,
+    source: usize,
 }
 
 /// Single-thread deterministic proof-number manager for one fixed attacker.
@@ -374,6 +387,9 @@ impl OfflineSolver {
         if self.nodes[id].outcome != ProofOutcome::Unknown {
             return;
         }
+        if self.adopt_cached_exact(id) {
+            return;
+        }
         if !self.nodes[id].oracle_done {
             self.nodes[id].oracle_done = true;
             self.statistics.expanded_nodes += 1;
@@ -419,7 +435,7 @@ impl OfflineSolver {
                 && let Some(cached) = cached
             {
                 child.set_outcome(cached.outcome);
-                child.evidence = cached.source.map_or(Evidence::Terminal, Evidence::Cached);
+                child.evidence = Evidence::Cached(cached.source);
                 self.statistics.exact_cache_hits += 1;
             }
             let child_id = self.nodes.len();
@@ -584,8 +600,25 @@ impl OfflineSolver {
         let key = context_key(&self.nodes[id].position, self.attacker);
         self.exact.entry(key).or_insert(Cached {
             outcome,
-            source: (outcome == ProofOutcome::ProvenWin).then_some(id),
+            source: id,
         });
+    }
+
+    /// A duplicate may have been selected before an equivalent node finished.
+    /// Rechecking here avoids solving a second deterministic tree branch while
+    /// preserving the first completed node as the canonical source.
+    fn adopt_cached_exact(&mut self, id: usize) -> bool {
+        let key = context_key(&self.nodes[id].position, self.attacker);
+        let Some(cached) = self.exact.get(&key).copied() else {
+            return false;
+        };
+        if cached.source == id || cached.source >= id {
+            return false;
+        }
+        self.nodes[id].set_outcome(cached.outcome);
+        self.nodes[id].evidence = Evidence::Cached(cached.source);
+        self.statistics.exact_cache_hits += 1;
+        true
     }
 
     fn refresh_statistics(&mut self) {
@@ -746,17 +779,32 @@ impl OfflineSolver {
     }
 
     pub fn save_checkpoint(&self, path: impl AsRef<Path>) -> Result<(), SolverError> {
+        check_persisted_node_count(self.nodes.len())?;
         atomic_write(path.as_ref(), |file| {
             self.write_checkpoint(file).map_err(|error| match error {
                 SolverError::Io(error) => crate::ProofBookError::Io(error),
                 SolverError::Invalid(message) => crate::ProofBookError::Invalid(message),
+                SolverError::PersistedNodeLimit { .. } => {
+                    crate::ProofBookError::Invalid("checkpoint node capacity")
+                }
                 SolverError::Incomplete => crate::ProofBookError::Invalid("incomplete checkpoint"),
             })
         })
         .map_err(SolverError::Io)
     }
 
+    #[cfg(test)]
+    fn save_checkpoint_with_test_count(
+        &self,
+        path: impl AsRef<Path>,
+        persisted_nodes: usize,
+    ) -> Result<(), SolverError> {
+        check_persisted_node_count(persisted_nodes)?;
+        self.save_checkpoint(path)
+    }
+
     fn write_checkpoint(&self, writer: &mut impl Write) -> Result<(), SolverError> {
+        check_persisted_node_count(self.nodes.len())?;
         writer
             .write_all(CHECKPOINT_MAGIC)
             .map_err(SolverError::Io)?;
@@ -843,9 +891,7 @@ impl OfflineSolver {
         let mut statistics = statistics_from_values(&values)?;
         let node_count = usize::try_from(decoder.u32()?)
             .map_err(|_| SolverError::Invalid("checkpoint node count"))?;
-        if node_count == 0 || node_count > MAX_CHECKPOINT_NODES {
-            return Err(SolverError::Invalid("checkpoint node count"));
-        }
+        check_persisted_node_count(node_count)?;
         let mut nodes: Vec<Node> = Vec::with_capacity(node_count);
         for id in 0..node_count {
             let parent = decoder.optional_index()?;
@@ -1070,6 +1116,16 @@ fn ordered_legal_moves(position: &Position) -> Vec<Move> {
 
 fn saturated_add(left: u64, right: u64) -> u64 {
     left.saturating_add(right).min(INFINITY)
+}
+
+fn check_persisted_node_count(nodes: usize) -> Result<(), SolverError> {
+    if nodes == 0 || nodes > MAX_PERSISTED_SOLVER_NODES {
+        return Err(SolverError::PersistedNodeLimit {
+            nodes,
+            maximum: MAX_PERSISTED_SOLVER_NODES,
+        });
+    }
+    Ok(())
 }
 
 pub(crate) fn verify_immediate(position: &Position, attacker: Stone) -> Option<u8> {
@@ -1452,6 +1508,128 @@ mod tests {
     }
 
     #[test]
+    fn cached_nonterminal_refutation_checkpoint_round_trips() {
+        fn ensure_child(solver: &mut OfflineSolver, parent: usize, at: Move) -> usize {
+            if let Some(child) = solver.nodes[parent]
+                .children
+                .iter()
+                .find(|child| child.at == at)
+            {
+                return child.node;
+            }
+            let target = solver.nodes[parent]
+                .ordered_moves
+                .iter()
+                .position(|&candidate| candidate == at)
+                .unwrap();
+            while solver.nodes[parent].next_unexpanded <= target {
+                let next = solver.nodes[parent].ordered_moves[solver.nodes[parent].next_unexpanded];
+                solver.nodes[parent].next_unexpanded += 1;
+                let mut position = solver.nodes[parent].position.clone();
+                position.make_move(next).unwrap();
+                let id = solver.nodes.len();
+                solver
+                    .nodes
+                    .push(Node::new(Some(parent), Some(next), position));
+                solver.nodes[parent]
+                    .children
+                    .push(Child { at: next, node: id });
+            }
+            solver.nodes[parent]
+                .children
+                .iter()
+                .find(|child| child.at == at)
+                .unwrap()
+                .node
+        }
+
+        let mut game = Game::default();
+        for at in ["G8", "A1", "H8", "A2"].map(|text| text.parse().unwrap()) {
+            game.play_move(at).unwrap();
+        }
+        let mut solver = OfflineSolver::new(&game, Stone::White).unwrap();
+        let path_a = ["I8", "B1", "J8", "B2"].map(|text| text.parse().unwrap());
+        let path_b = ["J8", "B2", "I8", "B1"].map(|text| text.parse().unwrap());
+        let source = path_a
+            .into_iter()
+            .fold(0, |parent, at| ensure_child(&mut solver, parent, at));
+        assert_eq!(
+            immediate_exact_outcome(&solver.nodes[source].position, Stone::White),
+            Some(ProofOutcome::Refuted)
+        );
+        solver.nodes[source].set_outcome(ProofOutcome::Refuted);
+        solver.nodes[source].evidence = Evidence::Immediate;
+        solver.cache_if_exact(source);
+        let duplicate = path_b
+            .into_iter()
+            .fold(0, |parent, at| ensure_child(&mut solver, parent, at));
+        assert!(solver.adopt_cached_exact(duplicate));
+        assert_eq!(solver.nodes[duplicate].evidence, Evidence::Cached(source));
+        solver.refresh_statistics();
+
+        let path = std::env::temp_dir().join(format!(
+            "rustmoku-refuted-cache-checkpoint-{}.bin",
+            std::process::id()
+        ));
+        solver.save_checkpoint(&path).unwrap();
+        let mut resumed = OfflineSolver::load_checkpoint(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(resumed.nodes[duplicate].evidence, Evidence::Cached(source));
+        let result = resumed.solve(SolverLimits::new(0));
+        assert_eq!(result.statistics.resident_nodes, solver.nodes.len());
+    }
+
+    #[test]
+    fn checkpoint_capacity_is_shared_and_failed_save_preserves_previous_file() {
+        assert_eq!(
+            SolverLimits::new(u64::MAX).max_resident_nodes,
+            Some(MAX_PERSISTED_SOLVER_NODES)
+        );
+        assert!(check_persisted_node_count(MAX_PERSISTED_SOLVER_NODES).is_ok());
+        assert!(matches!(
+            check_persisted_node_count(MAX_PERSISTED_SOLVER_NODES + 1),
+            Err(SolverError::PersistedNodeLimit { .. })
+        ));
+        let solver = OfflineSolver::new(&Game::default(), Stone::Black).unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "rustmoku-capacity-checkpoint-{}.bin",
+            std::process::id()
+        ));
+        solver.save_checkpoint(&path).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert!(matches!(
+            solver.save_checkpoint_with_test_count(&path, MAX_PERSISTED_SOLVER_NODES + 1),
+            Err(SolverError::PersistedNodeLimit { .. })
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn proof_book_rejects_untrusted_tactical_budget_before_verification() {
+        let game = vcf_fixture();
+        let mut solver = OfflineSolver::new(&game, Stone::Black).unwrap();
+        solver.solve(
+            SolverLimits::new(10_000)
+                .with_vcf(ProofLimits::new(7, 5_000))
+                .with_vct(ProofLimits::new(0, 0)),
+        );
+        let mut book = solver.export_proof_book().unwrap();
+        let leaf = book
+            .entries
+            .iter_mut()
+            .find(|entry| matches!(entry.action, StoredAction::Vcf { .. }))
+            .unwrap();
+        if let StoredAction::Vcf { max_nodes, .. } = &mut leaf.action {
+            *max_nodes = crate::ProofBookVerifyLimits::default().max_tactical_nodes_per_leaf + 1;
+        }
+        assert!(matches!(
+            book.verify(),
+            Err(crate::ProofBookError::VerificationLimit(_))
+        ));
+    }
+
+    #[test]
     fn verified_query_and_runtime_hit_follow_d4_orientation() {
         let game = fixture();
         let mut solver = OfflineSolver::new(&game, Stone::Black).unwrap();
@@ -1500,6 +1678,7 @@ mod tests {
         let mut engine = AlphaBetaEngine::new(PatternEvaluator).with_proof_book(tactical_book);
         let result = engine.search(tactical_game.position(), SearchLimits::new(1));
         assert_eq!(result.best_move, Some(expected));
+        assert_eq!(result.origin, crate::SearchOrigin::ProofBook);
         assert_eq!(result.proof.unwrap().source, ProofSource::ProofBook);
         assert_eq!(
             (

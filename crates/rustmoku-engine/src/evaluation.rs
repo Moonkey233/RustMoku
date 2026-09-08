@@ -1,6 +1,6 @@
 use crate::{
     pattern::{ThreatProfile, stone_index},
-    pattern_state::PatternState,
+    pattern_state::{PatternDelta, PatternState},
 };
 use rustmoku_core::{Move, Position, Stone};
 
@@ -12,7 +12,7 @@ const OPEN_THREE: i32 = 2_000;
 const CLOSED_THREE: i32 = 200;
 const OPEN_TWO: i32 = 50;
 const CLOSED_TWO: i32 = 5;
-const EVALUATION_LIMIT: i32 = 10_000_000;
+pub(crate) const EVALUATION_LIMIT: i32 = 10_000_000;
 
 /// Static position scoring from the side-to-move perspective.
 ///
@@ -26,13 +26,24 @@ pub trait Evaluator: Sync {
     /// Consumed in strict LIFO order on the corresponding logical state.
     type Undo: Send;
 
-    fn initialize(&self, position: &Position) -> Self::State;
+    fn initialize(&self, position: &Position, patterns: &PatternState) -> Self::State;
     /// Called only after Core has accepted the move; must complete infallibly.
-    fn make_move(&self, state: &mut Self::State, at: Move, stone: Stone) -> Self::Undo;
-    fn unmake_move(&self, state: &mut Self::State, undo: Self::Undo);
+    fn make_move(&self, state: &mut Self::State, delta: &PatternDelta) -> Self::Undo;
+    fn unmake_move(&self, state: &mut Self::State, delta: &PatternDelta, undo: Self::Undo);
     /// Static score, positive for side to move, strictly outside the mate range.
     /// Patterns and evaluator state must describe the supplied Position.
     fn evaluate(&self, position: &Position, patterns: &PatternState, state: &Self::State) -> i32;
+
+    /// Optional learned candidate preference. It affects ordering only.
+    fn policy_score(
+        &self,
+        _position: &Position,
+        _patterns: &PatternState,
+        _state: &Self::State,
+        _at: Move,
+    ) -> Option<i32> {
+        None
+    }
 }
 
 /// A deliberately simple contiguous-run evaluator used as the V0.1 baseline.
@@ -43,9 +54,9 @@ impl Evaluator for ClassicalEvaluator {
     type State = ();
     type Undo = ();
 
-    fn initialize(&self, _position: &Position) {}
-    fn make_move(&self, _state: &mut (), _at: Move, _stone: Stone) {}
-    fn unmake_move(&self, _state: &mut (), _undo: ()) {}
+    fn initialize(&self, _position: &Position, _patterns: &PatternState) {}
+    fn make_move(&self, _state: &mut (), _delta: &PatternDelta) {}
+    fn unmake_move(&self, _state: &mut (), _delta: &PatternDelta, _undo: ()) {}
 
     fn evaluate(&self, position: &Position, _patterns: &PatternState, _state: &()) -> i32 {
         let side = position.side_to_move();
@@ -68,9 +79,9 @@ impl Evaluator for PatternEvaluator {
     type State = ();
     type Undo = ();
 
-    fn initialize(&self, _position: &Position) {}
-    fn make_move(&self, _state: &mut (), _at: Move, _stone: Stone) {}
-    fn unmake_move(&self, _state: &mut (), _undo: ()) {}
+    fn initialize(&self, _position: &Position, _patterns: &PatternState) {}
+    fn make_move(&self, _state: &mut (), _delta: &PatternDelta) {}
+    fn unmake_move(&self, _state: &mut (), _delta: &PatternDelta, _undo: ()) {}
     fn evaluate(&self, position: &Position, patterns: &PatternState, _state: &()) -> i32 {
         let side = stone_index(position.side_to_move());
         let counts = patterns.counts();

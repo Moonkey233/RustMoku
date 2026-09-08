@@ -1,9 +1,36 @@
 # RustMoku
 
-RustMoku V0.11 is a 15 x 15 Freestyle Gomoku program and a small
+RustMoku V0.12 is a 15 x 15 Freestyle Gomoku program and a small
 research-oriented engine foundation. It prioritizes correct game semantics,
 clear crate boundaries, reproducible single-thread results, and measurable
 search behavior.
+
+## V0.12 - Learned Local Patterns & Reversible Timeline
+
+- Core `Game` now owns a complete Undo/Redo timeline. Redo legally replays
+  historical moves with fresh undo tokens; only a successful new move discards
+  the future, and records still contain only the current line.
+- The learned evaluator maps the complete 65,536-value directional `LineKey`
+  space to 16-dimensional embeddings. `PatternState` emits a fixed-capacity
+  delta of at most 32 changed keys so each worker updates its own two
+  side-relative accumulators without allocation or a board rescan.
+- A versioned, bounded model codec loads immutable quantized i16 weights shared
+  through `Arc`. Scalar i32/i64 inference is deterministic and Safe Rust; Value
+  remains in ordinary evaluator units and learned Policy changes ordering only
+  below exact tactical and legal TT priorities.
+- `RuntimeEvaluator` keeps Pattern as the default/fallback and permits a learned
+  model in Native. Arena accepts independent A/B model paths. Replacing an
+  evaluator always clears evaluator-dependent ordinary TT entries.
+- `rustmoku-data` writes checked canonical datasets from records or deterministic
+  seeded self-play. The PyTorch tools in [`training`](training/README.md) split
+  by whole game, augment training data with D4, train/evaluate, quantize/export,
+  inspect, and produce bit-exact Python/Rust differential values.
+- Native adds historical Redo, localized result origins, a 0.1-second live turn
+  timer, worker-measured AI time, and per-move session timing that follows
+  Undo/Redo but never enters Core records.
+- V0.11 reliability repairs preserve exact cache provenance for Refuted results,
+  share a 100,000-node checkpoint persistence cap, bound untrusted tactical leaf
+  verification, and memoize independently verified canonical entries per pass.
 
 ## V0.11 - Offline Proof Solver & Verified Proof Book
 
@@ -134,6 +161,7 @@ cargo build --workspace
 cargo test --workspace --all-features
 cargo run --release -p rustmoku-native
 cargo run --release -p rustmoku-solver -- help
+cargo run --release -p rustmoku-data -- help
 ```
 
 The Native app displays its Cargo package version automatically and defaults to
@@ -151,7 +179,8 @@ separate 384 KiB proof table. VCT defaults to 9 plies / 4,000 node
 inspections and a 16 MiB memory request (12 MiB actual bucket allocation). Roots
 without OpenThree-or-stronger candidates spend zero VCT nodes. A persistent
 worker owns the engine and ordinary TT. The UI remains responsive, displays
-completed search snapshots, and accepts New Game while searching. Depth,
+completed search snapshots and their explicit result source, and accepts New
+Game while searching. Depth,
 Auto/manual thread count, TT MiB and move time apply to the next request; setting
 move time to 0 ms means unlimited. Each invalidation cancels its token and advances the request ID; both
 old snapshots and old results are ignored. Application drop cancels, sends
@@ -164,7 +193,8 @@ cargo run --release -p rustmoku-engine --example search_bench
 ```
 
 Use `--suite deep`, `--depth 8`, `--fixture opening`, `--tt-mib 256`,
-`--threads 4`, `--repeats 3`, or `--evaluator classical` after Cargo's `--`
+`--threads 4`, `--repeats 3`, `--evaluator classical`, or
+`--evaluator learned --model FILE` after Cargo's `--`
 separator. Defaults are the historical depth-four suite, 64 MiB, PatternEvaluator,
 one warm-up and five cold runs, reporting their median. TT allocation/clearing is
 untimed.
@@ -214,11 +244,19 @@ by legal replay, and Arena uses the same suite for both legs of each pair.
 "Undo turn" returns to the previous human decision: it removes one human move
 while the AI is thinking, or the human move and completed AI reply. It handles
 terminal games and either human color. An AI's initial move has no earlier human
-decision to undo. Opening moves form the session's undo floor and remain in the
+decision to undo. "Redo turn" advances through the exact historical human and
+AI moves to the next decision point; it starts a new AI search only when no old
+AI reply exists. Opening moves form the session's undo floor and remain in the
 complete exported history. Core `Game::undo()` / `undo_plies(n)` are generic LIFO
-operations; `Game::history()` exposes only chronological Moves. Position remains
-history-free. Undo/import/New Game invalidate the worker request without clearing
-its persistent ordinary TT.
+operations; `redo()` / `redo_plies(n)` legally replay the future and
+`Game::history()` exposes only the current chronological line. Position remains
+history-free. Undo/Redo/import/New Game invalidate the worker request without
+clearing its persistent ordinary TT.
+
+Native timing is session-only. Human time runs from receipt of the turn until a
+legal move; finalized AI time is measured around the worker search. Historical
+times move with Undo/Redo, imported/opening moves display `—`, and the compatible
+`RustMoku 1` record never contains timing metadata.
 
 Coordinates include I: A1 is bottom-left, O15 top-right and H8 center. Move's
 `Display` / `FromStr` implementation is the authoritative codec; parsing also
@@ -264,6 +302,9 @@ println!("{:?}", result.termination);
 ```
 
 `SearchTermination` is `Completed`, `NodeLimit`, `TimeLimit`, or `Cancelled`.
+`SearchOrigin` separately reports Analysis, Fallback, AlphaBeta, Terminal,
+Immediate, Vcf, Vct, or ProofBook; it explains where a result came from without
+inventing mathematical proof metadata.
 Interrupted iterations never replace the last completed score, move, PV or
 seldepth. Final statistics include all spent work, including the discarded
 iteration. Before any positive-depth iteration completes, the fallback is the
@@ -312,7 +353,8 @@ Players may use independent CPU thread counts. CSV goes to stdout; configuration
 and A/B wins, draws, A's paired points and average work per move go to stderr.
 A win scores one point and a draw half a point, so each pair has two points.
 
-Player options use `--a-` or `--b-`: `evaluator pattern|classical`, `threads`, `tt-mib`,
+Player options use `--a-` or `--b-`: `evaluator pattern|classical|learned`,
+`model FILE`, `threads`, `tt-mib`,
 `vcf-plies`, `vcf-nodes`, `vct-plies`, `vct-nodes`, and `vct-mib`. Common `--depth`
 (default 3) and optional `--nodes` apply per move. Zero proof plies/nodes disables
 a solver. Tiny paired runs validate the harness; they do not establish Elo or
@@ -328,8 +370,7 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 cargo test --release -p rustmoku-engine
 cargo build --release -p rustmoku-native
-cargo build --release -p rustmoku-arena
-cargo run --release -p rustmoku-engine --example search_bench
+cargo build --release -p rustmoku-data
 ```
 
 ## Workspace
@@ -342,6 +383,9 @@ cargo run --release -p rustmoku-engine --example search_bench
 - `apps/rustmoku-arena`: deterministic paired engine matches, no GUI dependency.
 - `apps/rustmoku-solver`: offline proof generation, checkpointing, verification,
   inspection, and queries.
+- `apps/rustmoku-data`: deterministic teacher labelling and checked dataset I/O.
+- `training`: offline PyTorch training, evaluation, quantized export and
+  differential tooling; it is not a Rust runtime dependency.
 
 Dependencies remain one-way: Engine depends on Core; Native depends on Core and
 Engine, as does Arena. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the invariants and
@@ -349,8 +393,10 @@ search contracts.
 
 ## Current limits and roadmap
 
-V0.11 does not add Null Move, ProbCut, singular extension, interior VCF/VCT,
-NNUE, MCTS, an empirical opening database, server API, Renju, or Swap protocol. Parallel results
+V0.12 does not add Null Move, ProbCut, singular extension, interior VCF/VCT,
+policy-based pruning/reductions, MCTS, an empirical opening database, server API,
+Renju, or Swap protocol. Safe scalar quantized inference was retained because no
+measured SIMD need justified a new abstraction. Parallel results
 with more than one worker are not promised bit-for-bit stable. Selective search
 does not prove equality with full-width minimax. Quiescence omits ordinary Three expansion and optional
 non-immediate defensive moves, and stops non-immediate forcing continuations at
@@ -367,6 +413,6 @@ blocks the first canonical threat point and reports the second as the terminal
 reply. Score/distance stay exact; unrelated top-left moves are no longer chosen.
 Local proof exhaustion remains Unknown and falls through to classical search. Proof numbers
 saturate safely; practical node limits are far below that numerical ceiling.
-Evaluator stays replaceable; its public
-PatternState API debt and future milestones are recorded in
+Evaluator stays replaceable; production learned-model details are documented in
+[`docs/LEARNED_MODEL.md`](docs/LEARNED_MODEL.md), and future milestones remain in
 [`docs/ROADMAP.md`](docs/ROADMAP.md).

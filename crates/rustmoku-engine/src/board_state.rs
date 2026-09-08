@@ -1,8 +1,12 @@
 use rustmoku_core::{Move, MoveError, MoveUndo, Position, Stone};
 
 use crate::{
-    PatternState, bitboard::BitBoard256, candidate_frontier::CandidateFrontier,
-    move_generation::MoveList, pattern_state::PatternUndo, zobrist::PositionKey,
+    PatternState,
+    bitboard::BitBoard256,
+    candidate_frontier::CandidateFrontier,
+    move_generation::MoveList,
+    pattern_state::{PatternDelta, PatternUndo},
+    zobrist::PositionKey,
 };
 
 /// Reversible board sidecars shared by classical search and tactical proofs.
@@ -20,6 +24,12 @@ pub(crate) struct BoardUndo {
     pattern: PatternUndo,
     at: Move,
     stone: Stone,
+}
+
+impl BoardUndo {
+    pub(crate) const fn pattern_delta(&self) -> PatternDelta {
+        self.pattern.delta()
+    }
 }
 
 impl BoardState {

@@ -100,19 +100,20 @@ The semantic boundary is strict:
 
 Empirical balance must never be described as proof.
 
-## V0.12 — Learned Local-Pattern Value + Policy + SIMD (planned)
+## V0.12 — Learned Local-Pattern Value + Policy (implemented)
 
-- Study an NNUE/MixNet-style learned local-pattern or codebook representation.
-- Maintain it incrementally through `Evaluator::State` / `Undo` while BoardState
-  and tactical solvers remain evaluator-independent.
-- Establish a scalar reference, then quantization and a Value head.
-- Add a lightweight Policy head for move ordering and, only later, measured
-  reduction modifiers.
-- Train from deep Alpha-Beta/self-play data plus exact tactical/proof labels,
-  with D4 augmentation.
-- Add AVX2 after differential validation; optional AVX-512/VNNI remains later
-  and evidence-gated.
-- Re-tune V0.10 evaluation-dependent margins after evaluator replacement.
+- Added a complete direct `LineKey` embedding table, worker-local reversible
+  accumulators, quantized scalar Value, and candidate-local Policy ordering.
+- Added checked model/data formats, deterministic teacher generation, game-level
+  splits, training-only D4 augmentation, and PyTorch train/evaluate/export tools.
+- Preserved PatternEvaluator as default/reference and all evaluator-independent
+  tactical proof paths; evaluator replacement invalidates ordinary TT scores.
+- Added Core and Native Undo/Redo timelines, session move timing and explicit
+  result-origin presentation.
+- Repaired V0.11 cached Refuted provenance, checkpoint capacity consistency,
+  Proof Book verification limits, and per-pass verifier memoization.
+- Safe scalar inference is the V0.12 baseline. SIMD and broad evaluator-margin
+  tuning remain measured V1.0 work; no strength claim follows from smoke data.
 
 Rapfi/Figrid-style learned-evaluation ideas may be studied conceptually, but GPL
 code is not copied.
@@ -149,10 +150,10 @@ requires a training/self-play/GPU pipeline and does not replace
 - Evaluator remains replaceable; board proof nodes do not update learned accumulators.
 - Core owns rules and legal transitions. Search consumes Position; apps are adapters.
 
-## Explicit V0.10 non-goals
+## Explicit V0.12 non-goals
 
-V0.10 does not implement Null Move, ProbCut, singular extension, interior
-VCF/VCT, NNUE, policy networks, SIMD optimization, unsafe code, MCTS,
+V0.12 does not implement Null Move, ProbCut, singular extension, interior
+VCF/VCT, policy-based reduction/pruning, SIMD optimization, unsafe code, MCTS,
 AlphaZero/Gumbel AlphaZero, Transformer evaluation, GPU compute, a server or
 protocol layer, Renju/Standard rules, Swap/Swap2, a large opening database,
 SPRT/Elo infrastructure, or a generic thread-pool/runtime framework without

@@ -18,11 +18,66 @@ pub struct PatternState {
     profile_bits: [[BitBoard256; ThreatProfile::COUNT]; 2],
 }
 
+const MAX_PATTERN_CHANGES: usize = 32;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PatternChange {
+    old: LineKey,
+    new: LineKey,
+}
+
+/// Fixed-capacity local feature changes produced by one legal move.
+///
+/// The representation stays opaque so evaluators consume PatternState's line
+/// geometry rather than duplicating it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PatternDelta {
+    at: Move,
+    changes: [PatternChange; MAX_PATTERN_CHANGES],
+    len: u8,
+}
+
+impl Default for PatternDelta {
+    fn default() -> Self {
+        Self {
+            at: Move::CENTER,
+            changes: [PatternChange::default(); MAX_PATTERN_CHANGES],
+            len: 0,
+        }
+    }
+}
+
+impl PatternDelta {
+    #[must_use]
+    pub const fn played_move(&self) -> Move {
+        self.at
+    }
+
+    pub(crate) fn changes(&self) -> impl Iterator<Item = (LineKey, LineKey)> + '_ {
+        self.changes[..usize::from(self.len)]
+            .iter()
+            .map(|change| (change.old, change.new))
+    }
+
+    fn push(&mut self, old: LineKey, new: LineKey) {
+        debug_assert!(usize::from(self.len) < self.changes.len());
+        self.changes[usize::from(self.len)] = PatternChange { old, new };
+        self.len += 1;
+    }
+}
+
 /// A bounded update is reversible from the played cell; no board snapshot.
 #[derive(Debug)]
 pub(crate) struct PatternUndo {
     at: Move,
     stone: Stone,
+    delta: PatternDelta,
+}
+
+impl PatternUndo {
+    pub(crate) const fn delta(&self) -> PatternDelta {
+        self.delta
+    }
 }
 
 impl PatternState {
@@ -66,6 +121,12 @@ impl PatternState {
         self.lines[at.index()]
     }
 
+    pub(crate) fn all_line_keys(&self) -> impl Iterator<Item = LineKey> + '_ {
+        self.lines
+            .iter()
+            .flat_map(|directions| directions.iter().copied())
+    }
+
     pub(crate) const fn counts(&self) -> &[[u16; ThreatProfile::COUNT]; 2] {
         &self.counts
     }
@@ -93,26 +154,35 @@ impl PatternState {
         self.remove_profile(at);
         self.profiles[at.index()] = [ThreatProfile::Quiet; 2];
         self.occupied.set(at);
-        self.update_lines(at, 0, stone_code(Some(stone)));
-        PatternUndo { at, stone }
+        let mut delta = PatternDelta {
+            at,
+            ..PatternDelta::default()
+        };
+        self.update_lines(at, 0, stone_code(Some(stone)), Some(&mut delta));
+        PatternUndo { at, stone, delta }
     }
 
     pub(crate) fn unmake_move(&mut self, undo: PatternUndo) {
         debug_assert!(self.occupied.test(undo.at));
-        self.update_lines(undo.at, stone_code(Some(undo.stone)), 0);
+        self.update_lines(undo.at, stone_code(Some(undo.stone)), 0, None);
         self.occupied.clear(undo.at);
         self.refresh_profile(undo.at);
     }
 
-    fn update_lines(&mut self, at: Move, old: u16, new: u16) {
+    fn update_lines(&mut self, at: Move, old: u16, new: u16, mut delta: Option<&mut PatternDelta>) {
         // A center lies on only one of these four axes (excluding the played
         // center itself), so each empty profile is removed/recomputed once.
         for influence in LINE_INFLUENCES[at.index()].iter() {
             let center = influence.center;
             let key = &mut self.lines[center.index()][usize::from(influence.direction)].0;
             debug_assert_eq!((*key >> influence.shift) & 3, old);
+            let previous = LineKey(*key);
             *key = (*key & !(3 << influence.shift)) | (new << influence.shift);
-            let pair = PatternPair::lookup(LineKey(*key));
+            let updated = LineKey(*key);
+            if let Some(delta) = &mut delta {
+                delta.push(previous, updated);
+            }
+            let pair = PatternPair::lookup(updated);
             let changed = self.directions[center.index()].replace(influence.direction, pair);
             if changed && !self.occupied.test(center) {
                 let profiles = self.directions[center.index()].profiles();

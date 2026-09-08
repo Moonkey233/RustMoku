@@ -19,9 +19,9 @@ struct ZeroEvaluator;
 impl Evaluator for ZeroEvaluator {
     type State = ();
     type Undo = ();
-    fn initialize(&self, _position: &Position) {}
-    fn make_move(&self, _state: &mut (), _at: Move, _stone: rustmoku_core::Stone) {}
-    fn unmake_move(&self, _state: &mut (), _undo: ()) {}
+    fn initialize(&self, _position: &Position, _patterns: &rustmoku_engine::PatternState) {}
+    fn make_move(&self, _state: &mut (), _delta: &rustmoku_engine::PatternDelta) {}
+    fn unmake_move(&self, _state: &mut (), _delta: &rustmoku_engine::PatternDelta, _undo: ()) {}
     fn evaluate(
         &self,
         _position: &Position,
