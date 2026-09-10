@@ -32,7 +32,7 @@ Train, evaluate, and export:
 ```powershell
 python -X utf8 training/train.py --dataset data/train.rmd --output models/run.pt --epochs 10 --seed 7
 python -X utf8 training/evaluate.py --dataset data/train.rmd --checkpoint models/run.pt --split validation --seed 7
-python -X utf8 training/export.py --checkpoint models/run.pt --output models/run.rmlp
+python -X utf8 training/export.py --checkpoint models/run.pt --dataset data/train.rmd --output models/run.rmlp
 python -X utf8 training/inspect_model.py --model models/run.rmlp
 ```
 
@@ -65,7 +65,7 @@ restart, audit quality, and create a versioned dataset descriptor:
 python -X utf8 training/generate.py --engine target/release/rustmoku-data.exe --output target/data-smoke --games 8 --shard-games 4 --seed 7 --depth 1 --nodes 100
 python -X utf8 training/train.py --dataset target/data-smoke/dataset.json --output target/smoke.pt --epochs 1 --seed 7
 python -X utf8 training/evaluate.py --dataset target/data-smoke/dataset.json --checkpoint target/smoke.pt
-python -X utf8 training/export.py --checkpoint target/smoke.pt --output target/smoke.rmlp
+python -X utf8 training/export.py --checkpoint target/smoke.pt --dataset target/data-smoke/dataset.json --output target/smoke.rmlp
 python -X utf8 training/calibrate.py --dataset target/data-smoke/dataset.json --checkpoint target/smoke.pt --model target/smoke.rmlp
 python -X utf8 training/verify_integer.py --engine target/release/rustmoku-data.exe --model target/smoke.rmlp
 python -X utf8 -m unittest discover -s training -p 'test_*.py'
@@ -160,3 +160,75 @@ Research Arena controls include `--a-disable rfp,lmr` (or `all`) and
 `--a-interior-vcf 5:240:960` (plies:per-probe-work:per-search-work), likewise B.
 The proof experiment is disabled with multiple workers and remains off by
 default. These controls are not Native settings or calibrated model profiles.
+
+## Work package 1: experiment identity and publication
+
+`rustmoku-arena --describe [OPTIONS]` validates files and prints schema-2 JSON
+without playing. Rust alone resolves evaluator/model selection, threads, TT,
+proof/selectivity settings, clock/work limits, opening identities and SHA256
+inputs. Compatible `--a-evaluator learned --a-model FILE` works in either order;
+Pattern/Classical plus a model, conflicting external selection and duplicate
+single-value options are errors. B has the same independent checks. Actual
+games emit `EFFECTIVE_CONFIG` JSON on stderr. The runner compares it with
+preflight before accepting a leg and binds every completed event to the
+experiment and effective configuration. Old version-1 experiments are not
+promotion evidence and cannot be silently resumed as version 2.
+
+Export now requires `--dataset` to check the checkpoint-bound corpus and split.
+It writes an immutable `.rmlp.export.json` alongside the unchanged V1 model
+format. Calibration and integer verification write `.calibration.json` and
+`.integer.json` receipts tied to that exact export/model hash; the second
+completed check publishes `.evidence.json`. Receipts record checkpoint/data/
+shard/split hashes, architecture, score contract, calibration thresholds and
+metrics, checker executable and producer script hashes. Confirmation experiments
+freeze this complete input set. Old models still load for runtime diagnostics,
+but cannot promote without this evidence. Preserve the referenced original
+checkpoint, corpus and receipts when archiving a champion; copying model bytes
+alone does not preserve a reproducible training experiment.
+
+`promote.py --dataset` is now optional and only asserts equality with the bound
+corpus. It cannot select a different corpus for overlap checks. The experiment
+configuration's `promotion_kind` defaults to `model`: actual A/B engine, search
+profile, threads, TT and reset/book settings must agree. Explicit
+`engine-model-profile` promotion can compare different profiles, but publishes
+the actual winning `competition_identity` and match limits with the model.
+Future player B must match the recorded current champion combination. The
+atomic champion pointer retains the previous record. A model hash alone is not
+the identity of a champion with different search parameters.
+
+The external adapter sends CRLF and accepts LF/CRLF/CR, including split buffers.
+It initializes `timeout_match`, sends real `time_left` before each request, and
+reports the true turn cap as `timeout_turn`; the internal manager's 95% soft
+allocation is not a match clock. External ERROR details survive adjudication.
+The generic protocol has no portable thread control: external threads and TT
+are `unavailable`, and internal thread/TT/proof flags on external players are
+rejected. Optional `--b-external-memory-bytes N` sends advisory `max_memory`;
+it is explicitly not OS-enforced memory. File arguments, including `--key=file`,
+are hashed automatically; declare implicit network/configuration files using
+repeatable `--b-external-input FILE` (or A). These declarations cannot discover
+hidden dependencies loaded by an arbitrary executable; preserve the exact
+external launch environment for a formal comparison.
+
+All run/dataset/shard/split/pipeline/experiment JSON manifests use the same
+no-clobber publisher: same-directory temporary write, flush/fsync, parse check,
+then atomic hard-link publication. NTFS or a Linux filesystem with hard links
+is required; unsupported filesystems fail rather than fall back to overwriting.
+Unpublished `.partial` files can be ignored on retry. A truncated **published**
+file is reported as corruption requiring explicit recovery; a complete different
+manifest is an identity mismatch. Neither is silently replaced. Fault tests
+cover write interruption, pre/post publication, abrupt process exit and a
+concurrent publisher. Windows has no directory-fsync API exposed by this Python
+implementation; post-crash damage is detected rather than repaired by guessing.
+
+Proof bundle merge resolves shard paths in the source descriptor directory
+before publishing the merged bundle. Failed imports never overwrite existing
+shards. Run formal regressions after building their bounded subprocess fixtures:
+
+```powershell
+cargo build --release -p rustmoku-arena -p rustmoku-data
+python -X utf8 -m unittest discover -s training -p 'test_*.py'
+python -X utf8 -m unittest discover -s apps/rustmoku-arena -p 'test_*.py'
+```
+
+Synthetic promotion outcomes in these tests validate rejection and publication
+mechanics only. They are never included in Arena statistics or strength claims.

@@ -1028,6 +1028,19 @@ The `experimental-v2` feature exposes an offline float reference, not a runtime
 Evaluator. Its distinct architecture id prevents interpreting V1 model bytes as
 a nonlinear model. No default evaluator or Native human-play setting changes.
 
+Work package 1 keeps configuration/protocol/evidence mechanics in apps and the
+offline tools. The only Engine API addition is read access to existing interior
+probe limits for a complete configuration description. Arena owns schema-2
+effective configuration; Python no longer reinterprets evaluator/model ordering
+or time/work flags for promotion. Model bytes loaded for a leg are retained in
+the prepared player, so the described hash refers to the loaded model. SHA256
+and JSON dependencies belong only to Arena, not Core or recursive search.
+Atomic immutable JSON publication is shared by the offline generation, splitting,
+training pipeline and Arena manager; invalid published files are never silently
+replaced. Model provenance and actual player profiles must both pass promotion
+checks. See [training/README.md](../training/README.md) for receipt/version and
+external-resource limits. No new search technique or default was added here.
+
 ## Remaining research non-goals
 
 No Null Move, ProbCut, singular extension, qsearch TT, interior VCT,

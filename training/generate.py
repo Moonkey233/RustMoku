@@ -9,7 +9,8 @@ from pathlib import Path
 
 from audit import audit
 from common import make_split_manifest, save_split_manifest
-from dataset import DatasetBundle, describe_shard, file_hash
+from dataset import DatasetBundle, describe_shard, file_hash, publish_shard
+from manifest import read_manifest
 
 
 def generate(args):
@@ -33,7 +34,7 @@ def generate(args):
         path = args.output / f'shard-{shard_index:05d}.rmd'
         descriptor_path = path.with_suffix('.json')
         if descriptor_path.exists():
-            descriptor = json.loads(descriptor_path.read_text(encoding='utf-8'))
+            descriptor = read_manifest(descriptor_path)
             if descriptor['run_id'] != run_id or descriptor['sha256'] != file_hash(path):
                 raise ValueError('completed shard identity mismatch')
         else:
@@ -49,7 +50,8 @@ def generate(args):
             descriptor = describe_shard(temporary, teacher, run_id)
             if len(descriptor['games']) != count:
                 raise ValueError('incomplete generated shard')
-            temporary.replace(path)
+            publish_shard(temporary, path)
+            temporary.unlink()
             descriptor['path'] = str(path.resolve())
             save_split_manifest(descriptor_path, descriptor)
         shards.append(descriptor)

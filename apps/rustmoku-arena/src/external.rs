@@ -22,7 +22,12 @@ pub struct ExternalPlayer {
 }
 
 impl ExternalPlayer {
-    pub fn start(path: &Path, args: &[String]) -> Result<Self, String> {
+    pub fn start(
+        path: &Path,
+        args: &[String],
+        clock: Option<Duration>,
+        memory: Option<u64>,
+    ) -> Result<Self, String> {
         let mut child = Command::new(path)
             .args(args)
             .stdin(Stdio::piped())
@@ -35,7 +40,7 @@ impl ExternalPlayer {
         let (acknowledge, acknowledgements) = mpsc::sync_channel(1);
         let writer = thread::spawn(move || {
             while let Ok(command) = commands.recv() {
-                let result = writeln!(stdin, "{command}")
+                let result = write!(stdin, "{command}\r\n")
                     .and_then(|()| stdin.flush())
                     .map_err(|error| format!("protocol write: {error}"));
                 let failed = result.is_err();
@@ -72,6 +77,16 @@ impl ExternalPlayer {
             return Err(format!("START rejected: {reply}"));
         }
         player.send("INFO rule 0", deadline)?;
+        player.send(
+            &format!(
+                "INFO timeout_match {}",
+                clock.map_or(0, |time| time.as_millis())
+            ),
+            deadline,
+        )?;
+        if let Some(bytes) = memory {
+            player.send(&format!("INFO max_memory {bytes}"), deadline)?;
+        }
         Ok(player)
     }
 
@@ -109,17 +124,24 @@ impl ExternalPlayer {
     pub fn choose(
         &mut self,
         game: &Game,
-        budget: Duration,
+        turn_limit: Duration,
         timeout: Duration,
+        clock: Option<Duration>,
     ) -> Result<Move, String> {
         let start = Instant::now();
         let deadline = start
             .checked_add(timeout)
             .ok_or("invalid protocol timeout")?;
         self.send(
-            &format!("INFO timeout_turn {}", budget.as_millis()),
+            &format!("INFO timeout_turn {}", turn_limit.as_millis()),
             deadline,
         )?;
+        // The match clock includes startup and this turn's protocol processing.
+        // A manager's soft search allocation is not the remaining match time.
+        let time_left = clock.map_or(2_147_483_647, |time| {
+            time.saturating_sub(start.elapsed()).as_millis()
+        });
+        self.send(&format!("INFO time_left {time_left}"), deadline)?;
         if self.started {
             let last = game.history().last().ok_or("missing opponent move")?;
             self.send(&format!("TURN {},{}", last.column(), last.row()), deadline)?;
@@ -145,7 +167,11 @@ impl ExternalPlayer {
         let remaining = timeout
             .checked_sub(start.elapsed())
             .ok_or("protocol timeout")?;
-        let at = parse_move(&self.reply(remaining)?)?;
+        let reply = self.reply(remaining)?;
+        if reply == "ERROR" || reply.starts_with("ERROR ") {
+            return Err(format!("external {reply}"));
+        }
+        let at = parse_move(&reply)?;
         if !game.position().is_legal(at) {
             return Err(format!("illegal external move {at}"));
         }
@@ -177,16 +203,18 @@ fn read_line(source: &mut impl BufRead) -> Result<String, String> {
         if available.is_empty() {
             return Err("external stdout closed".into());
         }
-        let count = available
+        // Do not wait for an optional LF after CR: a CR-only brain is already
+        // waiting for the next command. A following LF is an ignored empty line.
+        let ending = available
             .iter()
-            .position(|&byte| byte == b'\n')
-            .map_or(available.len(), |i| i + 1);
+            .position(|&byte| byte == b'\n' || byte == b'\r');
+        let count = ending.unwrap_or(available.len());
         if bytes.len() + count > 4096 {
             return Err("external line exceeds 4096 bytes".into());
         }
         bytes.extend_from_slice(&available[..count]);
-        source.consume(count);
-        if bytes.last() == Some(&b'\n') {
+        source.consume(count + usize::from(ending.is_some()));
+        if ending.is_some() {
             return String::from_utf8(bytes)
                 .map(|text| text.trim().to_owned())
                 .map_err(|error| error.to_string());
@@ -214,5 +242,26 @@ mod tests {
         assert_eq!(read_line(&mut &b"OK\r\n"[..]).unwrap(), "OK");
         assert!(read_line(&mut vec![b'x'; 4097].as_slice()).is_err());
         assert!(read_line(&mut &b"partial"[..]).is_err());
+    }
+
+    #[test]
+    fn every_line_ending_and_buffer_split_preserves_complete_messages() {
+        for capacity in 1..=9 {
+            let mut source = BufReader::with_capacity(capacity, &b"OK\r1,2\r\n3,4\n\r5,6\r"[..]);
+            let mut lines = Vec::new();
+            while let Ok(line) = read_line(&mut source) {
+                if !line.is_empty() {
+                    lines.push(line);
+                }
+            }
+            assert_eq!(lines, ["OK", "1,2", "3,4", "5,6"]);
+        }
+        let mut exact = vec![b'x'; 4096];
+        exact.push(b'\r');
+        assert_eq!(read_line(&mut exact.as_slice()).unwrap().len(), 4096);
+        exact.insert(0, b'x');
+        assert!(read_line(&mut exact.as_slice()).is_err());
+        assert!(read_line(&mut &b""[..]).is_err());
+        assert!(read_line(&mut &[0xff, b'\r'][..]).is_err());
     }
 }

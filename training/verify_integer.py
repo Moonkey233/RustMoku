@@ -6,9 +6,12 @@ import tempfile
 from pathlib import Path
 
 from common import parse_game_record, parse_move, read_quantized_model
+from provenance import read_export, write_check, file_identity, check_file
 
 
 def verify(engine, model_path):
+    exported = read_export(model_path)
+    engine_identity = file_identity(engine)
     model = read_quantized_model(model_path)
     checks = 0
     with tempfile.TemporaryDirectory() as directory:
@@ -27,6 +30,10 @@ def verify(engine, model_path):
                     raise ValueError(f'integer mismatch: {moves}, {at}: {actual} != {expected}')
                 checks += 1
     print(f'integer_differential_checks={checks} passed')
+    check_file(engine_identity)
+    check_file(exported['model'])
+    write_check(model_path, 'integer', {'checks': checks}, engine=engine_identity,
+                producer=file_identity(__file__), fixture='five-positions-three-candidates-v1')
 
 
 def main():

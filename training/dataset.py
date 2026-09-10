@@ -10,17 +10,34 @@ import argparse
 import dataclasses
 import hashlib
 import json
+import os
 from collections import defaultdict
 from pathlib import Path
 from typing import Sequence
 
 from common import DataRecord, DatasetFile, save_split_manifest
+from manifest import read_manifest
 
 
 def file_hash(path: Path | str) -> str:
     path = Path(path)
     with path.open('rb') as source:
         return hashlib.file_digest(source, 'sha256').hexdigest()
+
+
+def publish_shard(source: Path, destination: Path) -> None:
+    """Publish a completed same-filesystem shard/companion without clobbering it."""
+    if destination.exists() or destination.is_symlink():
+        if destination.is_symlink() or file_hash(source) != file_hash(destination):
+            raise ValueError(f'immutable shard output changed: {destination}')
+        return
+    with source.open('rb+') as stream:
+        os.fsync(stream.fileno())
+    try:
+        os.link(source, destination)
+    except FileExistsError:
+        if destination.is_symlink() or file_hash(source) != file_hash(destination):
+            raise ValueError(f'immutable shard output changed: {destination}')
 
 
 def describe_shard(path: Path, teacher: dict, run_id: str) -> dict:
@@ -60,7 +77,7 @@ class DatasetBundle(Sequence[DataRecord]):
     def __init__(self, path: Path):
         if path.stat().st_size > 64 * 1024 * 1024:
             raise ValueError('dataset descriptor exceeds 64 MiB')
-        self.descriptor = json.loads(path.read_text(encoding='utf-8'))
+        self.descriptor = read_manifest(path)
         if self.descriptor.get('version') != 1:
             raise ValueError('unsupported dataset descriptor')
         self.shards = []

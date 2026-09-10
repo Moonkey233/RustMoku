@@ -135,6 +135,13 @@ profiles remain future work. E3-E6 algorithms are gated on those prerequisites;
 they have not been implemented merely to fill the roadmap. No persistent SMP
 pool, SIMD, or TT synchronization rewrite is justified by the current timings.
 
+Work package 1 repairs experiment identity and recovery: Rust-described actual
+player configurations, bound model export/calibration/integer evidence,
+model-versus-combination promotion, match-clock/line-ending protocol compliance,
+atomic immutable manifests, and relocated proof-bundle paths. These are trust
+and correctness gates, not a new trained model or evidence of playing strength.
+Work packages 2-5 remain separate; this repair does not start them.
+
 Experimentally evaluate rather than automatically retain:
 
 - proof-guided Alpha-Beta/DFPN budget scheduling;

@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod configuration;
 mod external;
 
 use rustmoku_core::{CanonicalPosition, Game, GameStatus, OPENINGS, Stone};
@@ -29,9 +30,13 @@ struct PlayerConfig {
     engine: EngineConfig,
     evaluator: EvaluatorConfig,
     external_args: Vec<String>,
+    external_inputs: Vec<PathBuf>,
+    external_memory: Option<u64>,
+    prepared_model: Option<Arc<LearnedModel>>,
 }
 
 struct Options {
+    describe: bool,
     players: [PlayerConfig; 2],
     limits: SearchLimits,
     pairs: usize,
@@ -45,6 +50,7 @@ struct Options {
 impl Options {
     fn parse(args: impl Iterator<Item = String>) -> Result<Self, Box<dyn Error>> {
         let mut options = Self {
+            describe: false,
             players: std::array::from_fn(|_| PlayerConfig::default()),
             limits: SearchLimits::new(3),
             pairs: 1,
@@ -55,7 +61,25 @@ impl Options {
             opening_records: Vec::new(),
         };
         let mut args = args;
+        let mut seen = std::collections::BTreeSet::new();
+        let mut declared_evaluators: [Option<String>; 2] = [None, None];
+        let mut declared_models: [Option<PathBuf>; 2] = [None, None];
         while let Some(flag) = args.next() {
+            if !matches!(
+                flag.as_str(),
+                "--opening-record"
+                    | "--a-external-arg"
+                    | "--b-external-arg"
+                    | "--a-external-input"
+                    | "--b-external-input"
+            ) && !seen.insert(flag.clone())
+            {
+                return Err(format!("duplicate option: {flag}").into());
+            }
+            if flag == "--describe" {
+                options.describe = true;
+                continue;
+            }
             let value = args
                 .next()
                 .ok_or_else(|| format!("missing value for {flag}"))?;
@@ -83,25 +107,27 @@ impl Options {
                     let mut tactical = config.engine.tactical();
                     match key {
                         "evaluator" => {
-                            config.evaluator = match value.as_str() {
-                                "pattern" => EvaluatorConfig::Pattern,
-                                "classical" => EvaluatorConfig::Classical,
-                                "learned" => EvaluatorConfig::Learned(PathBuf::new()),
-                                _ => {
-                                    return Err(
-                                        "evaluator must be pattern, classical, or learned".into()
-                                    );
-                                }
-                            };
+                            if !matches!(value.as_str(), "pattern" | "classical" | "learned") {
+                                return Err(
+                                    "evaluator must be pattern, classical, or learned".into()
+                                );
+                            }
+                            declared_evaluators[player] = Some(value);
                         }
                         "external" => config.evaluator = EvaluatorConfig::External(value.into()),
                         "external-arg" => config.external_args.push(value),
-                        "model" => config.evaluator = EvaluatorConfig::Learned(value.into()),
+                        "external-input" => config.external_inputs.push(value.into()),
+                        "external-memory-bytes" => config.external_memory = Some(value.parse()?),
+                        "model" => declared_models[player] = Some(value.into()),
                         "tt-mib" => {
                             config.engine = config.engine.with_tt_memory_mib(value.parse()?);
                         }
                         "threads" => {
-                            config.engine = config.engine.with_threads(value.parse()?);
+                            let threads = value.parse()?;
+                            if threads == 0 {
+                                return Err("threads must be positive".into());
+                            }
+                            config.engine = config.engine.with_threads(threads);
                         }
                         "interior-vcf" => {
                             let parts: Vec<&str> = value.split(':').collect();
@@ -144,6 +170,39 @@ impl Options {
                     }
                     config.engine = config.engine.with_tactical(tactical);
                 }
+            }
+        }
+        for (index, player) in options.players.iter_mut().enumerate() {
+            if matches!(player.evaluator, EvaluatorConfig::External(_)) {
+                if declared_evaluators[index].is_some() || declared_models[index].is_some() {
+                    return Err("external engine conflicts with evaluator/model selection".into());
+                }
+                let prefix = if index == 0 { "--a-" } else { "--b-" };
+                if seen.iter().any(|flag| {
+                    flag.strip_prefix(prefix)
+                        .is_some_and(|key| !matches!(key, "external" | "external-memory-bytes"))
+                }) {
+                    return Err("internal threads/TT/proof/selectivity options cannot constrain an external engine".into());
+                }
+            } else {
+                if !player.external_args.is_empty()
+                    || !player.external_inputs.is_empty()
+                    || player.external_memory.is_some()
+                {
+                    return Err("external options require an external engine".into());
+                }
+                player.evaluator = match (
+                    declared_evaluators[index].as_deref(),
+                    declared_models[index].take(),
+                ) {
+                    (None | Some("learned"), Some(path)) => EvaluatorConfig::Learned(path),
+                    (None | Some("pattern"), None) => EvaluatorConfig::Pattern,
+                    (Some("classical"), None) => EvaluatorConfig::Classical,
+                    (Some("learned"), None) => {
+                        return Err("learned evaluator requires a model file".into());
+                    }
+                    _ => return Err("model conflicts with selected evaluator".into()),
+                };
             }
         }
         let available = if options.opening_records.is_empty() {
@@ -192,11 +251,13 @@ enum Player {
 }
 
 impl Player {
-    fn new(config: &PlayerConfig) -> Result<Self, Box<dyn Error>> {
+    fn new(config: &PlayerConfig, clock: Option<Duration>) -> Result<Self, Box<dyn Error>> {
         Ok(match &config.evaluator {
             EvaluatorConfig::External(path) => Self::External(external::ExternalPlayer::start(
                 path,
                 &config.external_args,
+                clock,
+                config.external_memory,
             )?),
             EvaluatorConfig::Classical => Self::Classical(AlphaBetaEngine::with_config(
                 ClassicalEvaluator,
@@ -207,7 +268,11 @@ impl Player {
                 config.engine,
             )),
             EvaluatorConfig::Learned(path) => {
-                let model = Arc::new(LearnedModel::read_from_path(path)?);
+                let model = if let Some(model) = &config.prepared_model {
+                    Arc::clone(model)
+                } else {
+                    Arc::new(LearnedModel::read_from_path(path)?)
+                };
                 Self::Learned(AlphaBetaEngine::with_config(
                     LearnedEvaluator::new(model),
                     config.engine,
@@ -290,7 +355,7 @@ fn play_game(
     let mut players = Vec::with_capacity(2);
     for (index, config) in configs.iter().enumerate() {
         let startup = Instant::now();
-        match Player::new(config) {
+        match Player::new(config, clock) {
             Ok(player) => {
                 players.push(player);
                 if let Some(remaining) = &mut clocks[index] {
@@ -338,10 +403,9 @@ fn play_game(
             Player::External(external) => external
                 .choose(
                     &game,
-                    move_limits
-                        .move_time
-                        .expect("validated external time limit"),
+                    limits.move_time.expect("validated external time limit"),
                     hard_limit.expect("validated external time limit"),
+                    clocks[player],
                 )
                 .map(|at| (at, 0)),
             internal => {
@@ -354,7 +418,10 @@ fn play_game(
         };
         let elapsed = start.elapsed();
         let choice = if hard_limit.is_some_and(|time| elapsed > time) {
-            Err("time-forfeit".to_owned())
+            Err(match choice {
+                Err(reason) => format!("time-forfeit ({reason})"),
+                Ok(_) => "time-forfeit".to_owned(),
+            })
         } else {
             choice
         };
@@ -413,17 +480,19 @@ impl Summary {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    if env::args().any(|arg| arg == "--help") {
+    if env::args().len() == 2 && env::args().nth(1).as_deref() == Some("--help") {
         println!(
-            "RustMoku V0.12 Arena\n--pairs 1..12 --depth N --nodes N (optional global work cap per move)\nPlayer flags: --a- or --b- followed by evaluator pattern|classical|learned, model FILE, threads N,\ntt-mib N, vcf-plies N, vcf-nodes N, vct-plies N, vct-nodes N, vct-mib N.\nZero proof nodes/plies disables that solver. CSV stdout; configuration/summary stderr."
+            "RustMoku research Arena\n--describe validates inputs and prints effective JSON without playing.\n--pairs N --depth N --nodes N --move-ms N --clock-ms N --increment-ms N\nPlayer flags: --a- or --b- followed by evaluator pattern|classical|learned, model FILE, threads N,\ntt-mib N, vcf-plies N, vcf-nodes N, vct-plies N, vct-nodes N, vct-mib N, disable LIST, interior-vcf P:W:T.\nExternal players: external FILE, repeated external-arg ARG and external-input FILE; external-memory-bytes N is advisory.\nExternal threads/TT/proof options are unsupported and rejected.\nDuplicate options and conflicting model/evaluator selections are errors. CSV stdout; effective JSON/summary stderr."
         );
         return Ok(());
     }
-    let options = Options::parse(env::args().skip(1))?;
-    eprintln!(
-        "RustMoku V0.12 Arena: {:?}; A={:?}; B={:?}",
-        options.limits, options.players[0], options.players[1]
-    );
+    let mut options = Options::parse(env::args().skip(1))?;
+    let effective = configuration::describe(&mut options)?;
+    if options.describe {
+        println!("{effective}");
+        return Ok(());
+    }
+    eprintln!("EFFECTIVE_CONFIG {effective}");
     println!("pair,opening,leg,a_color,winner,plies,searched_moves,work_nodes,opening_key,failure");
     let mut summary = Summary::default();
     let openings = if options.opening_records.is_empty() {
@@ -511,6 +580,7 @@ mod tests {
             engine: EngineConfig::new(0).with_vct_table_memory(0),
             evaluator: EvaluatorConfig::Pattern,
             external_args: Vec::new(),
+            ..PlayerConfig::default()
         };
         let limits = SearchLimits::new(1).with_max_nodes(100);
         let configs = [config.clone(), config];
@@ -584,6 +654,7 @@ mod tests {
                 .with_vct_table_memory(0),
             evaluator: EvaluatorConfig::Pattern,
             external_args: Vec::new(),
+            ..PlayerConfig::default()
         };
         let configs = [config.clone(), config];
         let result = play(

@@ -16,6 +16,10 @@ import subprocess
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'training'))
+from manifest import save_manifest
+from provenance import object_hash, sidecar, validate_evidence
+
 from paired_stats import summarize
 
 
@@ -25,13 +29,7 @@ def digest(path):
 
 
 def immutable(path, value):
-    text = json.dumps(value, sort_keys=True, indent=2) + '\n'
-    if path.exists():
-        if path.read_text(encoding='utf-8') != text:
-            raise ValueError(f'experiment identity mismatch: {path}')
-    else:
-        with path.open('x', encoding='utf-8') as output:
-            output.write(text)
+    save_manifest(path, value)
 
 
 def append(path, event):
@@ -72,7 +70,7 @@ def completed_games(events):
     return result
 
 
-def statistics(completed, configuration):
+def statistics(completed, configuration, effective=None):
     counts = [0] * 5
     clusters = set()
     excluded = []
@@ -97,18 +95,49 @@ def statistics(completed, configuration):
     eligible = (configuration.get('suite_role') == 'confirmation'
                 and configuration.get('stop_rule') == 'fixed_pairs'
                 and summary['pairs'] == configuration['max_pairs']
-                and '--move-ms' in configuration.get('arguments', [])
-                and '--nodes' not in configuration.get('arguments', [])
+                and effective is not None
+                and effective['limits']['turn_hard_ms'] is not None
+                and effective['limits']['work'] is None
                 and summary['score_ci95_hoeffding'][0] > .5)
     return {**summary,
             'incomplete_pairs': half_pairs, 'repeated_opening_clusters': excluded,
             'completed_games': len(completed), 'promotion_eligible': eligible}
 
 
+def describe(arena, arguments):
+    """The Rust parser is the only interpreter of player/limit options."""
+    if not isinstance(arguments, list) or any(not isinstance(arg, str) for arg in arguments):
+        raise ValueError('Arena arguments must be a string array')
+    result = subprocess.run([str(arena), *arguments, '--describe'], check=True,
+                            capture_output=True, text=True, timeout=15)
+    effective = json.loads(result.stdout)
+    if effective.get('schema') != 2 or effective['engine']['sha256'] != digest(arena):
+        raise ValueError('Arena configuration identity/schema mismatch')
+    return effective
+
+
+def verify_events(completed, manifest):
+    manifest_hash = object_hash(manifest)
+    effective = manifest['effective']
+    effective_hash = object_hash(effective)
+    for game_id, event in completed.items():
+        if event.get('manifest_sha256') != manifest_hash or event.get('effective_sha256') != effective_hash:
+            raise ValueError('game event belongs to a different experiment/configuration')
+        pair, leg = map(int, game_id.split(':'))
+        if not 0 <= pair < manifest['configuration']['max_pairs'] or leg not in (1, 2):
+            raise ValueError('event pair/leg out of range')
+        row = event['row']
+        if (int(row['pair']) != pair + 1 or int(row['leg']) != leg
+                or row['opening_key'] != effective['openings'][pair]
+                or row['a_color'] != ('Black' if leg == 1 else 'White')
+                or row['winner'] not in ('A', 'B', 'draw')):
+            raise ValueError('game event does not match scheduled pair/opening/colors')
+
+
 def run(configuration, output):
     arena = Path(configuration['arena']).resolve()
     arguments = configuration.get('arguments', [])
-    if any(arg in ('--pairs', '--pair-start', '--leg') for arg in arguments):
+    if any(arg in ('--pairs', '--pair-start', '--leg', '--describe') for arg in arguments):
         raise ValueError('pair selection belongs to the experiment runner')
     if not 1 <= configuration['max_pairs'] <= 10000:
         raise ValueError('max_pairs must be explicitly bounded')
@@ -118,19 +147,31 @@ def run(configuration, output):
         raise ValueError('unsupported opening suite role')
     # Validate statistical parameters before launching any games.
     summarize([0] * 5, **configuration['sprt'], max_pairs=configuration['max_pairs'])
-    inputs = {str(arena): digest(arena)}
-    threads = [1, 1]
-    for i, flag in enumerate(arguments):
-        if flag in ('--a-model', '--b-model', '--a-external', '--b-external', '--opening-record'):
-            path = Path(arguments[i + 1]).resolve()
-            inputs[str(path)] = digest(path)
-        if flag in ('--a-threads', '--b-threads'):
-            threads[0 if flag == '--a-threads' else 1] = int(arguments[i + 1])
-    if any(t < 1 or t > (os.cpu_count() or 1) for t in threads):
+    effective = describe(arena, arguments)
+    if configuration['max_pairs'] > len(effective['openings']):
+        raise ValueError('requested pair cap exceeds described opening suite')
+    inputs = dict(effective['inputs_sha256'])
+    for path in (Path(__file__), Path(__file__).with_name('paired_stats.py')):
+        inputs[str(path.resolve())] = digest(path)
+    threads = [player['threads'] for player in effective['players']]
+    if any(t is not None and (t < 1 or t > (os.cpu_count() or 1)) for t in threads):
         raise ValueError('engine threads exceed available logical CPUs')
+    model_evidence = {}
+    for player in effective['players']:
+        if player['evaluator'] != 'learned':
+            continue
+        model = Path(player['model']['path'])
+        if sidecar(model, 'evidence').exists():
+            evidence = validate_evidence(model)
+            inputs.update(evidence['inputs_sha256'])
+            model_evidence[player['model']['sha256']] = {'path': str(sidecar(model, 'evidence').resolve()),
+                                                        'sha256': digest(sidecar(model, 'evidence'))}
+        elif configuration.get('suite_role') == 'confirmation':
+            raise ValueError('confirmation requires completed export/calibration/integer evidence')
     for path in configuration.get('extra_inputs', []):
         inputs[str(Path(path).resolve())] = digest(path)
-    manifest = {'version': 1, 'configuration': configuration, 'inputs_sha256': inputs,
+    manifest = {'version': 2, 'configuration': configuration, 'inputs_sha256': inputs,
+                'effective': effective, 'model_evidence': model_evidence,
                 'platform': platform.platform(), 'cpu': platform.processor(),
                 'logical_cpus': os.cpu_count(), 'python': sys.version,
                 'concurrent_games': 1, 'engine_threads': threads,
@@ -142,8 +183,9 @@ def run(configuration, output):
     immutable(output / 'manifest.json', manifest)
     journal = output / 'events.jsonl'
     completed = completed_games(read_events(journal))
+    verify_events(completed, manifest)
     for pair in range(configuration['max_pairs']):
-        before = statistics(completed, configuration)
+        before = statistics(completed, configuration, effective)
         if configuration.get('stop_rule', 'paired_sprt') == 'paired_sprt' and before['decision'] != 'inconclusive':
             break
         for leg in (1, 2):
@@ -157,6 +199,12 @@ def run(configuration, output):
             try:
                 process = subprocess.run(command, capture_output=True, text=True, check=True,
                                          timeout=configuration.get('game_timeout_seconds', 60))
+                descriptions = [line.removeprefix('EFFECTIVE_CONFIG ') for line in process.stderr.splitlines()
+                                if line.startswith('EFFECTIVE_CONFIG ')]
+                if len(descriptions) != 1 or json.loads(descriptions[0]) != effective:
+                    raise ValueError('actual Arena configuration differs from preflight')
+                if any(digest(path) != value for path, value in inputs.items()):
+                    raise ValueError('experiment input changed during a game')
                 rows = list(csv.DictReader(io.StringIO(process.stdout)))
                 if len(rows) != 1 or rows[0]['leg'] != str(leg) or int(rows[0]['pair']) != pair + 1:
                     raise ValueError('Arena did not return exactly the requested completed leg')
@@ -164,13 +212,15 @@ def run(configuration, output):
                 if row['winner'] not in ('A', 'B', 'draw'):
                     raise ValueError('invalid winner')
                 event = {'status': 'completed', 'game_id': game_id, 'row': row,
+                         'manifest_sha256': object_hash(manifest), 'effective_sha256': object_hash(effective),
                          'configuration_log': process.stderr}
+                verify_events({game_id: event}, manifest)
             except Exception as error:
                 append(journal, {'status': 'infrastructure-failure', 'game_id': game_id, 'error': str(error)})
                 raise
             append(journal, event)
             completed[game_id] = event
-    result = statistics(completed, configuration)
+    result = statistics(completed, configuration, effective)
     result['scheduled_pair_cap_reached'] = len(completed) == 2 * configuration['max_pairs']
     (output / 'statistics.json').write_text(json.dumps(result, indent=2) + '\n', encoding='utf-8')
     print(json.dumps(result, indent=2))

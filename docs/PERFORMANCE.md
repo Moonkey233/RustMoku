@@ -16,9 +16,48 @@ These metrics are not interchangeable. Iterative deepening, TT, and PV remain.
 
 ## Environment
 
+### Unreleased V1.0 work package 1 validation (2026-09-10)
+
+This repair started from clean HEAD `e107803`; the changes remain uncommitted.
+It changes experiment identity, model evidence, protocol handling and artifact
+publication, with no search algorithm change. The earlier observations below
+retain their original baseline and do not describe the current checkout.
+
+Local validation passed `cargo fmt --all -- --check`,
+`cargo check --workspace --all-targets`,
+`cargo clippy --workspace --all-targets --all-features -- -D warnings`,
+`cargo test --workspace --all-features` (213 tests), and
+`cargo test --release -p rustmoku-engine --all-features` (167 tests).
+The debug generated tactical oracle completed in 136.28 s. Final Release builds
+of Arena and the data tool passed, followed by 26 training Python tests and
+9 Arena Python tests, including actual subprocess protocol fixtures. Synthetic
+winning events in promotion regressions are test inputs, never match evidence.
+
+The Release `search_bench --suite quick --repeats 3` run completed with default
+Pattern, one worker and 64 MiB TT. Opening, balanced midgame, tactical attack,
+forced defense and transposition-rich fixtures respectively returned move/score
+96/780, 142/99999995, 107/99999999, 112/-243120 and 96/99999997. Their median
+times were 5.191, 0.222, 0.022, 1.994 and 0.053 ms (7.482 ms aggregate);
+total work was 9672, 475, 1, 4270 and 11. This is a bounded regression
+observation, not a speedup or strength claim.
+
+An eight-game, one-epoch, one-pair end-to-end smoke passed export provenance,
+calibration, all 15 integer fixtures and Arena execution; promotion was rejected
+as inconclusive. Its unchanged-input second run resumed without repeating
+completed stages. A real verified-book import also merged two proof labels into
+a bundle in a separate directory containing spaces. This smoke preceded only
+the final Arena error-detail preservation adjustment; protocol regressions were
+rerun on the final binary. Frozen experiments cannot resume across a changed
+executable hash and must use a new output directory after rebuilding.
+
+Hosted Windows/Linux CI, formal training, external strong-engine matches and
+statistical promotion remain unverified. External thread/TT settings are
+unavailable and rejected; optional protocol memory settings are advisory, not
+OS-enforced limits. No default evaluator or experimental search gate changed.
+
 ### Unreleased V1.0 bounded observations (2026-09-09)
 
-Baseline HEAD remains `76cc5ac`; the following implementation is uncommitted.
+At the time of this batch, HEAD was `76cc5ac` with uncommitted implementation.
 These are local smoke observations, not a V1.0 release or strength result.
 The original 20-game/100-work CR reproduced 564 records, 9 distinct trajectories,
 and 45/51 test positions in train. A later 8-game diversified smoke produced

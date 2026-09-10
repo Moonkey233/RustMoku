@@ -12,6 +12,7 @@ from common import (EVALUATION_LIMIT, POLICY_OUTPUT_SCALE, decode_position_key,
                     feature_keys, legal_policy_features, load_training_model,
                     read_quantized_model, validate_split_manifest)
 from dataset import open_dataset
+from provenance import read_export, write_check, file_identity, object_hash
 
 
 def calibration(model, quantized, records):
@@ -68,6 +69,11 @@ def main():
         raise ValueError('calibration samples must be 1..256')
     torch.set_num_threads(1)
     checkpoint = load_checkpoint(args.checkpoint)
+    exported = read_export(args.model)
+    if file_identity(args.checkpoint)['sha256'] != exported['checkpoint']['sha256']:
+        raise ValueError('calibration checkpoint differs from model export')
+    if file_identity(args.dataset)['sha256'] != exported['dataset']['sha256']:
+        raise ValueError('calibration dataset differs from model export')
     model = load_training_model(args.checkpoint, 'cpu')
     quantized = read_quantized_model(args.model)
     with open_dataset(args.dataset) as dataset:
@@ -78,6 +84,12 @@ def main():
             or report['policy_max_absolute_error'] > args.max_policy_error
             or report['value_sign_errors_margin_001']):
         raise ValueError('quantization calibration gate failed')
+    write_check(args.model, 'calibration', report,
+        checkpoint_sha256=exported['checkpoint']['sha256'],
+        dataset_fingerprint=checkpoint['split_manifest']['dataset_sha256'],
+        split_sha256=object_hash(checkpoint['split_manifest']),
+        gates={'max_value_error': args.max_value_error, 'max_policy_error': args.max_policy_error},
+        selection={'split': 'validation', 'indices': indices}, producer=file_identity(__file__))
 
 
 if __name__ == '__main__':

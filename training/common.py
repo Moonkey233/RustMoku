@@ -389,13 +389,8 @@ def validate_split_manifest(dataset: Sequence[DataRecord], manifest: dict, seed=
 
 
 def save_split_manifest(path: Path, manifest: dict) -> None:
-    text = json.dumps(manifest, sort_keys=True, indent=2) + "\n"
-    if path.exists():
-        if path.read_text(encoding="utf-8") != text:
-            raise ValueError("refusing to replace an immutable split manifest")
-    else:
-        with path.open("x", encoding="utf-8") as output:
-            output.write(text)
+    from manifest import save_manifest
+    save_manifest(path, manifest)
 
 
 class LocalPatternModel(nn.Module):

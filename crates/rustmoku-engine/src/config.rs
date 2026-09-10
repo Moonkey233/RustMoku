@@ -127,7 +127,9 @@ impl EngineConfig {
         self
     }
 
-    pub(crate) const fn interior_vcf(self) -> (ProofLimits, u64) {
+    /// Configured probe limits and per-search allowance, for experiment identity.
+    #[must_use]
+    pub const fn interior_vcf(self) -> (ProofLimits, u64) {
         (self.interior_vcf, self.interior_vcf_total_work)
     }
 

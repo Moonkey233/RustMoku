@@ -15,6 +15,7 @@ from pathlib import Path
 from common import save_split_manifest
 from dataset import file_hash, DatasetBundle
 from promote import promote
+from provenance import sidecar
 
 
 def publish_state(path, state):
@@ -65,10 +66,12 @@ def run(config, root, only=None):
         ('train', [python, str(scripts / 'train.py'), '--dataset', str(data), '--output', str(checkpoint),
                    '--epochs', str(config['epochs']), '--seed', str(config['seed']), '--batch-size', '8'], [checkpoint]),
         ('evaluate', [python, str(scripts / 'evaluate.py'), '--dataset', str(data), '--checkpoint', str(checkpoint)], []),
-        ('export', [python, str(scripts / 'export.py'), '--checkpoint', str(checkpoint), '--output', str(model)], [model]),
+        ('export', [python, str(scripts / 'export.py'), '--checkpoint', str(checkpoint), '--dataset', str(data),
+                    '--output', str(model)], [model, sidecar(model, 'export')]),
         ('calibrate', [python, str(scripts / 'calibrate.py'), '--dataset', str(data), '--checkpoint', str(checkpoint),
-                       '--model', str(model), '--samples', '8'], []),
-        ('integer', [python, str(scripts / 'verify_integer.py'), '--engine', str(data_engine), '--model', str(model)], []),
+                       '--model', str(model), '--samples', '8'], [sidecar(model, 'calibration')]),
+        ('integer', [python, str(scripts / 'verify_integer.py'), '--engine', str(data_engine), '--model', str(model)],
+                    [sidecar(model, 'integer'), sidecar(model, 'evidence')]),
         ('tactical', ['cargo', 'test', '--release', '-p', 'rustmoku-engine', 'search::'], []),
         ('arena', [python, str(repository / 'apps/rustmoku-arena/experiment.py'), '--config', str(root / 'arena.json'),
                    '--output', str(root / 'arena')], [root / 'arena/statistics.json']),

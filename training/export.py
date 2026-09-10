@@ -4,10 +4,15 @@ from __future__ import annotations
 
 import argparse
 import math
+import hashlib
+import os
 import struct
+import tempfile
 from pathlib import Path
 
 import torch
+from provenance import export_identity, write_export, check_file
+from common import read_quantized_model
 
 from common import (
     EVALUATION_LIMIT,
@@ -26,6 +31,7 @@ from common import (
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--dataset", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--embedding-scale", type=int, default=16384)
     parser.add_argument("--value-head-scale", type=int, default=16384)
@@ -65,6 +71,7 @@ def calibrated_divisor(combined_scale: int, output_scale: int) -> int:
 
 def main() -> None:
     args = parse_args()
+    identity = export_identity(args.checkpoint, args.dataset)
     model = load_training_model(args.checkpoint, "cpu")
     embeddings, embedding_scale = quantize(
         model.embedding.weight, args.embedding_scale, "embeddings"
@@ -108,12 +115,38 @@ def main() -> None:
     if len(header) + len(payload) > MAX_MODEL_BYTES:
         raise ValueError("exported model exceeds the Rust size limit")
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_bytes(header + payload)
+    check_file(identity['checkpoint'])
+    publish_model(args.output, header + payload)
+    write_export(args.output, identity, {'embedding_scale': embedding_scale,
+        'value_head_scale': value_head_scale, 'policy_head_scale': policy_head_scale,
+        'value_divisor': value_scale, 'policy_divisor': policy_scale})
     print(
         f"saved={args.output} bytes={len(header) + len(payload)} "
         f"embedding_scale={embedding_scale} value_divisor={value_scale} "
         f"policy_divisor={policy_scale}"
     )
+
+
+def publish_model(path, payload):
+    """Publish fully parsed model bytes without replacing a frozen model."""
+    digest = hashlib.sha256(payload).hexdigest()
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=path.parent, suffix='.partial', delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        read_quantized_model(temporary)
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            from dataset import file_hash
+            if path.is_symlink() or file_hash(path) != digest:
+                raise ValueError('refusing to replace an immutable exported model')
+    finally:
+        if temporary is not None and temporary.exists():
+            temporary.unlink()
 
 
 if __name__ == "__main__":
