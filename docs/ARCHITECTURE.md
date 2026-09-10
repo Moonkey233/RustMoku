@@ -221,7 +221,8 @@ callers preserve the lifecycle and LIFO contract.
 SearchState owns exactly one always-present `PatternState`, independently of the
 evaluator. Ordering and qsearch read this same tactical state. Pattern and
 Classical use unit state. Learned uses immutable shared model weights plus one
-independent pair of 16-dimensional i32 accumulators per Alpha-Beta worker.
+independent pair of i64 scalar accumulators per Alpha-Beta worker.
+V1 embedding/head products compile into shared exact scalar tables at load time.
 `RuntimeEvaluator` is a static enum adapter, not per-node dynamic dispatch.
 Replacing its definition clears all ordinary TT entries; proof caches remain
 evaluator-independent.
@@ -229,7 +230,7 @@ evaluator-independent.
 The learned feature table covers every u16 `LineKey` without hashing. One root
 scan sums 225 x 4 side-relative embeddings. Thereafter the opaque fixed-capacity
 `PatternDelta` carries only the old/new keys for the at-most-32 line influences
-already maintained by PatternState. Make/unmake subtracts/adds those embeddings
+already maintained by PatternState. Make/unmake subtracts/adds the compiled Value entries
 exactly, with no Vec, lock, allocation, or duplicated geometry. Value is clamped
 to +/-10,000,000; Policy scores only candidate moves and cannot affect pruning,
 reduction, proof, or tactical classification.
@@ -245,8 +246,14 @@ position, explicit D4 transform, teacher Value and canonical best move, result
 origin/exact flag, game ID and ply. The format is Freestyle-only and does not
 contain Native timing.
 
-Python memory-maps and validates this format, partitions whole game IDs before
-sampling, and applies D4 only to training examples. Validation/test keep the
+Python memory-maps and validates raw shards. Versioned dataset descriptors bind
+shard hashes, run/teacher configuration, full trajectory content, lineage and
+starting-opening families. Local game IDs are namespaced across shards. Complete
+duplicate trajectories and declared lineage descendants are grouped before
+sampling; D4 is training-only. Checkpoints bind an immutable split manifest and
+dataset/provenance fingerprint; evaluate cannot redefine the split. Raw V1
+quality metadata remains unknown; V2 adds completed/requested depth, total work,
+budget and termination. Fallback/Analysis is excluded from supervision. Validation/test keep the
 canonical unaugmented view. PyTorch float checkpoints remain offline artifacts;
 only explicitly quantized, bounded model version 1 files enter the Rust parser.
 The exact model contract is in [LEARNED_MODEL.md](LEARNED_MODEL.md).
@@ -986,11 +993,46 @@ are useful for scaling/strength experiments and may be schedule-dependent. There
 are no random openings, parallel matches, Elo estimates or tournament
 infrastructure.
 
-## Explicit V0.12 non-goals
+## V1.0 research implementation (unreleased)
 
-No Null Move, ProbCut, singular extension, qsearch TT, interior VCF/VCT,
+The offline Python tools own immutable dataset/run/split identities, resumable
+CPU training, calibration, and paired Arena orchestration. They are not an
+Engine dependency. `experiment.py` journals complete legs, excludes incomplete
+pairs, clusters repeated starts, and freezes executable/model/configuration
+hashes. Arena supports per-move limits and application-owned game clocks plus
+a bounded pbrain adapter for 15x15 Freestyle. Protocol faults forfeit the leg.
+The earlier V0.12 Arena description above is historical.
+
+`VerifiedProofBook` alone exports replayable proof labels: OR actions can label
+policy, AND coverage does not claim a best defense. Whole-book verification has
+total work, elapsed time, and cancellation limits in addition to leaf limits.
+The training descriptor carries proof lineage and exact-label conflict checks.
+
+`EngineConfig::with_interior_vcf` enables an optional single-worker experiment.
+It uses private solver scratch allocated once per public search and a bounded
+cooldown table. It only probes non-forced scout nodes with depth >= 3, <= 32
+candidates and real Four forcing moves. The result only changes policy-level
+ordering, below tactical tiers and a same-tier TT preference. No proof score,
+ordinary TT bound, root mate distance or independent public PV is produced.
+The per-probe work cap conservatively reserves depth+2 visits per expansion,
+including replay; actual work also consumes the public search cap and a separate
+per-search allowance. All board sidecars are restored before propagation.
+SMP disables this experiment entirely. Default configuration allocates no scratch.
+
+`SelectivityConfig` independently disables existing RFP/futility/razor/LMP/LMR/
+IIR/extensions for research. It cannot disable the TT validity firewall, nominal
+re-search, immediate facts or stop restoration. Pattern and Learned still use
+the historical margins; no Learned-specific calibrated profile is claimed.
+
+The `experimental-v2` feature exposes an offline float reference, not a runtime
+Evaluator. Its distinct architecture id prevents interpreting V1 model bytes as
+a nonlinear model. No default evaluator or Native human-play setting changes.
+
+## Remaining research non-goals
+
+No Null Move, ProbCut, singular extension, qsearch TT, interior VCT,
 policy-based reduction/pruning, explicit SIMD optimization, unsafe code, MCTS, AlphaZero,
 Transformer evaluation, GPU compute, opening database, server/protocol layer,
-full-game clocks, SPRT/Elo framework, Renju, Swap/Swap2, or a generic persistent
+Renju, Swap/Swap2, or a generic persistent
 thread pool. Core's backing storage remains 225 cells. Future scope is in
 [ROADMAP.md](ROADMAP.md).

@@ -118,7 +118,22 @@ Empirical balance must never be described as proof.
 Rapfi/Figrid-style learned-evaluation ideas may be studied conceptually, but GPL
 code is not copied.
 
-## V1.0 — Integrated Strength / Proof-Guided Search (planned)
+## V1.0 — Integrated Strength / Proof-Guided Search (in progress, unreleased)
+
+Implemented research infrastructure: trajectory/lineage split manifests,
+quality filtering, calibrated V1 export and equivalent folded inference;
+resumable CPU training, verified proof labels, bounded smoke orchestration and
+hash-bound champion gating; paired statistics/recovery and a minimal external
+pbrain runner; nonlinear float reference; default-off single-worker VCF ordering
+probes; existing-selectivity ablation switches; Windows/Linux CI definitions.
+
+Release gates remain open: a stable trained model, independent fixed-time
+confirmation, external strong-engine games with frozen weights and resources,
+and statistical strength evidence. Current smoke samples are inconclusive.
+Proof-neighborhood perturbation/relabel generation and calibrated search
+profiles remain future work. E3-E6 algorithms are gated on those prerequisites;
+they have not been implemented merely to fill the roadmap. No persistent SMP
+pool, SIMD, or TT synchronization rewrite is justified by the current timings.
 
 Experimentally evaluate rather than automatically retain:
 

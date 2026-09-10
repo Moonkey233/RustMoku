@@ -5,11 +5,16 @@ use std::{
     fs::{self, File},
     io::{self, Read, Write},
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 
 use rustmoku_core::{
     CELL_COUNT, CanonicalPosition, CanonicalPositionKey, Game, Move, Position, RuleSet, Stone,
 };
+
+#[path = "proof_training.rs"]
+mod training;
+pub use training::ProofTrainingSample;
 
 const MAGIC: &[u8; 8] = b"RMPBOOK1";
 const VERSION: u16 = 1;
@@ -21,6 +26,8 @@ const MAX_ENTRIES: usize = 1_000_000;
 pub struct ProofBookVerifyLimits {
     pub max_tactical_plies: u8,
     pub max_tactical_nodes_per_leaf: u64,
+    pub max_total_work: u64,
+    pub max_time: Option<Duration>,
 }
 
 impl ProofBookVerifyLimits {
@@ -29,7 +36,20 @@ impl ProofBookVerifyLimits {
         Self {
             max_tactical_plies,
             max_tactical_nodes_per_leaf,
+            max_total_work: 50_000_000,
+            max_time: Some(Duration::from_secs(60)),
         }
+    }
+    #[must_use]
+    pub const fn with_total_work(mut self, work: u64) -> Self {
+        self.max_total_work = work;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_time(mut self, duration: Duration) -> Self {
+        self.max_time = Some(duration);
+        self
     }
 }
 
@@ -357,6 +377,21 @@ impl ProofBook {
         self,
         limits: ProofBookVerifyLimits,
     ) -> Result<VerifiedProofBook, ProofBookError> {
+        self.verify_controlled(limits, crate::CancellationToken::new())
+    }
+
+    pub fn verify_controlled(
+        self,
+        limits: ProofBookVerifyLimits,
+        cancellation: crate::CancellationToken,
+    ) -> Result<VerifiedProofBook, ProofBookError> {
+        let mut control = VerificationControl {
+            limits,
+            cancellation,
+            started: Instant::now(),
+            work: 0,
+        };
+        control.poll()?;
         if self.roots.is_empty() {
             return Err(ProofBookError::Invalid("Proof Book has no roots"));
         }
@@ -369,6 +404,7 @@ impl ProofBook {
             return Err(ProofBookError::Invalid("duplicate Proof Book entry"));
         }
         for entry in &self.entries {
+            control.charge(1)?;
             let budget = match entry.action {
                 StoredAction::Vcf {
                     max_plies,
@@ -408,13 +444,14 @@ impl ProofBook {
                 return Err(ProofBookError::Invalid("duplicate Proof Book root"));
             }
             let mut stack = BTreeSet::new();
-            verify_position(
+            verify_position_controlled(
                 game.position(),
                 root.attacker,
                 &entries,
                 &mut visited,
                 &mut stack,
                 &mut memo,
+                &mut control,
             )?;
         }
         if visited.len() != entries.len() {
@@ -427,6 +464,82 @@ impl ProofBook {
     }
 }
 
+struct VerificationControl {
+    limits: ProofBookVerifyLimits,
+    cancellation: crate::CancellationToken,
+    started: Instant,
+    work: u64,
+}
+
+impl VerificationControl {
+    fn poll(&self) -> Result<(), ProofBookError> {
+        if self.cancellation.is_cancelled()
+            || self
+                .limits
+                .max_time
+                .is_some_and(|time| self.started.elapsed() >= time)
+        {
+            return Err(ProofBookError::VerificationLimit(
+                "book verification cancelled or timed out",
+            ));
+        }
+        Ok(())
+    }
+
+    fn charge(&mut self, work: u64) -> Result<(), ProofBookError> {
+        self.poll()?;
+        self.work = self
+            .work
+            .checked_add(work)
+            .filter(|&total| total <= self.limits.max_total_work)
+            .ok_or(ProofBookError::VerificationLimit(
+                "book total verification work exhausted",
+            ))?;
+        Ok(())
+    }
+
+    fn tactical(
+        &mut self,
+        position: &Position,
+        attacker: Stone,
+        is_vct: bool,
+        max_plies: u8,
+        max_nodes: u64,
+    ) -> Result<(u8, Option<Move>), ProofBookError> {
+        self.poll()?;
+        let available = self
+            .limits
+            .max_total_work
+            .saturating_sub(self.work)
+            .min(max_nodes);
+        if available == 0 {
+            return Err(ProofBookError::VerificationLimit(
+                "book total verification work exhausted",
+            ));
+        }
+        let duration = self
+            .limits
+            .max_time
+            .map(|time| time.saturating_sub(self.started.elapsed()));
+        let (result, work) = crate::offline::tactical_attempt(
+            position,
+            attacker,
+            is_vct,
+            crate::ProofLimits::new(max_plies, max_nodes),
+            available,
+            duration,
+            self.cancellation.clone(),
+        );
+        self.charge(work)?;
+        result.ok_or(if available < max_nodes {
+            ProofBookError::VerificationLimit("book total verification work exhausted")
+        } else {
+            ProofBookError::Invalid("tactical proof leaf did not verify")
+        })
+    }
+}
+
+#[cfg(test)]
 fn verify_position(
     position: &Position,
     attacker: Stone,
@@ -435,6 +548,32 @@ fn verify_position(
     stack: &mut BTreeSet<EntryKey>,
     memo: &mut BTreeMap<EntryKey, ProofDistance>,
 ) -> Result<ProofDistance, ProofBookError> {
+    verify_position_controlled(
+        position,
+        attacker,
+        entries,
+        visited,
+        stack,
+        memo,
+        &mut VerificationControl {
+            limits: ProofBookVerifyLimits::default(),
+            cancellation: crate::CancellationToken::new(),
+            started: Instant::now(),
+            work: 0,
+        },
+    )
+}
+
+fn verify_position_controlled(
+    position: &Position,
+    attacker: Stone,
+    entries: &BTreeMap<EntryKey, StoredEntry>,
+    visited: &mut BTreeSet<EntryKey>,
+    stack: &mut BTreeSet<EntryKey>,
+    memo: &mut BTreeMap<EntryKey, ProofDistance>,
+    control: &mut VerificationControl,
+) -> Result<ProofDistance, ProofBookError> {
+    control.charge(1)?;
     if let Some(winner) = position.winner() {
         return if winner == attacker {
             Ok(ProofDistance::Exact(0))
@@ -474,8 +613,8 @@ fn verify_position(
             child
                 .make_move(at)
                 .map_err(|_| ProofBookError::Invalid("illegal attacker transition"))?;
-            add_one(verify_position(
-                &child, attacker, entries, visited, stack, memo,
+            add_one(verify_position_controlled(
+                &child, attacker, entries, visited, stack, memo, control,
             )?)
         }
         StoredAction::DefenderAll => {
@@ -490,8 +629,12 @@ fn verify_position(
                 child
                     .make_move(at)
                     .map_err(|_| ProofBookError::Invalid("illegal defender transition"))?;
-                longest = longest
-                    .max(verify_position(&child, attacker, entries, visited, stack, memo)?.plies());
+                longest = longest.max(
+                    verify_position_controlled(
+                        &child, attacker, entries, visited, stack, memo, control,
+                    )?
+                    .plies(),
+                );
             }
             if !found {
                 return Err(ProofBookError::Invalid(
@@ -519,10 +662,8 @@ fn verify_position(
             max_plies,
             max_nodes,
         } => {
-            let (plies, fresh_move) = crate::offline::verify_tactical_line(
-                position, attacker, false, max_plies, max_nodes,
-            )
-            .ok_or(ProofBookError::Invalid("VCF proof leaf did not verify"))?;
+            let (plies, fresh_move) =
+                control.tactical(position, attacker, false, max_plies, max_nodes)?;
             validate_tactical_move(position, canonical, best_move, fresh_move)?;
             ProofDistance::AtMost(plies)
         }
@@ -531,10 +672,8 @@ fn verify_position(
             max_plies,
             max_nodes,
         } => {
-            let (plies, fresh_move) = crate::offline::verify_tactical_line(
-                position, attacker, true, max_plies, max_nodes,
-            )
-            .ok_or(ProofBookError::Invalid("VCT proof leaf did not verify"))?;
+            let (plies, fresh_move) =
+                control.tactical(position, attacker, true, max_plies, max_nodes)?;
             validate_tactical_move(position, canonical, best_move, fresh_move)?;
             ProofDistance::AtMost(plies)
         }

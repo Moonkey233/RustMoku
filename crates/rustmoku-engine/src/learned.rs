@@ -42,6 +42,8 @@ pub struct LearnedModel {
     embeddings: Box<[i16]>,
     value_head: [i16; LEARNED_HIDDEN],
     policy_head: [i16; LEARNED_HIDDEN],
+    value_table: Box<[i64]>,
+    policy_table: Box<[i64]>,
     value_bias: i64,
     value_scale: i32,
     policy_scale: i32,
@@ -137,7 +139,10 @@ impl LearnedModel {
             *weight = decoder.i16()?;
         }
         debug_assert_eq!(decoder.remaining(), 0);
+        let (value_table, policy_table) = compile_tables(&embeddings, &value_head, &policy_head);
         Ok(Self {
+            value_table,
+            policy_table,
             embeddings: embeddings.into_boxed_slice(),
             value_head,
             policy_head,
@@ -209,29 +214,16 @@ impl LearnedModel {
         }
     }
 
-    fn embedding(&self, key: LineKey, dimension: usize) -> i16 {
-        self.embeddings[usize::from(key.0) * LEARNED_HIDDEN + dimension]
-    }
-
-    fn value(&self, accumulator: &[i32; LEARNED_HIDDEN]) -> i32 {
-        let dot = accumulator
-            .iter()
-            .zip(self.value_head)
-            .fold(self.value_bias, |sum, (&feature, weight)| {
-                sum + i64::from(feature) * i64::from(weight)
-            });
-        let score = dot / i64::from(self.value_scale);
+    fn value(&self, accumulator: i64) -> i32 {
+        let score = (accumulator + self.value_bias) / i64::from(self.value_scale);
         score.clamp(-i64::from(EVALUATION_LIMIT), i64::from(EVALUATION_LIMIT)) as i32
     }
 
     fn policy(&self, side: Stone, keys: [LineKey; 4]) -> i32 {
-        let mut score = 0_i64;
-        for dimension in 0..LEARNED_HIDDEN {
-            let local = keys.into_iter().fold(0_i32, |sum, key| {
-                sum + i32::from(self.embedding(relative_key(key, side), dimension))
-            });
-            score += i64::from(local) * i64::from(self.policy_head[dimension]);
-        }
+        let score: i64 = keys
+            .into_iter()
+            .map(|key| self.policy_table[usize::from(relative_key(key, side).0)])
+            .sum();
         (score / i64::from(self.policy_scale)).clamp(i64::from(i16::MIN), i64::from(i16::MAX))
             as i32
     }
@@ -242,10 +234,15 @@ impl LearnedModel {
         for (index, value) in embeddings.iter_mut().enumerate() {
             *value = ((index as u64 * 17 + 11) % 31) as i16 - 15;
         }
+        let value_head = std::array::from_fn(|index| index as i16 - 8);
+        let policy_head = std::array::from_fn(|index| 8 - index as i16);
+        let (value_table, policy_table) = compile_tables(&embeddings, &value_head, &policy_head);
         Self {
             embeddings: embeddings.into_boxed_slice(),
-            value_head: std::array::from_fn(|index| index as i16 - 8),
-            policy_head: std::array::from_fn(|index| 8 - index as i16),
+            value_head,
+            policy_head,
+            value_table,
+            policy_table,
             value_bias: 37,
             value_scale: 64,
             policy_scale: 32,
@@ -253,9 +250,34 @@ impl LearnedModel {
     }
 }
 
+// Distributivity is exact: each table entry is at most 16 * 32768^2;
+// 900 entries fit in i64. No per-key division or clamp is permitted.
+fn compile_tables(
+    embeddings: &[i16],
+    value_head: &[i16; LEARNED_HIDDEN],
+    policy_head: &[i16; LEARNED_HIDDEN],
+) -> (Box<[i64]>, Box<[i64]>) {
+    let compile = |head: &[i16; LEARNED_HIDDEN]| {
+        embeddings
+            .as_chunks::<LEARNED_HIDDEN>()
+            .0
+            .iter()
+            .map(|embedding| {
+                embedding
+                    .iter()
+                    .zip(head)
+                    .map(|(&a, &b)| i64::from(a) * i64::from(b))
+                    .sum()
+            })
+            .collect::<Vec<i64>>()
+            .into_boxed_slice()
+    };
+    (compile(value_head), compile(policy_head))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LearnedState {
-    accumulators: [[i32; LEARNED_HIDDEN]; 2],
+    accumulators: [i64; 2],
 }
 
 #[derive(Clone, Debug)]
@@ -296,11 +318,8 @@ impl LearnedEvaluator {
             let (remove, add) = if reverse { (new, old) } else { (old, new) };
             for side in [Stone::Black, Stone::White] {
                 let accumulator = &mut state.accumulators[stone_index(side)];
-                for (dimension, value) in accumulator.iter_mut().enumerate() {
-                    *value -=
-                        i32::from(self.model.embedding(relative_key(remove, side), dimension));
-                    *value += i32::from(self.model.embedding(relative_key(add, side), dimension));
-                }
+                *accumulator -= self.model.value_table[usize::from(relative_key(remove, side).0)];
+                *accumulator += self.model.value_table[usize::from(relative_key(add, side).0)];
             }
         }
     }
@@ -312,14 +331,12 @@ impl Evaluator for LearnedEvaluator {
 
     fn initialize(&self, _position: &Position, patterns: &PatternState) -> LearnedState {
         let mut state = LearnedState {
-            accumulators: [[0; LEARNED_HIDDEN]; 2],
+            accumulators: [0; 2],
         };
         for key in patterns.all_line_keys() {
             for side in [Stone::Black, Stone::White] {
-                for dimension in 0..LEARNED_HIDDEN {
-                    state.accumulators[stone_index(side)][dimension] +=
-                        i32::from(self.model.embedding(relative_key(key, side), dimension));
-                }
+                state.accumulators[stone_index(side)] +=
+                    self.model.value_table[usize::from(relative_key(key, side).0)];
             }
         }
         state
@@ -335,7 +352,7 @@ impl Evaluator for LearnedEvaluator {
 
     fn evaluate(&self, position: &Position, _patterns: &PatternState, state: &LearnedState) -> i32 {
         self.model
-            .value(&state.accumulators[stone_index(position.side_to_move())])
+            .value(state.accumulators[stone_index(position.side_to_move())])
     }
 
     fn policy_score(
@@ -434,7 +451,7 @@ impl Evaluator for RuntimeEvaluator {
     }
 }
 
-fn relative_key(key: LineKey, side: Stone) -> LineKey {
+pub(crate) fn relative_key(key: LineKey, side: Stone) -> LineKey {
     if side == Stone::Black {
         return key;
     }
@@ -522,6 +539,88 @@ mod tests {
     use super::*;
     use crate::search_state::SearchState;
 
+    fn reference_value(model: &LearnedModel, patterns: &PatternState, side: Stone) -> i32 {
+        let mut accumulator = [0_i64; LEARNED_HIDDEN];
+        for key in patterns.all_line_keys() {
+            let offset = usize::from(relative_key(key, side).0) * LEARNED_HIDDEN;
+            for (dimension, sum) in accumulator.iter_mut().enumerate() {
+                *sum += i64::from(model.embeddings[offset + dimension]);
+            }
+        }
+        let dot = accumulator
+            .iter()
+            .zip(model.value_head)
+            .fold(model.value_bias, |sum, (&feature, weight)| {
+                sum + feature * i64::from(weight)
+            });
+        (dot / i64::from(model.value_scale))
+            .clamp(-i64::from(EVALUATION_LIMIT), i64::from(EVALUATION_LIMIT)) as i32
+    }
+
+    #[test]
+    fn folded_tables_match_unfolded_integer_reference_at_extremes() {
+        for extreme in [false, true] {
+            let mut model = LearnedModel::deterministic_fixture();
+            if extreme {
+                for (index, value) in model.embeddings.iter_mut().enumerate() {
+                    *value = if index % 3 == 0 { i16::MIN } else { i16::MAX };
+                }
+                model.value_head = [i16::MIN; LEARNED_HIDDEN];
+                model.policy_head = [i16::MAX; LEARNED_HIDDEN];
+                model.value_bias = i64::MAX - MAX_VALUE_DOT;
+                (model.value_table, model.policy_table) =
+                    compile_tables(&model.embeddings, &model.value_head, &model.policy_head);
+            }
+            let evaluator = LearnedEvaluator::new(Arc::new(model));
+            let mut position = Position::default();
+            let mut undos = Vec::new();
+            for index in (0..CELL_COUNT).map(|i| (i * 97) % CELL_COUNT).take(100) {
+                let at = Move::from_index(index).unwrap();
+                if !position.is_legal(at) {
+                    break;
+                }
+                undos.push(position.make_move(at).unwrap());
+                let patterns = PatternState::new(&position);
+                let state = evaluator.initialize(&position, &patterns);
+                for side in [Stone::Black, Stone::White] {
+                    assert_eq!(
+                        evaluator.model.value(state.accumulators[stone_index(side)]),
+                        reference_value(&evaluator.model, &patterns, side)
+                    );
+                    for at in Move::all().filter(|&at| position.is_legal(at)) {
+                        let mut dot = 0_i64;
+                        for dimension in 0..LEARNED_HIDDEN {
+                            let local: i64 = patterns
+                                .line_keys(at)
+                                .into_iter()
+                                .map(|key| {
+                                    i64::from(
+                                        evaluator.model.embeddings[usize::from(
+                                            relative_key(key, side).0,
+                                        ) * LEARNED_HIDDEN
+                                            + dimension],
+                                    )
+                                })
+                                .sum();
+                            dot += local * i64::from(evaluator.model.policy_head[dimension]);
+                        }
+                        let reference = (dot / i64::from(evaluator.model.policy_scale))
+                            .clamp(i64::from(i16::MIN), i64::from(i16::MAX))
+                            as i32;
+                        assert_eq!(
+                            evaluator.model.policy(side, patterns.line_keys(at)),
+                            reference
+                        );
+                    }
+                }
+            }
+            while let Some(undo) = undos.pop() {
+                position.unmake_move(undo);
+            }
+            assert_eq!(position, Position::default());
+        }
+    }
+
     #[test]
     fn model_round_trip_and_parser_rejections() {
         let model = LearnedModel::deterministic_fixture();
@@ -599,10 +698,10 @@ mod tests {
         model.value_scale = 1;
         let evaluator = LearnedEvaluator::new(Arc::new(model));
         let mut state = LearnedState {
-            accumulators: [[0; LEARNED_HIDDEN]; 2],
+            accumulators: [0; 2],
         };
-        state.accumulators[stone_index(Stone::Black)][0] = 123;
-        state.accumulators[stone_index(Stone::White)][0] = -123;
+        state.accumulators[stone_index(Stone::Black)] = 123;
+        state.accumulators[stone_index(Stone::White)] = -123;
         let black_to_move = Position::default();
         let black_patterns = PatternState::new(&black_to_move);
         assert_eq!(

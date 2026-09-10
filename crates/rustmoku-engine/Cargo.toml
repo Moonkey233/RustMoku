@@ -17,7 +17,12 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 
 [features]
 bench-internals = []
+experimental-v2 = []
 
 [[example]]
 name = "hotpath_bench"
 required-features = ["bench-internals"]
+
+[[example]]
+name = "nonlinear_reference"
+required-features = ["experimental-v2"]

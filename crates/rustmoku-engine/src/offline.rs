@@ -1165,7 +1165,7 @@ pub(crate) fn verify_tactical_line(
     .0
 }
 
-fn tactical_attempt(
+pub(crate) fn tactical_attempt(
     position: &Position,
     attacker: Stone,
     is_vct: bool,

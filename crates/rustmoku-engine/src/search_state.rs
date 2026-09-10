@@ -74,6 +74,16 @@ impl<E: Evaluator> SearchState<E> {
         solver.solve_controlled(&mut self.board, attacker, max_plies, budget)
     }
 
+    pub(crate) fn vcf_ordering_hint(
+        &mut self,
+        solver: &mut VcfSolver,
+        depth: u8,
+        work: u64,
+        budget: &mut crate::search_control::SearchBudget,
+    ) -> (crate::vcf::VcfStatus, Option<Move>) {
+        solver.ordering_hint(&mut self.board, depth, work, budget)
+    }
+
     pub(crate) fn make_move(
         &mut self,
         at: Move,

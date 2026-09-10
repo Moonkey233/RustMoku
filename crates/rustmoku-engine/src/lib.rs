@@ -10,12 +10,16 @@ mod board_state;
 mod candidate_frontier;
 mod config;
 mod evaluation;
+mod interior_proof;
 mod learned;
 #[cfg(test)]
 mod line_classifier;
 mod line_geometry;
 mod move_generation;
 mod move_ordering;
+/// Offline float architecture oracle; never a runtime evaluator default.
+#[cfg(feature = "experimental-v2")]
+pub mod nonlinear_reference;
 mod offline;
 mod pattern;
 mod pattern_state;
@@ -34,8 +38,9 @@ mod vcf;
 mod vct;
 mod zobrist;
 
-pub use config::{EngineConfig, ProofLimits, TacticalConfig};
+pub use config::{EngineConfig, ProofLimits, SelectivityConfig, TacticalConfig};
 pub use evaluation::{ClassicalEvaluator, Evaluator, PatternEvaluator};
+pub use interior_proof::InteriorProofStatistics;
 pub use learned::{
     LEARNED_FEATURE_COUNT, LEARNED_HIDDEN, LearnedEvaluator, LearnedModel, LearnedModelError,
     LearnedModelMetadata, LearnedState, RuntimeEvaluator, RuntimeEvaluatorState,
@@ -47,7 +52,7 @@ pub use offline::{
 pub use pattern_state::{PatternDelta, PatternState};
 pub use proof_book::{
     Proof, ProofBook, ProofBookError, ProofBookHit, ProofBookMetadata, ProofBookSourceSummary,
-    ProofBookVerifyLimits, ProofDistance, ProofSource, VerifiedProofBook,
+    ProofBookVerifyLimits, ProofDistance, ProofSource, ProofTrainingSample, VerifiedProofBook,
 };
 pub use search::{
     AlphaBetaEngine, SearchEngine, SearchInfo, SearchLimits, SearchObserver, SearchOrigin,

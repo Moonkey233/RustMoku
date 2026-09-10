@@ -16,6 +16,66 @@ These metrics are not interchangeable. Iterative deepening, TT, and PV remain.
 
 ## Environment
 
+### Unreleased V1.0 bounded observations (2026-09-09)
+
+Baseline HEAD remains `76cc5ac`; the following implementation is uncommitted.
+These are local smoke observations, not a V1.0 release or strength result.
+The original 20-game/100-work CR reproduced 564 records, 9 distinct trajectories,
+and 45/51 test positions in train. A later 8-game diversified smoke produced
+366 records, 8 distinct trajectories and 37 qualified unique labels (329
+fallback labels excluded). Its only train/test position overlap was in the
+short prefix; after ply 8 it was zero. Generation measured 111.65 qualified
+unique positions/s; the tiny one-epoch training took 1.585 s for three steps.
+
+The same V1 smoke model and opening/20,000-work case took 216.411 ms before
+folding and 27.075 ms after folding, with identical semantic/node results.
+The 1,000-iteration microbenchmark medians changed Value 6.90 -> 1.70 ns,
+Policy 26.60 -> 5.70 ns, make/unmake 8887.10 -> 704.50 ns. Nanosecond samples
+are noisy and model-specific. No SIMD or unsafe optimization was used.
+
+`research_bench` supplies bounded depth-4, work-20,000 and time-20ms runs with
+explicit cold/warm TT rows, 1 MiB primary TT and 1/2/4/8 workers. The Sep 9
+matrix collected 54 samples for Pattern/frozen smoke Learned plus proof-off/on.
+Model SHA256: `4b2557fa8b4d15aa0058251f7f01713b8b85925034c4bae1d35877ec07d6eb0e`.
+Cold fixed-work observations (one sample each):
+
+| Evaluator | Workers | ms | Completed depth |
+|---|---:|---:|---:|
+| Pattern | 1 / 2 / 4 / 8 | 10.411 / 6.143 / 3.866 / 2.731 | 4 / 4 / 3 / 3 |
+| Learned | 1 / 2 / 4 / 8 | 26.619 / 15.439 / 10.093 / 5.005 | 4 / 4 / 3 / 3 |
+
+All rows spent exactly 20,000 work. Faster work exhaustion is not faster
+completion of an equivalent search or stronger play. The narrow interior VCF
+scheduler attempted zero probes on this opening; it remains default-off and
+has no demonstrated net benefit. No pool/TT synchronization rewrite follows.
+This driver records TT bytes and node contributions, not allocator events,
+per-thread resident memory or cancellation tail latency; those need dedicated
+profiling before choosing a low-level optimization.
+
+Reproduce individual cells with `cargo run --release -p rustmoku-engine
+--example research_bench -- --threads 4 --mode work [--model FILE] [--probe]`.
+Use the existing quick-suite and opening/defense depth-six benchmark protocol
+for regression comparisons. Do not compare concurrent validation load timings.
+Performance runs belong on a fixed machine/toolchain/model with explicit
+budgets; shared CI runners do not adjudicate small timing regressions.
+
+CI definitions cover Windows/Linux compilation and headless tests. The manual
+heavy lane adds Release oracle and a bounded training/Arena smoke. No GUI manual
+interaction, hosted CI run, formal training, external strong-engine match or
+statistical promotion is implied by local validation. Formal experiments need
+CPU/GPU, memory/disk, time, pair caps and frozen external engine/model inputs.
+
+Final local validation passed fmt, workspace/all-target check, all-feature
+Clippy with warnings denied, 212 workspace tests, 167 Release engine tests,
+13 Python training/recovery tests and 5 paired-statistics tests. The generated
+debug tactical oracle took 134.14 s. The final three-repeat quick suite and
+opening/forced-defense depth-six runs passed; the latter medians were
+66.425/91.410 ms with 116,169/162,220 total work respectively.
+The full smoke pipeline and its unchanged-input second run passed, including
+15 Rust/Python integer fixtures and rejection by the promotion gate.
+The proof-on/off 10ms Arena smoke completed two pairs with counts [0,0,2,0,0]:
+inconclusive, with no eligible promotion. Local results do not certify hosted CI.
+
 - CPU: AMD Ryzen 7 8845H, 8 cores / 16 logical processors
 - Host: `x86_64-pc-windows-msvc`
 - Toolchain: `rustc 1.98.1 (48a229cea 2026-09-01)`, LLVM 22.1.8

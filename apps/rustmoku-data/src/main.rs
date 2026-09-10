@@ -15,14 +15,18 @@ use rustmoku_core::{
     CELL_COUNT, CanonicalPosition, CanonicalPositionKey, Game, Move, OPENINGS, Symmetry,
 };
 use rustmoku_engine::{
-    AlphaBetaEngine, EngineConfig, LearnedEvaluator, LearnedModel, PatternEvaluator, SearchEngine,
-    SearchLimits, SearchOrigin,
+    AlphaBetaEngine, EngineConfig, LearnedEvaluator, LearnedModel, PatternEvaluator, ProofBook,
+    ProofBookVerifyLimits, ProofDistance, SearchEngine, SearchLimits, SearchOrigin,
+    SearchTermination,
 };
 
 const MAGIC: &[u8; 8] = b"RMDATA01";
-const VERSION: u16 = 1;
+const VERSION: u16 = 2;
 const MAX_RECORDS: usize = 10_000_000;
-const RECORD_BYTES: usize = 8 + 2 + 1 + 1 + 4 + 1 + 1 + CanonicalPositionKey::BYTE_LEN;
+const LEGACY_RECORD_BYTES: usize = 8 + 2 + 1 + 1 + 4 + 1 + 1 + CanonicalPositionKey::BYTE_LEN;
+
+const QUALITY_BYTES: usize = 19;
+const RECORD_BYTES: usize = LEGACY_RECORD_BYTES + QUALITY_BYTES;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct DataRecord {
@@ -34,6 +38,16 @@ struct DataRecord {
     source: SearchOrigin,
     exact: bool,
     position: CanonicalPositionKey,
+    quality: Option<LabelQuality>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LabelQuality {
+    completed_depth: u8,
+    requested_depth: u8,
+    termination: u8,
+    work: u64,
+    budget: u64,
 }
 
 fn main() -> ExitCode {
@@ -50,6 +64,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut args = Arguments::new(env::args().skip(1));
     match args.command()?.as_str() {
         "record" => generate_record(args),
+        "proof" => generate_proof(args),
         "selfplay" => generate_selfplay(args),
         "inspect" => inspect(args),
         "model-check" => model_check(args),
@@ -59,6 +74,48 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
         other => Err(format!("unknown command {other:?}").into()),
     }
+}
+
+fn generate_proof(mut args: Arguments) -> Result<(), Box<dyn Error>> {
+    let book = PathBuf::from(args.required("--book")?);
+    let output = PathBuf::from(args.required("--output")?);
+    let max_positions: usize = args.optional("--max-positions")?.unwrap_or(10_000);
+    let max_work: u64 = args.optional("--verify-work")?.unwrap_or(1_000_000);
+    args.finish()?;
+    if max_positions == 0 || max_positions > 100_000 {
+        return Err("proof export positions must be 1..=100000".into());
+    }
+    let verified = ProofBook::read_from_path(book)?
+        .verify_with_limits(ProofBookVerifyLimits::default().with_total_work(max_work))?;
+    let mut records = Vec::new();
+    let mut metadata = Vec::new();
+    verified.visit_training_positions(max_positions, |sample| {
+        let canonical = CanonicalPosition::new(sample.game.position());
+        let game_id = records.len() as u64;
+        records.push(DataRecord {
+            game_id, ply: sample.game.history().len() as u16,
+            canonical_symmetry: symmetry_tag(canonical.original_to_canonical()),
+            policy_move: sample.policy.map(|at| canonical.move_to_canonical(at)),
+            value: i32::from(sample.value) * 10_000_000,
+            source: SearchOrigin::ProofBook, exact: true, position: canonical.key(), quality: None,
+        });
+        let lineage = sample.lineage.as_bytes().iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+        let moves = sample.game.history().map(|at| at.index().to_string()).collect::<Vec<_>>().join(",");
+        let kind = match sample.distance { ProofDistance::Exact(_) => "source-exact", ProofDistance::AtMost(_) => "at-most" };
+        metadata.push(format!(
+            "\"{game_id}\":{{\"lineage_id\":\"{lineage}-{:?}\",\"distance_kind\":\"{kind}\",\"plies\":{},\"moves\":[{moves}]}}",
+            sample.attacker, sample.distance.plies()));
+    })?;
+    write_dataset(&output, &records)?;
+    std::fs::write(
+        output.with_extension("proof.json"),
+        format!("{{\"version\":1,\"games\":{{{}}}}}\n", metadata.join(",")),
+    )?;
+    println!(
+        "exported {} independently verified proof labels",
+        records.len()
+    );
+    Ok(())
 }
 
 fn generate_record(mut args: Arguments) -> Result<(), Box<dyn Error>> {
@@ -102,7 +159,12 @@ fn generate_selfplay(mut args: Arguments) -> Result<(), Box<dyn Error>> {
     let requested_workers: usize = args.optional("--workers")?.unwrap_or(1);
     let depth = args.optional("--depth")?.unwrap_or(6);
     let nodes = args.optional("--nodes")?.unwrap_or(20_000);
+    let random_plies: usize = args.optional("--random-plies")?.unwrap_or(0);
+    let cold_games: bool = args.optional("--cold-games")?.unwrap_or(false);
     args.finish()?;
+    if random_plies > 8 {
+        return Err("random prefix must be 0..=8 plies".into());
+    }
     if games == 0 || games > MAX_RECORDS / (CELL_COUNT + 1) {
         return Err("game count can exceed the dataset record safety limit".into());
     }
@@ -119,11 +181,15 @@ fn generate_selfplay(mut args: Arguments) -> Result<(), Box<dyn Error>> {
                 let mut teacher = teacher_engine();
                 let mut records = Vec::new();
                 for game_id in (worker..games).step_by(workers) {
+                    if cold_games {
+                        teacher = teacher_engine();
+                    }
                     let opening_index =
                         (splitmix64(seed ^ game_id as u64) as usize) % OPENINGS.len();
                     let mut game = OPENINGS[opening_index]
                         .game()
                         .map_err(|error| error.to_string())?;
+                    let opening_plies = game.history().len();
                     while game.status() == rustmoku_core::GameStatus::Ongoing {
                         let record = label_position(
                             &mut teacher,
@@ -139,6 +205,17 @@ fn generate_selfplay(mut args: Arguments) -> Result<(), Box<dyn Error>> {
                             canonical.move_to_original(at)
                         }) else {
                             break;
+                        };
+                        let at = if game.history().len() - opening_plies < random_plies {
+                            diverse_move(
+                                &game,
+                                at,
+                                splitmix64(
+                                    seed ^ ((game_id as u64) << 32) ^ game.history().len() as u64,
+                                ),
+                            )
+                        } else {
+                            at
                         };
                         records.push(record);
                         game.play_move(at).map_err(|error| error.to_string())?;
@@ -177,6 +254,21 @@ fn generate_selfplay(mut args: Arguments) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+// Offline prefix diversity never changes normal engine determinism or labels.
+// Exact wins/blocks on either side suppress exploration entirely.
+fn diverse_move(game: &Game, teacher: Move, seed: u64) -> Move {
+    let position = game.position();
+    if Move::all().any(|at| {
+        position.is_legal(at)
+            && (position.would_win(at, position.side_to_move())
+                || position.would_win(at, position.side_to_move().opponent()))
+    }) {
+        return teacher;
+    }
+    let legal: Vec<_> = Move::all().filter(|&at| position.is_legal(at)).collect();
+    legal[(seed % legal.len() as u64) as usize]
+}
+
 fn label_position(
     engine: &mut AlphaBetaEngine<PatternEvaluator>,
     game_id: u64,
@@ -206,6 +298,18 @@ fn label_position(
                 | SearchOrigin::ProofBook
         ),
         position: canonical.key(),
+        quality: Some(LabelQuality {
+            completed_depth: result.completed_depth,
+            requested_depth: depth,
+            termination: match result.termination {
+                SearchTermination::Completed => 0,
+                SearchTermination::NodeLimit => 1,
+                SearchTermination::TimeLimit => 2,
+                SearchTermination::Cancelled => 3,
+            },
+            work: result.statistics.work_nodes,
+            budget: nodes,
+        }),
     })
 }
 
@@ -232,6 +336,17 @@ fn write_dataset(path: &Path, records: &[DataRecord]) -> Result<(), Box<dyn Erro
         file.write_all(&record.value.to_le_bytes())?;
         file.write_all(&[origin_tag(record.source), u8::from(record.exact)])?;
         file.write_all(record.position.as_bytes())?;
+        if let Some(quality) = record.quality {
+            file.write_all(&[
+                quality.completed_depth,
+                quality.requested_depth,
+                quality.termination,
+            ])?;
+            file.write_all(&quality.work.to_le_bytes())?;
+            file.write_all(&quality.budget.to_le_bytes())?;
+        } else {
+            file.write_all(&[u8::MAX; QUALITY_BYTES])?;
+        }
     }
     Ok(())
 }
@@ -245,18 +360,24 @@ fn read_dataset(path: &Path) -> Result<Vec<DataRecord>, Box<dyn Error>> {
     let mut file = File::open(path)?;
     let mut header = [0; 16];
     file.read_exact(&mut header)?;
+    let version = u16::from_le_bytes(header[8..10].try_into().unwrap());
     if &header[..8] != MAGIC
-        || u16::from_le_bytes(header[8..10].try_into().unwrap()) != VERSION
+        || !matches!(version, 1 | VERSION)
         || u16::from_le_bytes(header[10..12].try_into().unwrap()) != 0
     {
         return Err("invalid dataset magic, version, or flags".into());
     }
     let count = usize::try_from(u32::from_le_bytes(header[12..16].try_into().unwrap()))?;
-    if count > MAX_RECORDS || length != 16 + count as u64 * RECORD_BYTES as u64 {
+    let record_bytes = if version == 1 {
+        LEGACY_RECORD_BYTES
+    } else {
+        RECORD_BYTES
+    };
+    if count > MAX_RECORDS || length != 16 + count as u64 * record_bytes as u64 {
         return Err("invalid dataset record count or length".into());
     }
     let mut records = Vec::with_capacity(count);
-    let mut bytes = [0; RECORD_BYTES];
+    let mut bytes = vec![0; record_bytes];
     for _ in 0..count {
         file.read_exact(&mut bytes)?;
         let symmetry = bytes[10];
@@ -273,7 +394,8 @@ fn read_dataset(path: &Path) -> Result<Vec<DataRecord>, Box<dyn Error>> {
             1 => true,
             _ => return Err("invalid exact-label flag".into()),
         };
-        let key: [u8; CanonicalPositionKey::BYTE_LEN] = bytes[18..].try_into()?;
+        let key: [u8; CanonicalPositionKey::BYTE_LEN] =
+            bytes[18..LEGACY_RECORD_BYTES].try_into()?;
         records.push(DataRecord {
             game_id: u64::from_le_bytes(bytes[0..8].try_into().unwrap()),
             ply: u16::from_le_bytes(bytes[8..10].try_into().unwrap()),
@@ -283,6 +405,22 @@ fn read_dataset(path: &Path) -> Result<Vec<DataRecord>, Box<dyn Error>> {
             source,
             exact,
             position: CanonicalPositionKey::from_bytes(key)?,
+            quality: if version == 1 || bytes[LEGACY_RECORD_BYTES..].iter().all(|&b| b == u8::MAX) {
+                None
+            } else {
+                let q = &bytes[LEGACY_RECORD_BYTES..];
+                let quality = LabelQuality {
+                    completed_depth: q[0],
+                    requested_depth: q[1],
+                    termination: q[2],
+                    work: u64::from_le_bytes(q[3..11].try_into()?),
+                    budget: u64::from_le_bytes(q[11..19].try_into()?),
+                };
+                if quality.termination > 3 || quality.work > quality.budget {
+                    return Err("invalid label quality metadata".into());
+                }
+                Some(quality)
+            },
         });
     }
     Ok(records)
@@ -436,6 +574,25 @@ mod tests {
     use rustmoku_core::RuleSet;
 
     #[test]
+    fn offline_diversity_preserves_exact_wins_and_defenses() {
+        for moves in ["H8 A1 I8 A2 J8 B1 K8 B2", "A1 H8 A3 I8 B1 J8 B3 K8"] {
+            let game = Game::from_record(&format!("RustMoku 1\nrules=freestyle\nmoves={moves}\n"))
+                .unwrap();
+            let position = game.position();
+            let teacher = Move::all()
+                .find(|&at| {
+                    position.is_legal(at)
+                        && (position.would_win(at, position.side_to_move())
+                            || position.would_win(at, position.side_to_move().opponent()))
+                })
+                .unwrap();
+            for seed in 0..32 {
+                assert_eq!(diverse_move(&game, teacher, seed), teacher);
+            }
+        }
+    }
+
+    #[test]
     fn dataset_round_trip_is_deterministic_and_checked() {
         let record = DataRecord {
             game_id: 7,
@@ -446,6 +603,7 @@ mod tests {
             source: SearchOrigin::AlphaBeta,
             exact: false,
             position: CanonicalPosition::new(Game::new(RuleSet::Freestyle).position()).key(),
+            quality: None,
         };
         let path = env::temp_dir().join(format!("rustmoku-data-{}.bin", std::process::id()));
         write_dataset(&path, &[record]).unwrap();

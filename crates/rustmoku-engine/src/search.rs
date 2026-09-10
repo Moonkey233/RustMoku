@@ -68,6 +68,7 @@ impl Default for SearchLimits {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SearchStatistics {
+    pub interior_proof: crate::InteriorProofStatistics,
     /// Total admitted logical visits, including proof certificate visits.
     /// `qnodes` is already included in `nodes`, and is not charged twice.
     pub work_nodes: u64,
@@ -411,6 +412,7 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
                     pv: &mut pv,
                     statistics,
                     heuristics: SearchHeuristics::default(),
+                    interior_proof: None,
                     budget,
                 },
             );
@@ -517,8 +519,10 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
             pv: &mut pv,
             statistics,
             heuristics: SearchHeuristics::default(),
+            interior_proof: None,
             budget,
         };
+        resources.interior_proof = crate::interior_proof::InteriorProof::new(self.config);
         self.search_ordinary(
             root_position,
             state,
@@ -539,7 +543,8 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
         observer: &mut dyn SearchObserver,
     ) -> SearchResult {
         let threads = self.config.threads();
-        let principal = AbContext::new(&self.evaluator, &self.table, self.generation, 0);
+        let mut principal = AbContext::new(&self.evaluator, &self.table, self.generation, 0);
+        principal.selectivity = self.config.selectivity();
         if threads == 1 {
             let mut completed =
                 run_principal_iterations(&principal, state, limits, resources, completed, observer);
@@ -552,6 +557,7 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
         let evaluator = &self.evaluator;
         let table = &self.table;
         let generation = self.generation;
+        let selectivity = self.config.selectivity();
         let (completed, helper_results) = std::thread::scope(|scope| {
             let mut handles = Vec::with_capacity(threads.saturating_sub(1));
             for worker_id in 1..threads {
@@ -565,8 +571,9 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
                     let mut helper_statistics = SearchStatistics::default();
                     let mut helper_pv = PvTable::new();
                     let mut helper_seldepth = 0;
-                    let context =
+                    let mut context =
                         AbContext::new(helper_evaluator, helper_table, generation, worker_id);
+                    context.selectivity = selectivity;
                     run_helper_iterations(
                         &context,
                         &mut helper_state,
@@ -710,6 +717,7 @@ fn run_helper_iterations<E: Evaluator>(
         pv,
         statistics,
         heuristics: SearchHeuristics::default(),
+        interior_proof: None,
         budget,
     };
     for depth in 1..=limits.max_depth {
@@ -736,6 +744,7 @@ struct AbContext<'a, E: Evaluator> {
     table: &'a TranspositionTable,
     generation: u8,
     root_rotation: usize,
+    selectivity: crate::SelectivityConfig,
 }
 
 impl<'a, E: Evaluator> AbContext<'a, E> {
@@ -750,6 +759,7 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
             table,
             generation,
             root_rotation,
+            selectivity: crate::SelectivityConfig::BASELINE,
         }
     }
 
@@ -1014,6 +1024,27 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
                         .moves_at_least(side.opponent(), ThreatProfile::OpenThree),
                 )
                 .is_empty();
+        // Narrow scout-only scheduler: no immediate forced response, at least
+        // three remaining plies, <= 32 candidates, and an actual Four move.
+        let proof_hint = if PVS
+            && scout_node
+            && forced_block.is_none()
+            && depth >= 3
+            && candidate_bits.iter().count() <= 32
+            && !forcing_moves(state.patterns(), side).is_empty()
+        {
+            if let Some(proof) = resources.interior_proof.as_mut() {
+                proof.probe(
+                    state,
+                    resources.budget,
+                    &mut resources.statistics.interior_proof,
+                )?
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let selective_node = PVS
             && scout_node
             && forced_block.is_none()
@@ -1028,7 +1059,7 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
         } else {
             resources.heuristics.static_eval(ply)
         };
-        if selective_node && depth <= 3 {
+        if self.selectivity.reverse_futility && selective_node && depth <= 3 {
             resources.statistics.rfp_attempts += 1;
             if static_eval
                 .is_some_and(|score| score - search_params::reverse_futility_margin(depth) >= beta)
@@ -1039,7 +1070,8 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
                 ));
             }
         }
-        if selective_node
+        if self.selectivity.razoring
+            && selective_node
             && depth <= 2
             && static_eval.is_some_and(|score| score + search_params::razor_margin(depth) < alpha)
         {
@@ -1051,6 +1083,7 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
             }
         }
         let iir = PVS
+            && self.selectivity.iir
             && scout_node
             && forced_block.is_none()
             && !strong_threats
@@ -1075,7 +1108,13 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
             probe.best_move,
             &resources.heuristics,
             ply,
-            |at| state.policy_score(self.evaluator, at),
+            |at| {
+                if proof_hint == Some(at) {
+                    Some(i32::from(i16::MAX))
+                } else {
+                    state.policy_score(self.evaluator, at)
+                }
+            },
         );
         let mut best_move = None;
         let mut best_score = -SEARCH_INFINITY;
@@ -1091,7 +1130,8 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
                 && quiet
                 && probe.best_move != Some(at)
                 && !strong_context;
-            if late_quiet
+            if self.selectivity.lmp
+                && late_quiet
                 && searched_depth <= 3
                 && index >= search_params::lmp_threshold(searched_depth)
             {
@@ -1099,7 +1139,8 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
                 validity.upper = false;
                 continue;
             }
-            if late_quiet
+            if self.selectivity.futility
+                && late_quiet
                 && searched_depth <= 2
                 && static_eval.is_some_and(|score| {
                     score + search_params::futility_margin(searched_depth) <= alpha
@@ -1109,13 +1150,17 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
                 validity.upper = false;
                 continue;
             }
-            let extension = u8::from(threat_extension(
-                state.patterns().profile(at, side),
-                resources.heuristics.extensions(ply),
-            ));
+            let extension = u8::from(
+                self.selectivity.threat_extension
+                    && threat_extension(
+                        state.patterns().profile(at, side),
+                        resources.heuristics.extensions(ply),
+                    ),
+            );
             resources.statistics.threat_extensions += u64::from(extension);
             let child_depth = searched_depth - 1 + extension;
             let reduction = if PVS
+                && self.selectivity.lmr
                 && scout_node
                 && forced_block.is_none()
                 && probe.best_move != Some(at)
@@ -1580,6 +1625,7 @@ struct SearchResources<'a> {
     pv: &'a mut PvTable,
     statistics: &'a mut SearchStatistics,
     heuristics: SearchHeuristics,
+    interior_proof: Option<crate::interior_proof::InteriorProof>,
     budget: &'a mut SearchBudget,
 }
 
@@ -1945,6 +1991,7 @@ mod tests {
         let mut pv = PvTable::new();
         let mut seldepth = 0;
         let mut resources = super::SearchResources {
+            interior_proof: None,
             budget: &mut crate::search_control::SearchBudget::default(),
             statistics: &mut statistics,
             pv: &mut pv,
@@ -2025,6 +2072,7 @@ mod tests {
                 1,
                 0,
                 &mut super::SearchResources {
+                    interior_proof: None,
                     budget: &mut crate::search_control::SearchBudget::default(),
                     seldepth: &mut seldepth,
                     pv: &mut pv,
@@ -2072,6 +2120,7 @@ mod tests {
                 1,
                 0,
                 &mut super::SearchResources {
+                    interior_proof: None,
                     budget: &mut crate::search_control::SearchBudget::default(),
                     seldepth: &mut seldepth,
                     pv: &mut pv,
@@ -2118,6 +2167,7 @@ mod tests {
                 1,
                 0,
                 &mut super::SearchResources {
+                    interior_proof: None,
                     budget: &mut crate::search_control::SearchBudget::default(),
                     seldepth: &mut guided_seldepth,
                     pv: &mut guided_pv,
@@ -2144,6 +2194,7 @@ mod tests {
                 -crate::score::SEARCH_INFINITY,
                 crate::score::SEARCH_INFINITY,
                 &mut super::SearchResources {
+                    interior_proof: None,
                     budget: &mut crate::search_control::SearchBudget::default(),
                     seldepth: &mut seldepth,
                     pv: &mut pv,
@@ -2205,6 +2256,7 @@ mod tests {
                     2,
                     reference.score + offset,
                     &mut super::SearchResources {
+                        interior_proof: None,
                         budget: &mut crate::search_control::SearchBudget::default(),
                         seldepth: &mut seldepth,
                         pv: &mut pv,
@@ -2275,6 +2327,7 @@ mod tests {
                     -crate::score::SEARCH_INFINITY,
                     crate::score::SEARCH_INFINITY,
                     &mut super::SearchResources {
+                        interior_proof: None,
                         budget: &mut crate::search_control::SearchBudget::default(),
                         seldepth: &mut seldepth,
                         pv: &mut pv,
@@ -2302,6 +2355,7 @@ mod tests {
                 0,
                 qply,
                 &mut super::SearchResources {
+                    interior_proof: None,
                     budget: &mut crate::search_control::SearchBudget::default(),
                     seldepth: &mut seldepth,
                     pv: &mut pv,
@@ -2464,6 +2518,7 @@ mod tests {
                 crate::score::SEARCH_INFINITY,
                 7,
                 &mut super::SearchResources {
+                    interior_proof: None,
                     budget: &mut crate::search_control::SearchBudget::default(),
                     seldepth: &mut selective_depth,
                     pv: &mut line,
@@ -2550,6 +2605,7 @@ mod tests {
                 1,
                 0,
                 &mut super::SearchResources {
+                    interior_proof: None,
                     budget: &mut crate::search_control::SearchBudget::default(),
                     seldepth: &mut seldepth,
                     pv: &mut pv,
@@ -2655,6 +2711,7 @@ mod tests {
             let mut pv = crate::principal_variation::PvTable::new();
             let mut seldepth = 0;
             let mut resources = super::SearchResources {
+                interior_proof: None,
                 budget: &mut crate::search_control::SearchBudget::default(),
                 seldepth: &mut seldepth,
                 pv: &mut pv,
@@ -2699,6 +2756,7 @@ mod tests {
             let mut pv = crate::principal_variation::PvTable::new();
             let mut seldepth = 0;
             let mut resources = super::SearchResources {
+                interior_proof: None,
                 budget: &mut crate::search_control::SearchBudget::default(),
                 seldepth: &mut seldepth,
                 pv: &mut pv,
@@ -2789,6 +2847,7 @@ mod tests {
                     1,
                     0,
                     &mut super::SearchResources {
+                        interior_proof: None,
                         budget: &mut crate::search_control::SearchBudget::default(),
                         seldepth: &mut seldepth,
                         pv: &mut pv,

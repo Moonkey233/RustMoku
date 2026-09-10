@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import array
 import dataclasses
+import hashlib
+import json
 import mmap
 import os
 import random
@@ -20,10 +22,12 @@ BOARD_SIZE = 15
 CELL_COUNT = BOARD_SIZE * BOARD_SIZE
 POSITION_KEY_BYTES = (CELL_COUNT + 3) // 4 + 1
 DATA_MAGIC = b"RMDATA01"
-DATA_VERSION = 1
+DATA_VERSION = 2
 DATA_HEADER = struct.Struct("<8sHHI")
 DATA_RECORD_PREFIX = struct.Struct("<QHBBiBB")
-DATA_RECORD_BYTES = DATA_RECORD_PREFIX.size + POSITION_KEY_BYTES
+LEGACY_RECORD_BYTES = DATA_RECORD_PREFIX.size + POSITION_KEY_BYTES
+DATA_QUALITY = struct.Struct("<BBBQQ")
+DATA_RECORD_BYTES = LEGACY_RECORD_BYTES + DATA_QUALITY.size
 MAX_DATA_RECORDS = 10_000_000
 
 MODEL_MAGIC = b"RMLPV001"
@@ -50,6 +54,16 @@ class DataRecord:
     source: int
     exact: bool
     position_key: bytes
+    completed_depth: int | None = None
+    requested_depth: int | None = None
+    termination: int | None = None
+    work: int | None = None
+    budget: int | None = None
+    run_id: str | None = None
+    trajectory_id: str | None = None
+    lineage_id: str | None = None
+    opening_family: str | None = None
+    outcome: int | None = None
 
 
 class DatasetFile(Sequence[DataRecord]):
@@ -71,11 +85,13 @@ class DatasetFile(Sequence[DataRecord]):
                 raise ValueError("dataset file exceeds safety limit")
             self._map = mmap.mmap(self._file.fileno(), 0, access=mmap.ACCESS_READ)
             magic, version, flags, count = DATA_HEADER.unpack_from(self._map)
-            if magic != DATA_MAGIC or version != DATA_VERSION or flags != 0:
+            if magic != DATA_MAGIC or version not in (1, DATA_VERSION) or flags != 0:
                 raise ValueError("invalid dataset magic, version, or flags")
             if count > MAX_DATA_RECORDS:
                 raise ValueError("dataset record count exceeds safety limit")
-            expected = DATA_HEADER.size + count * DATA_RECORD_BYTES
+            self.version = version
+            self.record_bytes = LEGACY_RECORD_BYTES if version == 1 else DATA_RECORD_BYTES
+            expected = DATA_HEADER.size + count * self.record_bytes
             if size != expected:
                 raise ValueError("dataset record count does not match file length")
             self._count = count
@@ -95,7 +111,7 @@ class DatasetFile(Sequence[DataRecord]):
             index += len(self)
         if not 0 <= index < len(self):
             raise IndexError(index)
-        offset = DATA_HEADER.size + index * DATA_RECORD_BYTES
+        offset = DATA_HEADER.size + index * self.record_bytes
         game_id, ply, symmetry, policy, value, source, exact = (
             DATA_RECORD_PREFIX.unpack_from(self._map, offset)
         )
@@ -110,6 +126,13 @@ class DatasetFile(Sequence[DataRecord]):
         if exact not in (0, 1):
             raise ValueError(f"record {index} has an invalid exact flag")
         decode_position_key(key)
+        quality = (None,) * 5
+        if self.version == 2:
+            raw = self._map[offset + LEGACY_RECORD_BYTES:offset + self.record_bytes]
+            if raw != bytes([255]) * DATA_QUALITY.size:
+                quality = DATA_QUALITY.unpack(raw)
+                if quality[2] > 3 or quality[3] > quality[4]:
+                    raise ValueError("invalid label quality metadata")
         return DataRecord(
             game_id=game_id,
             ply=ply,
@@ -119,6 +142,8 @@ class DatasetFile(Sequence[DataRecord]):
             source=source,
             exact=bool(exact),
             position_key=key,
+            completed_depth=quality[0], requested_depth=quality[1],
+            termination=quality[2], work=quality[3], budget=quality[4],
         )
 
     def close(self) -> None:
@@ -238,32 +263,139 @@ def calibrated_value_target(record: DataRecord) -> float:
     return float(max(-EVALUATION_LIMIT, min(EVALUATION_LIMIT, record.value))) / EVALUATION_LIMIT
 
 
-def split_indices(
-    dataset: Sequence[DataRecord], seed: int
-) -> dict[str, list[int]]:
-    """Split whole game IDs before any position augmentation."""
-    game_ids = sorted({dataset[index].game_id for index in range(len(dataset))})
-    random.Random(seed).shuffle(game_ids)
-    game_count = len(game_ids)
-    test_count = 1 if game_count >= 3 else 0
-    validation_count = 1 if game_count >= 2 else 0
-    if game_count >= 20:
-        test_count = max(1, round(game_count * 0.1))
-        validation_count = max(1, round(game_count * 0.1))
-    while test_count + validation_count >= game_count and test_count:
-        test_count -= 1
-    train_count = game_count - validation_count - test_count
-    split_by_game: dict[int, str] = {}
-    for game_id in game_ids[:train_count]:
-        split_by_game[game_id] = "train"
-    for game_id in game_ids[train_count : train_count + validation_count]:
-        split_by_game[game_id] = "validation"
-    for game_id in game_ids[train_count + validation_count :]:
-        split_by_game[game_id] = "test"
+def dataset_fingerprint(dataset: Sequence[DataRecord]) -> str:
+    digest = hashlib.sha256()
+    if hasattr(dataset, "descriptor"):
+        digest.update(json.dumps(dataset.descriptor, sort_keys=True).encode())
+    for record in dataset:
+        digest.update(DATA_RECORD_PREFIX.pack(
+            record.game_id, record.ply, record.canonical_symmetry,
+            255 if record.policy_move is None else record.policy_move,
+            record.value, record.source, int(record.exact)))
+        digest.update(record.position_key)
+        digest.update(json.dumps([record.completed_depth, record.requested_depth, record.termination, record.work, record.budget, record.run_id, record.trajectory_id, record.lineage_id, record.opening_family, record.outcome]).encode())
+    return digest.hexdigest()
+
+
+def split_indices(dataset: Sequence[DataRecord], seed: int) -> dict[str, list[int]]:
+    """Group complete canonical trajectories, independent of relabelled policy.
+
+    Tuple equality checks full content (Python hash collisions cannot merge
+    different trajectories). Shared opening prefixes do not merge games.
+    """
+    games: dict[int, list[int]] = {}
+    for index, record in enumerate(dataset):
+        games.setdefault(record.game_id, []).append(index)
+    groups: dict[tuple, list[int]] = {}
+    for indices in games.values():
+        indices.sort(key=lambda index: dataset[index].ply)
+        plies = [dataset[index].ply for index in indices]
+        if len(set(plies)) != len(plies):
+            raise ValueError("duplicate game_id/ply: merge shards with explicit identity first")
+        trajectory = tuple((dataset[i].ply, dataset[i].position_key) for i in indices)
+        groups.setdefault(trajectory, []).extend(indices)
+    # Union lineage roots and complete duplicate trajectories transitively.
+    parent = list(range(len(groups)))
+    keys = list(groups)
+    def root(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+    lineage_owner = {}
+    for group_index, indices in enumerate(groups.values()):
+        for index in indices:
+            lineage = dataset[index].lineage_id
+            if lineage is not None:
+                if lineage in lineage_owner:
+                    parent[root(group_index)] = root(lineage_owner[lineage])
+                else:
+                    lineage_owner[lineage] = group_index
+    merged = {}
+    for i, key in enumerate(keys):
+        merged.setdefault(keys[root(i)], []).extend(groups[key])
+    groups = merged
+    identities = sorted(groups)
+    heldout = []
+    families = sorted({r.opening_family for r in dataset if r.opening_family is not None})
+    if len(families) >= 3:
+        # Versioned family holdout, selected independently of tuning seed.
+        family = families[-1]
+        retained = []
+        for identity in identities:
+            if any(dataset[i].opening_family == family for i in groups[identity]):
+                heldout.extend(groups[identity])
+            else:
+                retained.append(identity)
+        identities = retained
+    random.Random(seed).shuffle(identities)
+    count = len(identities)
+    test_count = max(1, round(count * 0.1)) if count >= 3 else 0
+    validation_count = max(1, round(count * 0.1)) if count >= 2 else 0
+    train_count = count - validation_count - test_count
     result = {"train": [], "validation": [], "test": []}
-    for index in range(len(dataset)):
-        result[split_by_game[dataset[index].game_id]].append(index)
-    return result
+    for index, identity in enumerate(identities):
+        name = "train" if index < train_count else (
+            "validation" if index < train_count + validation_count else "test")
+        result[name].extend(groups[identity])
+    if families:
+        result["opening_heldout"] = heldout
+    return {name: sorted(indices) for name, indices in result.items()}
+
+
+def eligible_label(record: DataRecord) -> bool:
+    # Analysis and zero-iteration Fallback are never supervision. Legacy AB
+    # lacks depth/work details; its provenance remains explicitly legacy.
+    return record.source in (3, 4, 5, 6, 7) or (
+        record.source == 2 and (record.completed_depth is None or record.completed_depth > 0))
+
+
+def make_split_manifest(dataset: Sequence[DataRecord], seed: int) -> dict:
+    exact = {}
+    for record in dataset:
+        if record.exact and eligible_label(record):
+            sign = (record.value > 0) - (record.value < 0)
+            if record.position_key in exact and exact[record.position_key] != sign:
+                raise ValueError("conflicting exact labels for canonical position")
+            exact[record.position_key] = sign
+    return {
+        "version": 1,
+        "dataset_sha256": dataset_fingerprint(dataset),
+        "seed": seed,
+        "grouping": "complete-canonical-trajectory-v1",
+        "quality_filter": "exclude-analysis-fallback-v1",
+        "indices": split_indices(dataset, seed),
+    }
+
+
+def validate_split_manifest(dataset: Sequence[DataRecord], manifest: dict, seed=None) -> dict:
+    if not isinstance(manifest, dict) or manifest.get("version") != 1:
+        raise ValueError("checkpoint lacks a supported immutable split manifest")
+    if manifest.get("dataset_sha256") != dataset_fingerprint(dataset):
+        raise ValueError("dataset fingerprint does not match checkpoint split")
+    if seed is not None and seed != manifest.get("seed"):
+        raise ValueError("seed conflicts with checkpoint split; this is a different experiment")
+    expected = make_split_manifest(dataset, manifest["seed"])
+    if manifest != expected:
+        raise ValueError("invalid or modified split manifest")
+    filtered = {}
+    for name, indices in manifest["indices"].items():
+        # Exact supervision only replaces approximations inside its own split.
+        # A heldout label must never be imported into training.
+        exact_positions = {dataset[i].position_key for i in indices if dataset[i].exact and eligible_label(dataset[i])}
+        filtered[name] = [i for i in indices if eligible_label(dataset[i])
+                          and (dataset[i].exact or dataset[i].position_key not in exact_positions)]
+    return filtered
+
+
+def save_split_manifest(path: Path, manifest: dict) -> None:
+    text = json.dumps(manifest, sort_keys=True, indent=2) + "\n"
+    if path.exists():
+        if path.read_text(encoding="utf-8") != text:
+            raise ValueError("refusing to replace an immutable split manifest")
+    else:
+        with path.open("x", encoding="utf-8") as output:
+            output.write(text)
 
 
 class LocalPatternModel(nn.Module):
@@ -289,7 +421,8 @@ class LocalPatternModel(nn.Module):
 
 
 def load_training_model(path: str | os.PathLike[str], device: str) -> LocalPatternModel:
-    checkpoint = torch.load(path, map_location=device, weights_only=True)
+    from checkpoint import load_checkpoint
+    checkpoint = load_checkpoint(path, device)
     if checkpoint.get("format") != "rustmoku-local-pattern-v1":
         raise ValueError("unsupported training checkpoint")
     model = LocalPatternModel().to(device)

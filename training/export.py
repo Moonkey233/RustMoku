@@ -51,6 +51,18 @@ def quantize(tensor: torch.Tensor, preferred_scale: int, name: str) -> tuple[tor
     return values, scale
 
 
+def calibrated_divisor(combined_scale: int, output_scale: int) -> int:
+    """V1 truncates the final dot/divisor. Bound gain error to one percent.
+
+    This checks scale calibration, separately from weight rounding error. V1
+    bytes retain their existing meaning; unrepresentable exports fail closed.
+    """
+    divisor = max(1, round(combined_scale / output_scale))
+    if abs(combined_scale - divisor * output_scale) * 100 > divisor * output_scale:
+        raise ValueError("V1 divisor gain error exceeds 1%; increase quantization scales")
+    return divisor
+
+
 def main() -> None:
     args = parse_args()
     model = load_training_model(args.checkpoint, "cpu")
@@ -70,8 +82,8 @@ def main() -> None:
     # The float Value head learns [-1, 1], then the production divisor maps it
     # into RustMoku's ordinary evaluator units. Policy logits get a modest
     # fixed integer resolution used only for ordering.
-    value_scale = max(1, round(value_quantization_scale / EVALUATION_LIMIT))
-    policy_scale = max(1, round(policy_quantization_scale / POLICY_OUTPUT_SCALE))
+    value_scale = calibrated_divisor(value_quantization_scale, EVALUATION_LIMIT)
+    policy_scale = calibrated_divisor(policy_quantization_scale, POLICY_OUTPUT_SCALE)
     value_bias = round(float(model.value_head.bias.item()) * value_quantization_scale)
     maximum_accumulator = 225 * 4 * 32768
     maximum_value_dot = maximum_accumulator * 32768 * MODEL_HIDDEN

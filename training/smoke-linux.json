@@ -1,0 +1,9 @@
+{
+  "data_engine": "target/release/rustmoku-data",
+  "arena_engine": "target/release/rustmoku-arena",
+  "games": 8,
+  "epochs": 1,
+  "pairs": 1,
+  "seed": 7,
+  "move_ms": 10
+}

@@ -60,6 +60,35 @@ impl VcfSolver {
         self.statistics
     }
 
+    /// A bounded, allocation-free ordering hint. The distance is deliberately
+    /// not exported as a normal search score. One expansion can replay at most
+    /// depth + 1 links; reserving depth + 2 visits bounds all charged work.
+    pub(crate) fn ordering_hint(
+        &mut self,
+        board: &mut BoardState,
+        depth: u8,
+        work: u64,
+        budget: &mut SearchBudget,
+    ) -> (VcfStatus, Option<Move>) {
+        let depth = depth.min((rustmoku_core::CELL_COUNT - board.position().move_count()) as u8);
+        self.begin_search(work / (u64::from(depth) + 2));
+        let mut pv = PvTable::new();
+        let status = self.visit(
+            board,
+            board.position().side_to_move(),
+            depth,
+            0,
+            &mut ProofResources {
+                pv: &mut pv,
+                budget,
+            },
+        );
+        let hint = matches!(status, VcfStatus::ProvenWin { .. })
+            .then(|| pv.root_line().first().copied())
+            .flatten();
+        (status, hint)
+    }
+
     #[cfg(test)]
     pub(crate) fn solve(
         &mut self,

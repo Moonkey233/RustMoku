@@ -6,6 +6,46 @@ pub struct ProofLimits {
     pub max_nodes: u64,
 }
 
+/// Independent research ablations of existing V0.10 heuristics. These flags
+/// never relax proof, interruption, or transposition-bound validity rules.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SelectivityConfig {
+    pub reverse_futility: bool,
+    pub futility: bool,
+    pub razoring: bool,
+    pub lmp: bool,
+    pub lmr: bool,
+    pub iir: bool,
+    pub threat_extension: bool,
+}
+
+impl SelectivityConfig {
+    pub const BASELINE: Self = Self {
+        reverse_futility: true,
+        futility: true,
+        razoring: true,
+        lmp: true,
+        lmr: true,
+        iir: true,
+        threat_extension: true,
+    };
+    pub const OFF: Self = Self {
+        reverse_futility: false,
+        futility: false,
+        razoring: false,
+        lmp: false,
+        lmr: false,
+        iir: false,
+        threat_extension: false,
+    };
+}
+
+impl Default for SelectivityConfig {
+    fn default() -> Self {
+        Self::BASELINE
+    }
+}
+
 impl ProofLimits {
     #[must_use]
     pub const fn new(max_plies: u8, max_nodes: u64) -> Self {
@@ -41,6 +81,9 @@ pub struct EngineConfig {
     tt_memory_mib: usize,
     threads: usize,
     tactical: TacticalConfig,
+    interior_vcf: ProofLimits,
+    interior_vcf_total_work: u64,
+    selectivity: SelectivityConfig,
 }
 
 impl EngineConfig {
@@ -53,6 +96,9 @@ impl EngineConfig {
         Self {
             tt_memory_mib,
             threads: 1,
+            interior_vcf: ProofLimits::new(0, 0),
+            interior_vcf_total_work: 0,
+            selectivity: SelectivityConfig::BASELINE,
             tactical: TacticalConfig {
                 vcf: ProofLimits::new(Self::DEFAULT_VCF_MAX_PLIES, Self::DEFAULT_VCF_MAX_NODES),
                 vct: ProofLimits::new(9, 4_000),
@@ -70,6 +116,30 @@ impl EngineConfig {
     #[must_use]
     pub const fn threads(self) -> usize {
         self.threads
+    }
+
+    /// Experimental single-worker ordering probes. `max_nodes` is a total
+    /// visit cap per probe, including certificate replay. Zero disables.
+    #[must_use]
+    pub const fn with_interior_vcf(mut self, limits: ProofLimits, total_work: u64) -> Self {
+        self.interior_vcf = limits;
+        self.interior_vcf_total_work = total_work;
+        self
+    }
+
+    pub(crate) const fn interior_vcf(self) -> (ProofLimits, u64) {
+        (self.interior_vcf, self.interior_vcf_total_work)
+    }
+
+    #[must_use]
+    pub const fn with_selectivity(mut self, config: SelectivityConfig) -> Self {
+        self.selectivity = config;
+        self
+    }
+
+    #[must_use]
+    pub const fn selectivity(self) -> SelectivityConfig {
+        self.selectivity
     }
 
     /// Sets the number of CPU Alpha-Beta workers. Zero is normalized to the
