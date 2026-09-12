@@ -1,12 +1,21 @@
-# RustMoku V0.12 Architecture
+# RustMoku Architecture (V1.0 development)
 
-V0.12 adds a reversible game timeline, a quantized learned local-pattern
+The V0.12 foundation adds a reversible game timeline, a quantized learned local-pattern
 Value/Policy evaluator, deterministic teacher datasets and offline PyTorch
 tooling. It also hardens V0.11 checkpoints and Proof Book verification. Classical
 recursive search and its V0.9/V0.10 TT/selectivity protocols remain intact.
 Core remains authoritative for legality and wins; Native remains an adapter.
 All first-party crates forbid unsafe code. Concurrency uses only the standard library.
 Milestone scope and future work live in [ROADMAP.md](ROADMAP.md).
+
+V1/V2 learned inference and V1.0 research mechanisms are described later in this
+document. The current development version is not a release or strength claim.
+At the root, verified equal negative search scores can use tactical, policy and
+center preference before canonical index. This configurable preference never
+changes the primary score or its bound authority. Scout ties require full-window
+verification. Nonnegative scores retain canonical ties; immediate known losses
+still resist at actual opponent winning points. Fallback uses the same practical
+ordering without claiming a completed search score.
 
 ## Crate dependency graph
 
@@ -888,7 +897,7 @@ iteration, including any aspiration retry, cannot replace the last completed
 move, score, PV, nominal depth or seldepth. Final statistics include all work,
 including a discarded iteration; SearchInfo statistics reflect the completion
 instant. Before any nominal iteration completes, positive-depth fallback is the
-lowest candidate index (center if empty), static side-to-move score and one-move
+tactical/policy/center preference (center if empty), static side-to-move score and one-move
 PV, with completed_depth=0. It is not a completed minimax evaluation. Zero-depth
 analysis keeps no move/PV and uses its completed qsearch score if available.
 Immediate exact facts remain valid; VCF/VCT certificates are accepted only after

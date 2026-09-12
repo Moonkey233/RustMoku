@@ -71,6 +71,8 @@ def snapshot_file(identity, root):
         temporary = Path(stream.name)
     try:
         shutil.copyfile(source, temporary)
+        # Frozen cross-version players must remain executable on POSIX hosts.
+        shutil.copymode(source, temporary)
         if file_hash(temporary) != identity['sha256']:
             raise ValueError('input changed while freezing snapshot')
         publish_shard(temporary, destination)

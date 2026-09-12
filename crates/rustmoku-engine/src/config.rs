@@ -86,6 +86,8 @@ pub struct EngineConfig {
     interior_vct: ProofLimits,
     interior_vct_total_work: u64,
     selectivity: SelectivityConfig,
+    root_resistance: bool,
+    adaptive_root_candidates: bool,
     profile: Option<crate::SearchProfile>,
     probcut: Option<crate::ProbCutCalibration>,
 }
@@ -105,6 +107,8 @@ impl EngineConfig {
             interior_vct: ProofLimits::new(0, 0),
             interior_vct_total_work: 0,
             selectivity: SelectivityConfig::BASELINE,
+            root_resistance: true,
+            adaptive_root_candidates: false,
             profile: None,
             probcut: None,
             tactical: TacticalConfig {
@@ -161,6 +165,32 @@ impl EngineConfig {
     #[must_use]
     pub const fn selectivity(self) -> SelectivityConfig {
         self.selectivity
+    }
+
+    /// Practical root preference only among verified equal negative scores.
+    /// Disabling restores canonical index ties; primary scores never change.
+    #[must_use]
+    pub const fn with_root_resistance(mut self, enabled: bool) -> Self {
+        self.root_resistance = enabled;
+        self
+    }
+
+    #[must_use]
+    pub const fn root_resistance(self) -> bool {
+        self.root_resistance
+    }
+
+    /// Experimental broader root universe. No sibling is removed; new tactical
+    /// and policy candidates can change practical strength, so default is off.
+    #[must_use]
+    pub const fn with_adaptive_root_candidates(mut self, enabled: bool) -> Self {
+        self.adaptive_root_candidates = enabled;
+        self
+    }
+
+    #[must_use]
+    pub const fn adaptive_root_candidates(self) -> bool {
+        self.adaptive_root_candidates
     }
 
     #[must_use]

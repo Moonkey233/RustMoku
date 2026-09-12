@@ -155,15 +155,71 @@ def verify_game_record(event, manifest):
         raise ValueError('game record moves/opening disagree with result')
     expected = 'draw' if replay['winner'] == 'draw' else 'A' if replay['winner'] == row['a_color'] else 'B'
     if record['termination'] == 'terminal':
-        if replay['winner'] == 'ongoing' or expected != row['winner']:
+        if row.get('failure') or replay['winner'] == 'ongoing' or expected != row['winner']:
             raise ValueError('terminal outcome does not replay')
-    elif not row.get('failure') or replay['winner'] != 'ongoing':
-        raise ValueError('forfeit must retain its reason and an ongoing legal position')
+    else:
+        failure = record['termination']
+        csv_failure = failure.translate(str.maketrans({',': ' ', '\n': ' ', '\r': ' '}))
+        if not row.get('failure') or csv_failure != row['failure'] or replay['winner'] != 'ongoing':
+            raise ValueError('forfeit must retain its reason and an ongoing legal position')
+        prefix, separator, reason = failure.partition(':')
+        if prefix not in ('player-0', 'player-1', 'player-0-startup', 'player-1-startup') or not separator or not reason:
+            raise ValueError('invalid forfeit reason')
+        loser = int(prefix[7])
+        active = (replay['plies'] % 2) ^ (row['a_color'] == 'White')
+        if (row['winner'] != ('B' if loser == 0 else 'A')
+                or ('startup' in prefix and count != 0)
+                or ('startup' not in prefix and loser != active)):
+            raise ValueError('forfeit winner/player disagrees with replay')
+    verify_clocks(record, row, manifest['effective']['limits'], opening_plies)
+
+
+def verify_clocks(record, row, limits, opening_plies):
+    """Audit millisecond receipts, allowing only Duration truncation and startup cost."""
+    initial = limits['clock_ms']
+    increment = limits['increment_ms']
+    previous = [initial, initial]
+    seen = [False, False]
+
+    def valid_clocks(values):
+        return (isinstance(values, list) and len(values) == 2
+                and all(value is None if initial is None else type(value) is int and value >= 0
+                        for value in values))
+
     for move in record['move_clocks']:
-        if move['player'] not in (0, 1) or type(move['elapsed_ms']) is not int or move['elapsed_ms'] < 0:
+        active = (opening_plies % 2) ^ (row['a_color'] == 'White')
+        elapsed = move['elapsed_ms']
+        if type(move['player']) is not int or move['player'] != active or type(elapsed) is not int or elapsed < 0:
             raise ValueError('invalid move clock receipt')
-        if len(move['clocks_ms']) != 2 or any(value is not None and (type(value) is not int or value < 0) for value in move['clocks_ms']):
+        current = move['clocks_ms']
+        if not valid_clocks(current):
             raise ValueError('invalid remaining clock receipt')
+        if limits['turn_hard_ms'] is not None and elapsed > limits['turn_hard_ms']:
+            raise ValueError('accepted move exceeds turn clock')
+        if initial is not None:
+            if elapsed > previous[active]:
+                raise ValueError('accepted move exceeds remaining clock')
+            expected = previous[active] - elapsed + increment
+            # Before the first receipt, player startup costs are unrecorded.
+            # Afterwards floor(a-b) differs from floor(a)-floor(b) by at most 1.
+            if current[active] < increment or current[active] > expected or (seen[active] and current[active] < expected - 1):
+                raise ValueError('remaining clock does not match elapsed time/increment')
+            other = 1 - active
+            if current[other] > previous[other] or (seen[other] and current[other] != previous[other]):
+                raise ValueError('inactive player clock changed')
+        previous = current
+        seen = [True, True]
+        opening_plies += 1
+    final = record['clocks_ms']
+    if not valid_clocks(final):
+        raise ValueError('invalid final clock receipt')
+    if record['termination'] == 'terminal':
+        if final != previous:
+            raise ValueError('terminal clocks disagree with last move')
+    elif initial is not None:
+        loser = int(record['termination'][7])
+        if any(final[i] > previous[i] for i in (0, 1)) or (any(seen) and final[1 - loser] != previous[1 - loser]):
+            raise ValueError('forfeit clocks disagree with last move')
 
 
 def run(configuration, output):

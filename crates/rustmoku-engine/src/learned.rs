@@ -387,6 +387,25 @@ pub enum RuntimeEvaluator {
 }
 
 impl RuntimeEvaluator {
+    /// Stable diagnostic architecture name; distinct from the score contract.
+    #[must_use]
+    pub const fn architecture_name(&self) -> &'static str {
+        match self {
+            Self::Pattern => "pattern",
+            Self::Learned(_) => "line-value-policy-v1",
+            Self::Nonlinear(_) => "local-nonlinear-v2",
+        }
+    }
+
+    #[must_use]
+    pub const fn model_format_version(&self) -> Option<u16> {
+        match self {
+            Self::Pattern => None,
+            Self::Learned(_) => Some(1),
+            Self::Nonlinear(_) => Some(2),
+        }
+    }
+
     /// Load a explicitly selected model. Magic/version dispatch fails closed;
     /// neither floating references nor a damaged V2 file fall back to V1.
     pub fn read_from_path(path: impl AsRef<Path>) -> Result<Self, LearnedModelError> {

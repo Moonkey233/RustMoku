@@ -5,7 +5,7 @@ use crate::{
     CancellationToken, EngineConfig, Evaluator, PatternEvaluator, Proof, ProofDistance,
     ProofSource, SearchTermination, VerifiedProofBook,
     move_generation::MoveList,
-    move_ordering::order_moves,
+    move_ordering::{order_moves, resistance_key},
     pattern::ThreatProfile,
     principal_variation::PvTable,
     score::{MATE_SCORE, MATE_THRESHOLD, SEARCH_INFINITY, score_from_tt, score_to_tt},
@@ -85,6 +85,10 @@ pub struct SearchStatistics {
     pub qsearch_cap_hits: u64,
     pub max_qply: u8,
     pub pvs_researches: u64,
+    /// Verified equal negative root scores resolved by practical preference.
+    pub root_resistance_ties: u64,
+    pub root_resistance_researches: u64,
+    pub root_candidates_added: u64,
     pub lmr_reductions: u64,
     pub lmr_researches: u64,
     pub policy_lmr_reductions: u64,
@@ -122,6 +126,7 @@ pub struct SearchStatistics {
     pub vcf_proven: u64,
     pub vcf_budget_exhausted: u64,
     pub vct_nodes: u64,
+    pub vct_probes: u64,
     pub vct_cache_hits: u64,
     pub vct_proven: u64,
     pub vct_budget_exhausted: u64,
@@ -182,6 +187,7 @@ pub struct SearchInfo {
 /// and no ordinary TT access. Storage is allocated once at this public boundary.
 #[derive(Clone, Debug)]
 pub struct RootAnalysis {
+    pub universe: crate::TeacherCandidates,
     pub side_to_move: rustmoku_core::Stone,
     pub candidates: Vec<RootCandidate>,
     pub completed_depth: u8,
@@ -281,13 +287,31 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
     }
 
     /// Bounded teacher interface, independent of the normal public search result.
-    /// Top-k applies to ordinary candidates; every current winning point and
-    /// opponent winning point is retained even when it exceeds k.
+    /// Every legal root move is compared at a common completed horizon. `top_k`
+    /// controls the production ablation only; callers rank/truncate broad output.
     pub fn analyze_root(
         &self,
         position: &Position,
         limits: SearchLimits,
         top_k: usize,
+        cancellation: CancellationToken,
+    ) -> Result<RootAnalysis, &'static str> {
+        self.analyze_root_with_candidates(
+            position,
+            limits,
+            top_k,
+            crate::TeacherCandidates::AllLegal,
+            cancellation,
+        )
+    }
+
+    /// Explicit candidate universe for offline recall comparisons and ablations.
+    pub fn analyze_root_with_candidates(
+        &self,
+        position: &Position,
+        limits: SearchLimits,
+        top_k: usize,
+        universe: crate::TeacherCandidates,
         cancellation: CancellationToken,
     ) -> Result<RootAnalysis, &'static str> {
         if !(1..=16).contains(&top_k) || limits.max_depth == 0 || limits.max_nodes.is_none() {
@@ -320,6 +344,12 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
             selected.set(at);
         }
         selected = selected.union(protected);
+        if universe == crate::TeacherCandidates::AllLegal {
+            selected = crate::bitboard::BitBoard256::EMPTY;
+            for at in crate::TeacherCandidateUniverse::moves(position) {
+                selected.set(at);
+            }
+        }
         let mut candidates: Vec<_> = selected
             .iter()
             .filter(|&at| position.is_legal(at))
@@ -342,13 +372,26 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
             .effective_profile(self.evaluator.score_contract());
         context.selectivity = crate::SelectivityConfig::OFF;
         let mut completed_depth = 0;
+        // One set of large continuation tables for the entire teacher request.
+        // History is ordering-only in this nonselective, TT-free analysis domain.
+        let mut resources = SearchResources {
+            seldepth: &mut seldepth,
+            pv: &mut pv,
+            statistics: &mut statistics,
+            heuristics: SearchHeuristics::default(),
+            interior_proof: None,
+            analysis: None,
+            budget: &mut budget,
+        };
         if !candidates.is_empty() {
             'depth: for depth in 1..=limits.max_depth {
                 for (i, candidate) in candidates.iter_mut().enumerate() {
-                    if budget.poll().is_err() {
+                    if resources.budget.poll().is_err() {
                         break 'depth;
                     }
-                    let before = budget.work_nodes();
+                    let before = resources.budget.work_nodes();
+                    resources.heuristics.begin_root();
+                    resources.heuristics.set_child(1, candidate.at, false, 0);
                     let undo = state
                         .make_move(candidate.at, &self.evaluator)
                         .expect("checked root candidate");
@@ -358,22 +401,14 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
                         -SEARCH_INFINITY,
                         SEARCH_INFINITY,
                         1,
-                        &mut SearchResources {
-                            seldepth: &mut seldepth,
-                            pv: &mut pv,
-                            statistics: &mut statistics,
-                            heuristics: SearchHeuristics::default(),
-                            interior_proof: None,
-                            analysis: None,
-                            budget: &mut budget,
-                        },
+                        &mut resources,
                     );
                     state.unmake_move(undo, &self.evaluator);
-                    candidate.work += budget.work_nodes() - before;
+                    candidate.work += resources.budget.work_nodes() - before;
                     let Ok(result) = result else {
                         break 'depth;
                     };
-                    if budget.poll().is_err() {
+                    if resources.budget.poll().is_err() {
                         break 'depth;
                     }
                     let result = -result;
@@ -397,6 +432,7 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
             candidate.termination = termination;
         }
         Ok(RootAnalysis {
+            universe,
             side_to_move: side,
             candidates,
             completed_depth,
@@ -444,8 +480,8 @@ pub trait SearchEngine {
 
     /// Caller retains a clone of the one-way token when cancellation is needed.
     /// If interrupted, returns the last completed iteration. Before any depth
-    /// completes, a nonterminal positive-depth search uses the lowest candidate
-    /// (center on an empty board), static score and one-move fallback PV.
+    /// completes, a nonterminal positive-depth search uses tactical/policy/center
+    /// preference (center on an empty board), static score and one-move fallback PV.
     /// Zero depth remains analysis-only with no move. Exact root tactics remain
     /// valid completed results. Cancelled application requests must not be played.
     fn search_controlled(
@@ -636,7 +672,16 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
         }
         // Static fallback is explicitly not a completed nominal search score.
         let fallback = (limits.max_depth != 0)
-            .then(|| state.candidate_bits().iter().next())
+            .then(|| {
+                state.candidate_bits().iter().max_by_key(|&at| {
+                    resistance_key(
+                        side,
+                        state.patterns(),
+                        at,
+                        state.policy_score(&self.evaluator, at),
+                    )
+                })
+            })
             .flatten();
         let mut completed = search_result(
             fallback,
@@ -737,6 +782,7 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
         }
         let vct_limits = self.config.tactical().vct;
         if vct_limits.enabled() && !crate::vct::attacks(state.patterns(), side).is_empty() {
+            statistics.vct_probes += 1;
             let proof = state.prove_vct(&mut self.vct, side, vct_limits.max_plies, budget);
             let vct = self.vct.statistics();
             statistics.vct_nodes = vct.nodes;
@@ -798,6 +844,8 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
         let threads = self.config.threads();
         let mut principal = AbContext::new(&self.evaluator, &self.table, self.generation, 0);
         principal.selectivity = self.config.selectivity();
+        principal.root_resistance = self.config.root_resistance();
+        principal.adaptive_root_candidates = self.config.adaptive_root_candidates();
         principal.profile = self
             .config
             .effective_profile(self.evaluator.score_contract());
@@ -886,6 +934,112 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
 }
 
 impl SearchStatistics {
+    /// Schema for named diagnostic counters. Values are snapshots, not strength metrics.
+    pub const COUNTER_SCHEMA: u32 = 1;
+
+    /// Stable names shared by research tools and UI. Called only at reporting
+    /// boundaries; search increments ordinary worker-local fields without atomics.
+    pub fn counters(&self) -> impl Iterator<Item = (&'static str, u64)> {
+        [
+            ("work_nodes", self.work_nodes),
+            ("nodes", self.nodes),
+            ("qnodes", self.qnodes),
+            ("qsearch_recursive_nodes", self.qsearch_recursive_nodes),
+            ("qsearch_forcing_edges", self.qsearch_forcing_edges),
+            ("qsearch_forced_blocks", self.qsearch_forced_blocks),
+            ("qsearch_stand_pat_cutoffs", self.qsearch_stand_pat_cutoffs),
+            ("qsearch_cap_hits", self.qsearch_cap_hits),
+            ("max_qply", self.max_qply as u64),
+            ("pvs_researches", self.pvs_researches),
+            ("root_resistance_ties", self.root_resistance_ties),
+            ("root_candidates_added", self.root_candidates_added),
+            (
+                "root_resistance_researches",
+                self.root_resistance_researches,
+            ),
+            ("lmr_reductions", self.lmr_reductions),
+            ("lmr_researches", self.lmr_researches),
+            ("policy_lmr_reductions", self.policy_lmr_reductions),
+            ("policy_lmr_researches", self.policy_lmr_researches),
+            (
+                "policy_lmr_failed_verifications",
+                self.policy_lmr_failed_verifications,
+            ),
+            ("singular_attempts", self.singular_attempts),
+            ("singular_extensions", self.singular_extensions),
+            ("singular_incomplete", self.singular_incomplete),
+            ("singular_work", self.singular_work),
+            ("probcut_attempts", self.probcut_attempts),
+            ("probcut_cutoffs", self.probcut_cutoffs),
+            ("probcut_work", self.probcut_work),
+            ("probcut_unqualified", self.probcut_unqualified),
+            ("lmp_pruned_moves", self.lmp_pruned_moves),
+            ("futility_pruned_moves", self.futility_pruned_moves),
+            ("rfp_attempts", self.rfp_attempts),
+            ("rfp_cutoffs", self.rfp_cutoffs),
+            ("razor_attempts", self.razor_attempts),
+            ("razor_cutoffs", self.razor_cutoffs),
+            ("iir_reductions", self.iir_reductions),
+            ("threat_extensions", self.threat_extensions),
+            ("aspiration_fail_low", self.aspiration_fail_low),
+            ("aspiration_fail_high", self.aspiration_fail_high),
+            ("static_evaluations", self.static_evaluations),
+            ("beta_cutoffs", self.beta_cutoffs),
+            ("tt_probes", self.tt_probes),
+            ("tt_hits", self.tt_hits),
+            ("tt_cutoffs", self.tt_cutoffs),
+            ("tt_stores", self.tt_stores),
+            ("tt_replacements", self.tt_replacements),
+            ("vcf_nodes", self.vcf_nodes),
+            ("vcf_cache_hits", self.vcf_cache_hits),
+            ("vcf_probes", self.vcf_probes),
+            ("vcf_proven", self.vcf_proven),
+            ("vcf_budget_exhausted", self.vcf_budget_exhausted),
+            ("vct_nodes", self.vct_nodes),
+            ("vct_probes", self.vct_probes),
+            ("vct_cache_hits", self.vct_cache_hits),
+            ("vct_proven", self.vct_proven),
+            ("vct_budget_exhausted", self.vct_budget_exhausted),
+            ("proof_book_probes", self.proof_book_probes),
+            ("proof_book_hits", self.proof_book_hits),
+            ("worker_count", self.worker_count as u64),
+            ("principal_nodes", self.principal_nodes),
+            ("helper_nodes", self.helper_nodes),
+            ("interior_attempts", self.interior_proof.attempts),
+            ("interior_proven", self.interior_proof.proven),
+            ("interior_not_proven", self.interior_proof.not_proven),
+            (
+                "interior_local_exhausted",
+                self.interior_proof.local_exhausted,
+            ),
+            ("interior_interrupted", self.interior_proof.interrupted),
+            ("interior_skipped", self.interior_proof.skipped),
+            ("interior_cooldown_hits", self.interior_proof.cooldown_hits),
+            ("interior_work", self.interior_proof.work),
+            (
+                "interior_certificate_work",
+                self.interior_proof.certificate_work,
+            ),
+            ("interior_elapsed_nanos", self.interior_proof.elapsed_nanos),
+            ("interior_vct_attempts", self.interior_proof.vct_attempts),
+            ("interior_vct_proven", self.interior_proof.vct_proven),
+            (
+                "interior_vct_not_proven",
+                self.interior_proof.vct_not_proven,
+            ),
+            (
+                "interior_vct_local_exhausted",
+                self.interior_proof.vct_local_exhausted,
+            ),
+            (
+                "interior_vct_interrupted",
+                self.interior_proof.vct_interrupted,
+            ),
+            ("interior_vct_work", self.interior_proof.vct_work),
+        ]
+        .into_iter()
+    }
+
     fn add_worker(&mut self, other: Self) {
         self.nodes += other.nodes;
         self.qnodes += other.qnodes;
@@ -896,6 +1050,9 @@ impl SearchStatistics {
         self.qsearch_cap_hits += other.qsearch_cap_hits;
         self.max_qply = self.max_qply.max(other.max_qply);
         self.pvs_researches += other.pvs_researches;
+        self.root_resistance_ties += other.root_resistance_ties;
+        self.root_resistance_researches += other.root_resistance_researches;
+        self.root_candidates_added += other.root_candidates_added;
         self.lmr_reductions += other.lmr_reductions;
         self.lmr_researches += other.lmr_researches;
         self.policy_lmr_reductions += other.policy_lmr_reductions;
@@ -932,6 +1089,7 @@ impl SearchStatistics {
         self.vcf_proven += other.vcf_proven;
         self.vcf_budget_exhausted += other.vcf_budget_exhausted;
         self.vct_nodes += other.vct_nodes;
+        self.vct_probes += other.vct_probes;
         self.vct_cache_hits += other.vct_cache_hits;
         self.vct_proven += other.vct_proven;
         self.vct_budget_exhausted += other.vct_budget_exhausted;
@@ -1069,6 +1227,8 @@ struct AbContext<'a, E: Evaluator> {
     generation: u8,
     root_rotation: usize,
     selectivity: crate::SelectivityConfig,
+    root_resistance: bool,
+    adaptive_root_candidates: bool,
     domain: SearchDomain,
     profile: crate::SearchProfile,
     probcut: Option<crate::ProbCutCalibration>,
@@ -1094,6 +1254,8 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
             generation,
             root_rotation,
             selectivity: crate::SelectivityConfig::BASELINE,
+            root_resistance: false,
+            adaptive_root_candidates: false,
             domain: SearchDomain::Normal,
             profile: crate::SearchProfile::baseline(evaluator.score_contract()),
             probcut: None,
@@ -1181,6 +1343,29 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
         } else {
             state.candidates()
         };
+        if forced_block.is_none() && self.adaptive_root_candidates {
+            let mut bits = state.candidate_bits();
+            let hints = crate::tactical::ThreatResolver::new(state.patterns(), side).hints();
+            bits = bits.union(hints);
+            // A single all-board scan at the root admits the strongest learned
+            // policy point even outside radius two. No recursive scan/allocation.
+            if let Some((_, at)) = crate::TeacherCandidateUniverse::moves(state.position())
+                .filter_map(|at| {
+                    state
+                        .policy_score(self.evaluator, at)
+                        .map(|score| ((score, std::cmp::Reverse(at)), at))
+                })
+                .max_by_key(|(rank, _)| *rank)
+            {
+                bits.set(at);
+            }
+            for at in bits.and_not(state.candidate_bits()).iter() {
+                if state.position().is_legal(at) {
+                    moves.push(at);
+                    resources.statistics.root_candidates_added += 1;
+                }
+            }
+        }
         order_moves(
             side,
             state.patterns(),
@@ -1196,9 +1381,28 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
         }
         let mut best_move = None;
         let mut best_score = -SEARCH_INFINITY;
+        let mut best_exact = false;
         let mut searched_quiets = MoveList::new();
 
         for (index, at) in moves.iter().enumerate() {
+            let resistance = self.root_resistance && best_score < 0 && best_exact;
+            let preferred = best_move.is_none_or(|current| {
+                if resistance {
+                    resistance_key(
+                        side,
+                        state.patterns(),
+                        at,
+                        state.policy_score(self.evaluator, at),
+                    ) > resistance_key(
+                        side,
+                        state.patterns(),
+                        current,
+                        state.policy_score(self.evaluator, current),
+                    )
+                } else {
+                    at < current
+                }
+            });
             let quiet = SearchHeuristics::is_quiet(state.patterns(), side, at);
             resources.heuristics.set_child(1, at, index != 0, 0);
             let undo = state
@@ -1220,11 +1424,14 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
                 if result.score == best_score
                     && best_score > original_alpha
                     && best_score < beta
-                    && best_move.is_some_and(|current| at < current)
+                    && preferred
                 {
-                    // Equality from a scout can be only an upper bound. A smaller
-                    // index replaces the exact incumbent only after resolving it.
+                    // Scout equality is only a bound. Resolve the candidate before
+                    // using any secondary preference, including resistance.
                     resources.statistics.pvs_researches += 1;
+                    if resistance {
+                        resources.statistics.root_resistance_researches += 1;
+                    }
                     result = -self.negamax::<PVS>(
                         state,
                         depth - 1,
@@ -1244,9 +1451,18 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
                 searched_quiets.push(at);
             }
             if score > best_score
-                || (score == best_score && best_move.is_none_or(|current| at < current))
+                || (score == best_score
+                    && preferred
+                    && (!resistance || (result.validity.lower && result.validity.upper)))
             {
+                if score == best_score && resistance {
+                    resources.statistics.root_resistance_ties += 1;
+                }
                 best_score = score;
+                best_exact = result.validity.lower
+                    && result.validity.upper
+                    && score > original_alpha
+                    && score < beta;
                 best_move = Some(at);
                 resources.pv.update(0, at);
             }
@@ -1272,7 +1488,11 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
         if best_move.is_none() {
             best_score = 0;
         }
-        if validity.supports(classify_bound(best_score, original_alpha, beta)) {
+        // Broader root-only candidate scores do not have the ordinary interior
+        // candidate horizon. Never let that root exception leak through the TT.
+        if !self.adaptive_root_candidates
+            && validity.supports(classify_bound(best_score, original_alpha, beta))
+        {
             self.store_tt(
                 TtStore {
                     key: state.key().value(),

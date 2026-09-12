@@ -134,6 +134,13 @@ impl Options {
                             }
                             config.engine = config.engine.with_threads(threads);
                         }
+                        "root-resistance" => {
+                            config.engine = config.engine.with_root_resistance(value.parse()?);
+                        }
+                        "adaptive-root-candidates" => {
+                            config.engine =
+                                config.engine.with_adaptive_root_candidates(value.parse()?);
+                        }
                         "interior-vcf" | "interior-vct" => {
                             let parts: Vec<&str> = value.split(':').collect();
                             if parts.len() != 3 {

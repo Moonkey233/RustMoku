@@ -7,7 +7,54 @@ use crate::{
 
 /// Potential forcing placements; proof search must recheck the resulting board.
 pub(crate) fn forcing_moves(patterns: &PatternState, side: Stone) -> BitBoard256 {
-    patterns.moves_at_least(side, ThreatProfile::Four)
+    ThreatResolver::new(patterns, side).forcing()
+}
+
+/// Separates exact immediate obligations from structural candidate hints.
+/// Profiles include double Four, FourThree and double OpenThree; none of these
+/// potential placements is promoted to a proof without checking its continuations.
+pub(crate) struct ThreatResolver<'a> {
+    patterns: &'a PatternState,
+    side: Stone,
+}
+
+impl<'a> ThreatResolver<'a> {
+    pub(crate) fn new(patterns: &'a PatternState, side: Stone) -> Self {
+        Self { patterns, side }
+    }
+
+    pub(crate) fn forcing(&self) -> BitBoard256 {
+        self.patterns.moves_at_least(self.side, ThreatProfile::Four)
+    }
+
+    /// Both attacks and counter-threat/defense candidates, not an exact defense set.
+    pub(crate) fn hints(&self) -> BitBoard256 {
+        self.patterns
+            .moves_at_least(self.side, ThreatProfile::OpenThree)
+            .union(
+                self.patterns
+                    .moves_at_least(self.side.opponent(), ThreatProfile::OpenThree),
+            )
+    }
+
+    pub(crate) fn immediate(&self) -> ImmediateTactic {
+        let patterns = self.patterns;
+        let side = self.side;
+        if let Some(at) = patterns.winning_moves(side).iter().next() {
+            return ImmediateTactic::Win(at);
+        }
+        let mut threats = patterns.winning_moves(side.opponent()).iter();
+        let Some(first) = threats.next() else {
+            return ImmediateTactic::None;
+        };
+        let Some(second) = threats.next() else {
+            return ImmediateTactic::ForcedBlock(first);
+        };
+        ImmediateTactic::Loss {
+            at: first,
+            reply: second,
+        }
+    }
 }
 
 /// Exact Freestyle facts, independent of evaluation and nominal search depth.
@@ -20,22 +67,9 @@ pub(crate) enum ImmediateTactic {
 }
 
 pub(crate) fn immediate_tactic(patterns: &PatternState, side: Stone) -> ImmediateTactic {
-    if let Some(at) = patterns.winning_moves(side).iter().next() {
-        return ImmediateTactic::Win(at);
-    }
-    let mut threats = patterns.winning_moves(side.opponent()).iter();
-    let Some(first) = threats.next() else {
-        return ImmediateTactic::None;
-    };
-    let Some(second) = threats.next() else {
-        return ImmediateTactic::ForcedBlock(first);
-    };
     // Exact loss-in-two: resist at a real winning point before applying the
     // canonical index tie-break. Another immediate point remains terminal.
-    ImmediateTactic::Loss {
-        at: first,
-        reply: second,
-    }
+    ThreatResolver::new(patterns, side).immediate()
 }
 
 impl ImmediateTactic {

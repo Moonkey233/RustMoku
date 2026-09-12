@@ -87,6 +87,10 @@ fn pipe_player(mut args: Arguments) -> Result<(), Box<dyn Error>> {
     let nodes = args.optional("--nodes")?.unwrap_or(u64::MAX);
     let threads: usize = args.optional("--threads")?.unwrap_or(1);
     let tt_mib: usize = args.optional("--tt-mib")?.unwrap_or(64);
+    let root_resistance = args.optional("--root-resistance")?.unwrap_or(true);
+    let adaptive_root_candidates = args
+        .optional("--adaptive-root-candidates")?
+        .unwrap_or(false);
     args.finish()?;
     if !(1..=8).contains(&threads) || tt_mib > 1024 || depth == 0 || nodes == 0 {
         return Err("invalid pipe resource limits".into());
@@ -97,6 +101,8 @@ fn pipe_player(mut args: Arguments) -> Result<(), Box<dyn Error>> {
         .unwrap_or(RuntimeEvaluator::Pattern);
     let config = teacher_config(&evaluator, profile)?
         .with_threads(threads)
+        .with_root_resistance(root_resistance)
+        .with_adaptive_root_candidates(adaptive_root_candidates)
         .with_tt_memory_mib(tt_mib);
     if describe {
         let fingerprint = evaluator
@@ -106,14 +112,21 @@ fn pipe_player(mut args: Arguments) -> Result<(), Box<dyn Error>> {
             .map(|b| format!("{b:02x}"))
             .collect::<String>();
         println!(
-            r#"{{"protocol":"rustmoku-pipe-v1","version":"{}","model_fingerprint":"{}","profile":"{}","threads":{},"tt_mib":{},"depth":{},"nodes":{}}}"#,
+            r#"{{"protocol":"rustmoku-pipe-v1","version":"{}","model_fingerprint":"{}","profile":"{}","threads":{},"tt_mib":{},"depth":{},"nodes":{},"root_resistance":{},"evaluator":"{}","model_version":{},"score_contract":"{:?}","adaptive_root_candidates":{}}}"#,
             env!("CARGO_PKG_VERSION"),
             fingerprint,
             config.effective_profile(evaluator.score_contract()),
             threads,
             tt_mib,
             depth,
-            nodes
+            nodes,
+            root_resistance,
+            evaluator.architecture_name(),
+            evaluator
+                .model_format_version()
+                .map_or_else(|| "null".to_owned(), |v| v.to_string()),
+            evaluator.score_contract(),
+            adaptive_root_candidates
         );
         return Ok(());
     }
@@ -133,6 +146,15 @@ fn analyze_record(mut args: Arguments) -> Result<(), Box<dyn Error>> {
     let nodes = args.optional("--nodes")?.unwrap_or(20_000);
     let top_k = args.optional("--top-k")?.unwrap_or(8);
     let score_only = args.optional("--score-only")?.unwrap_or(false);
+    let universe = match args
+        .optional::<String>("--candidates")?
+        .as_deref()
+        .unwrap_or("all-legal")
+    {
+        "all-legal" => rustmoku_engine::TeacherCandidates::AllLegal,
+        "production-top-k" => rustmoku_engine::TeacherCandidates::ProductionTopK,
+        _ => return Err("candidates must be all-legal or production-top-k".into()),
+    };
     let model: Option<PathBuf> = args.optional("--model")?;
     let profile: Option<rustmoku_engine::SearchProfile> = args
         .optional::<String>("--profile")?
@@ -174,13 +196,14 @@ fn analyze_record(mut args: Arguments) -> Result<(), Box<dyn Error>> {
         );
         return Ok(());
     }
-    let result = engine.analyze_root(
+    let result = engine.analyze_root_with_candidates(
         game.position(),
         SearchLimits::new(depth).with_max_nodes(nodes),
         top_k,
+        universe,
         rustmoku_engine::CancellationToken::new(),
     )?;
-    println!("{}", analysis_json(&game, &result, depth, nodes));
+    println!("{}", analysis_json(&game, &result, depth, nodes, top_k));
     Ok(())
 }
 
@@ -189,6 +212,7 @@ fn analysis_json(
     result: &rustmoku_engine::RootAnalysis,
     depth: u8,
     nodes: u64,
+    top_k: usize,
 ) -> String {
     let canonical = CanonicalPosition::new(game.position());
     let key = canonical
@@ -197,15 +221,51 @@ fn analysis_json(
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect::<String>();
+    let production = rustmoku_engine::ProductionCandidateUniverse::new(game.position());
+    let recall = if result.universe == rustmoku_engine::TeacherCandidates::AllLegal
+        && result.completed_depth > 0
+    {
+        let mut ranked: Vec<_> = result.candidates.iter().collect();
+        ranked.sort_by_key(|candidate| (std::cmp::Reverse(candidate.score), candidate.at));
+        let count = top_k.min(ranked.len());
+        let hits = ranked
+            .iter()
+            .take(count)
+            .filter(|candidate| production.contains(candidate.at))
+            .count();
+        let canonical_best = ranked
+            .first()
+            .is_some_and(|candidate| production.contains(candidate.at));
+        // A tied low-index teacher move outside the radius is not a value miss
+        // when an equally good production move exists. Report both questions.
+        let best = ranked.first().is_some_and(|first| {
+            ranked.iter().any(|candidate| {
+                candidate.score == first.score && production.contains(candidate.at)
+            })
+        });
+        format!(
+            r#"{{"best_in_production":{best},"canonical_best_in_production":{canonical_best},"top_k":{count},"top_k_hits":{hits},"top_k_tie_break":"move-index"}}"#
+        )
+    } else {
+        "null".to_owned()
+    };
     let candidates = result.candidates.iter().map(|candidate| {
         let score = candidate.score.map_or_else(|| "null".to_string(), |value| value.to_string());
-        format!(r#"{{"move":{},"score":{},"bound":"{:?}","completed_depth":{},"nominal_depth_valid":{},"source":"{:?}","termination":"{:?}","work":{}}}"#,
+        format!(r#"{{"move":{},"score":{},"bound":"{:?}","completed_depth":{},"nominal_depth_valid":{},"source":"{:?}","termination":"{:?}","work":{},"in_production":{}}}"#,
             canonical.move_to_canonical(candidate.at).index(), score, candidate.bound, candidate.completed_depth,
-            candidate.nominal_depth_valid, candidate.source, candidate.termination, candidate.work)
+            candidate.nominal_depth_valid, candidate.source, candidate.termination, candidate.work, production.contains(candidate.at))
     }).collect::<Vec<_>>().join(",");
     format!(
-        r#"{{"version":1,"position_key":"{}","perspective":"root-side-to-move","requested_depth":{},"completed_depth":{},"termination":"{:?}","work":{},"budget":{},"candidates":[{}]}}"#,
-        key, depth, result.completed_depth, result.termination, result.work, nodes, candidates
+        r#"{{"version":2,"position_key":"{}","perspective":"root-side-to-move","requested_depth":{},"completed_depth":{},"termination":"{:?}","work":{},"budget":{},"candidates":[{}],"candidate_universe":"{:?}","production_recall":{}}}"#,
+        key,
+        depth,
+        result.completed_depth,
+        result.termination,
+        result.work,
+        nodes,
+        candidates,
+        result.universe,
+        recall
     )
 }
 
@@ -313,6 +373,9 @@ fn generate_record(mut args: Arguments) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+type RootComparison = (u64, usize, String);
+type SelfplayBatch = (Vec<DataRecord>, Vec<RootComparison>);
+
 fn generate_selfplay(mut args: Arguments) -> Result<(), Box<dyn Error>> {
     let output = PathBuf::from(args.required("--output")?);
     let games: usize = args.required("--games")?.parse()?;
@@ -364,84 +427,88 @@ fn generate_selfplay(mut args: Arguments) -> Result<(), Box<dyn Error>> {
         let mut handles = Vec::new();
         for worker in 0..workers {
             let evaluator = evaluator.clone();
-            handles.push(scope.spawn(
-                move || -> Result<(Vec<DataRecord>, Vec<(u64, usize, String)>), String> {
-                    // Independent persistent teacher state: no globally locked
-                    // engine and no scheduler-dependent cross-worker TT sharing.
-                    let mut teacher = AlphaBetaEngine::with_config(evaluator, config);
-                    let mut records = Vec::new();
-                    let mut comparisons = Vec::new();
-                    for local_game in (worker..games).step_by(workers) {
-                        let game_id = first_game + local_game as u64;
-                        teacher.clear_transposition_table();
-                        let opening_index = (splitmix64(seed ^ game_id) as usize) % OPENINGS.len();
-                        let mut game = OPENINGS[opening_index]
-                            .game()
-                            .map_err(|error| error.to_string())?;
-                        let opening_plies = game.history().len();
-                        while game.status() == rustmoku_core::GameStatus::Ongoing {
-                            let record = label_position(
-                                &mut teacher,
+            handles.push(scope.spawn(move || -> Result<SelfplayBatch, String> {
+                // Independent persistent teacher state: no globally locked
+                // engine and no scheduler-dependent cross-worker TT sharing.
+                let mut teacher = AlphaBetaEngine::with_config(evaluator, config);
+                let mut records = Vec::new();
+                let mut comparisons = Vec::new();
+                for local_game in (worker..games).step_by(workers) {
+                    let game_id = first_game + local_game as u64;
+                    teacher.clear_transposition_table();
+                    let opening_index = (splitmix64(seed ^ game_id) as usize) % OPENINGS.len();
+                    let mut game = OPENINGS[opening_index]
+                        .game()
+                        .map_err(|error| error.to_string())?;
+                    let opening_plies = game.history().len();
+                    while game.status() == rustmoku_core::GameStatus::Ongoing {
+                        let record = label_position(
+                            &mut teacher,
+                            game_id,
+                            game.history().len(),
+                            &game,
+                            depth,
+                            nodes,
+                        )
+                        .map_err(|error| error.to_string())?;
+                        let Some(at) = record.policy_move.map(|at| {
+                            let canonical = CanonicalPosition::new(game.position());
+                            canonical.move_to_original(at)
+                        }) else {
+                            break;
+                        };
+                        let seed =
+                            splitmix64(seed ^ splitmix64(game_id) ^ game.history().len() as u64);
+                        let explored = if explore_top_k > 0
+                            && game.history().len() < explore_plies
+                            && !record.exact
+                        {
+                            let analysis = teacher
+                                .analyze_root(
+                                    game.position(),
+                                    SearchLimits::new(depth).with_max_nodes(nodes),
+                                    explore_top_k,
+                                    rustmoku_engine::CancellationToken::new(),
+                                )
+                                .map_err(str::to_string)?;
+                            comparisons.push((
                                 game_id,
                                 game.history().len(),
+                                analysis_json(&game, &analysis, depth, nodes, explore_top_k),
+                            ));
+                            near_optimal_move(
                                 &game,
-                                depth,
-                                nodes,
+                                &analysis,
+                                at,
+                                seed,
+                                explore_temperature,
+                                explore_top_k,
                             )
-                            .map_err(|error| error.to_string())?;
-                            let Some(at) = record.policy_move.map(|at| {
-                                let canonical = CanonicalPosition::new(game.position());
-                                canonical.move_to_original(at)
-                            }) else {
-                                break;
-                            };
-                            let seed = splitmix64(
-                                seed ^ splitmix64(game_id) ^ game.history().len() as u64,
-                            );
-                            let explored = if explore_top_k > 0
-                                && game.history().len() < explore_plies
-                                && !record.exact
-                            {
-                                let analysis = teacher
-                                    .analyze_root(
-                                        game.position(),
-                                        SearchLimits::new(depth).with_max_nodes(nodes),
-                                        explore_top_k,
-                                        rustmoku_engine::CancellationToken::new(),
-                                    )
-                                    .map_err(str::to_string)?;
-                                comparisons.push((
-                                    game_id,
-                                    game.history().len(),
-                                    analysis_json(&game, &analysis, depth, nodes),
-                                ));
-                                near_optimal_move(&game, &analysis, at, seed, explore_temperature)
-                            } else {
-                                at
-                            };
-                            let at = if game.history().len() - opening_plies < random_plies {
-                                diverse_move(&game, at, seed)
-                            } else {
-                                explored
-                            };
-                            records.push(record);
-                            game.play_move(at).map_err(|error| error.to_string())?;
-                        }
-                        records.push(
-                            label_position(
-                                &mut teacher,
-                                game_id,
-                                game.history().len(),
-                                &game,
-                                depth,
-                                nodes,
-                            )
-                            .map_err(|error| error.to_string())?,
-                        );
+                        } else {
+                            at
+                        };
+                        let at = if game.history().len() - opening_plies < random_plies {
+                            diverse_move(&game, at, seed)
+                        } else {
+                            explored
+                        };
+                        records.push(record);
+                        game.play_move(at).map_err(|error| error.to_string())?;
                     }
-                    Ok((records, comparisons))
-                },
-            ));
+                    records.push(
+                        label_position(
+                            &mut teacher,
+                            game_id,
+                            game.history().len(),
+                            &game,
+                            depth,
+                            nodes,
+                        )
+                        .map_err(|error| error.to_string())?,
+                    );
+                }
+                Ok((records, comparisons))
+            }));
         }
         let mut records = Vec::new();
         let mut comparisons = Vec::new();
@@ -479,6 +546,7 @@ fn near_optimal_move(
     fallback: Move,
     seed: u64,
     temperature: f64,
+    top_k: usize,
 ) -> Move {
     let position = game.position();
     if Move::all().any(|at| {
@@ -488,7 +556,7 @@ fn near_optimal_move(
     }) {
         return fallback;
     }
-    let candidates: Vec<_> = analysis
+    let mut candidates: Vec<_> = analysis
         .candidates
         .iter()
         .filter(|candidate| {
@@ -501,6 +569,8 @@ fn near_optimal_move(
                     .is_some_and(|score| score.abs() <= 10_000_000)
         })
         .collect();
+    candidates.sort_by_key(|candidate| (std::cmp::Reverse(candidate.score), candidate.at));
+    candidates.truncate(top_k);
     let Some(maximum) = candidates
         .iter()
         .filter_map(|candidate| candidate.score)

@@ -47,6 +47,24 @@ pub(crate) fn order_moves(
     }
 }
 
+/// Root-only practical preference. This ordinal is never an evaluation or bound.
+pub(crate) fn resistance_key(
+    side: Stone,
+    patterns: &PatternState,
+    at: Move,
+    policy: Option<i32>,
+) -> (u8, i32, u8, std::cmp::Reverse<Move>) {
+    (
+        tactical_class(
+            patterns.profile(at, side),
+            patterns.profile(at, side.opponent()),
+        ),
+        policy.unwrap_or(0),
+        CENTER_BIAS[at.index()],
+        std::cmp::Reverse(at),
+    )
+}
+
 fn tactical_class(own: ThreatProfile, opponent: ThreatProfile) -> u8 {
     use ThreatProfile::{DoubleThree, FourThree, OpenThree, Three, WinningMove};
     // Four bits for tier, four for structural class. TT preference is confined

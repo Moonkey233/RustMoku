@@ -2,14 +2,13 @@ use std::{
     env,
     error::Error,
     path::PathBuf,
-    sync::Arc,
     time::{Duration, Instant},
 };
 
 use rustmoku_core::{Move, Position};
 use rustmoku_engine::{
-    AlphaBetaEngine, ClassicalEvaluator, EngineConfig, Evaluator, LearnedEvaluator, LearnedModel,
-    PatternEvaluator, SearchEngine, SearchLimits, SearchResult, TranspositionTableStatistics,
+    AlphaBetaEngine, ClassicalEvaluator, EngineConfig, Evaluator, PatternEvaluator,
+    RuntimeEvaluator, SearchEngine, SearchLimits, SearchResult, TranspositionTableStatistics,
 };
 
 const OPENING: &[(usize, usize)] = &[(7, 7), (6, 7), (8, 8), (7, 8)];
@@ -255,15 +254,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                 );
             }
             EvaluatorChoice::Learned(path) => {
-                let model = Arc::new(LearnedModel::read_from_path(path)?);
-                benchmark(
-                    fixture,
-                    LearnedEvaluator::new(model),
-                    "learned",
-                    config,
-                    repeats,
-                    max_nodes,
-                );
+                let model = RuntimeEvaluator::read_from_path(path)?;
+                benchmark(fixture, model, "learned", config, repeats, max_nodes);
             }
         }
     }
@@ -308,6 +300,17 @@ fn benchmark<E: Evaluator>(
     let elapsed = sample.elapsed;
     let result = &sample.result;
     let stats = result.statistics;
+    eprintln!(
+        "SEARCH_COUNTERS schema={} fixture={} evaluator={} {}",
+        rustmoku_engine::SearchStatistics::COUNTER_SCHEMA,
+        fixture.name,
+        name,
+        stats
+            .counters()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
     let tt = sample.table;
     let nps = stats.nodes as f64 / elapsed.as_secs_f64();
     println!(

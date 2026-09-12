@@ -35,6 +35,20 @@ struct NativeDefaults {
     language: LanguagePreference,
 }
 
+fn evaluator_identity(evaluator: &RuntimeEvaluator) -> String {
+    let fingerprint = evaluator.model_fingerprint().map_or_else(
+        || "unavailable".to_owned(),
+        |bytes| bytes.iter().map(|byte| format!("{byte:02x}")).collect(),
+    );
+    format!(
+        "{} | format {:?} | {:?}\n{}",
+        evaluator.architecture_name(),
+        evaluator.model_format_version(),
+        evaluator.score_contract(),
+        fingerprint
+    )
+}
+
 fn auto_thread_count(available: usize) -> usize {
     available.clamp(1, NATIVE_MAX_AUTO_THREADS)
 }
@@ -132,6 +146,7 @@ struct RustMokuApp {
     profile_path: String,
     loaded_contract: ScoreContract,
     loaded_model: Option<String>,
+    loaded_identity: String,
 }
 
 impl RustMokuApp {
@@ -182,6 +197,7 @@ impl RustMokuApp {
             profile_path: String::from("rustmoku.profile"),
             loaded_contract: ScoreContract::Pattern,
             loaded_model: None,
+            loaded_identity: evaluator_identity(&RuntimeEvaluator::Pattern),
         }
     }
 
@@ -341,12 +357,13 @@ impl RustMokuApp {
     }
 
     fn use_pattern_evaluator(&mut self) {
-        self.loaded_contract = ScoreContract::Pattern;
-        self.last_search = None;
-        self.loaded_model = None;
         if let Err(error) = self.worker.replace_evaluator(RuntimeEvaluator::Pattern) {
             self.message = Some(self.text.detail(TextKey::ReconfigureFailed, error));
         } else {
+            self.loaded_contract = ScoreContract::Pattern;
+            self.loaded_model = None;
+            self.loaded_identity = evaluator_identity(&RuntimeEvaluator::Pattern);
+            self.last_search = None;
             self.message = None;
             self.turn_started = None;
             self.play_ai_if_needed();
@@ -392,12 +409,14 @@ impl RustMokuApp {
         match RuntimeEvaluator::read_from_path(&self.model_path) {
             Ok(evaluator) => {
                 let loaded_contract = evaluator.score_contract();
+                let identity = evaluator_identity(&evaluator);
                 self.last_search = None;
                 if let Err(error) = self.worker.replace_evaluator(evaluator) {
                     self.message = Some(self.text.detail(TextKey::ReconfigureFailed, error));
                     return;
                 }
                 self.loaded_contract = loaded_contract;
+                self.loaded_identity = identity;
                 self.loaded_model = Some(self.model_path.clone());
                 self.message = None;
                 self.turn_started = None;
@@ -405,13 +424,8 @@ impl RustMokuApp {
                 self.start_human_timer_if_needed();
             }
             Err(error) => {
-                self.loaded_contract = ScoreContract::Pattern;
-                self.loaded_model = None;
-                let _ = self.worker.replace_evaluator(RuntimeEvaluator::Pattern);
-                self.message = Some(error.to_string());
-                self.turn_started = None;
-                self.play_ai_if_needed();
-                self.start_human_timer_if_needed();
+                // A rejected file must not silently replace the active model.
+                self.message = Some(self.text.detail(TextKey::LoadModel, &error.to_string()));
             }
         }
     }
@@ -723,6 +737,27 @@ impl RustMokuApp {
                 text.get(TextKey::Waiting)
             });
         }
+        ui.collapsing(text.get(TextKey::Diagnostics), |ui| {
+            ui.monospace(&self.loaded_identity);
+            ui.monospace(
+                self.engine_config
+                    .effective_profile(self.loaded_contract)
+                    .to_string(),
+            );
+            if let Some(search) = &self.last_search {
+                egui::ScrollArea::vertical()
+                    .max_height(160.0)
+                    .show(ui, |ui| {
+                        for (name, count) in search
+                            .statistics
+                            .counters()
+                            .filter(|(_, count)| *count != 0)
+                        {
+                            ui.monospace(format!("{name}: {count}"));
+                        }
+                    });
+            }
+        });
         egui::ScrollArea::horizontal()
             .id_salt("pv")
             .max_height(28.0)

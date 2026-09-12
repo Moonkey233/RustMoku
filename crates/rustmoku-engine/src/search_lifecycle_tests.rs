@@ -19,6 +19,139 @@ fn config() -> EngineConfig {
         .with_vct_table_memory(0)
 }
 
+#[test]
+fn fallback_uses_practical_root_order_without_claiming_a_completed_score() {
+    let position = fixture(&[112]);
+    let result = AlphaBetaEngine::with_config(PatternEvaluator, config())
+        .search(&position, SearchLimits::new(4).with_max_nodes(0));
+    let state = SearchState::new(&position, &PatternEvaluator);
+    let expected = state
+        .candidate_bits()
+        .iter()
+        .max_by_key(|&at| resistance_key(position.side_to_move(), state.patterns(), at, None));
+    assert_eq!(result.best_move, expected);
+    assert_ne!(result.best_move, state.candidate_bits().iter().next());
+    assert_eq!(result.origin, SearchOrigin::Fallback);
+    assert_eq!(result.completed_depth, 0);
+    assert_eq!(result.statistics.work_nodes, 0);
+    assert_eq!(position, fixture(&[112]));
+}
+
+#[test]
+fn negative_root_ties_preserve_score_and_have_an_independent_switch() {
+    struct EqualLoss;
+    impl Evaluator for EqualLoss {
+        type State = ();
+        type Undo = ();
+        fn initialize(&self, _: &Position, _: &crate::PatternState) {}
+        fn make_move(&self, _: &mut (), _: &crate::PatternDelta) {}
+        fn unmake_move(&self, _: &mut (), _: &crate::PatternDelta, _: ()) {}
+        fn evaluate(&self, _: &Position, _: &crate::PatternState, _: &()) -> i32 {
+            10
+        }
+    }
+    let position = fixture(&[112]);
+    let state = SearchState::new(&position, &EqualLoss);
+    let expected = state
+        .candidate_bits()
+        .iter()
+        .max_by_key(|&at| resistance_key(position.side_to_move(), state.patterns(), at, None));
+    for enabled in [false, true] {
+        let mut engine =
+            AlphaBetaEngine::with_config(EqualLoss, config().with_root_resistance(enabled));
+        for _ in 0..2 {
+            let result = engine.search(&position, SearchLimits::new(1));
+            assert_eq!(result.score, -10);
+            assert_eq!(
+                result.best_move,
+                if enabled {
+                    expected
+                } else {
+                    state.candidate_bits().iter().next()
+                }
+            );
+            assert_eq!(result.origin, SearchOrigin::AlphaBeta);
+            assert_eq!(result.proof, None);
+            let entry = engine
+                .table
+                .probe(PositionKey::from_position(&position).value())
+                .unwrap();
+            assert_eq!(entry.score, -10);
+        }
+    }
+}
+
+#[test]
+fn resistance_never_promotes_a_scout_bound_over_a_better_primary_score() {
+    struct MisleadingPolicy;
+    impl Evaluator for MisleadingPolicy {
+        type State = ();
+        type Undo = ();
+        fn initialize(&self, _: &Position, _: &crate::PatternState) {}
+        fn make_move(&self, _: &mut (), _: &crate::PatternDelta) {}
+        fn unmake_move(&self, _: &mut (), _: &crate::PatternDelta, _: ()) {}
+        fn evaluate(&self, position: &Position, _: &crate::PatternState, _: &()) -> i32 {
+            -10 - i32::from(
+                position.cell(Move::from_index(96).unwrap()) == Some(rustmoku_core::Stone::White),
+            )
+        }
+        fn policy_score(
+            &self,
+            _: &Position,
+            _: &crate::PatternState,
+            _: &(),
+            at: Move,
+        ) -> Option<i32> {
+            Some(i32::from(at.index() == 96))
+        }
+    }
+    let position = fixture(&[112]);
+    let engine = AlphaBetaEngine::with_config(MisleadingPolicy, config());
+    engine.table.store(TtEntry::new(
+        PositionKey::from_position(&position).value(),
+        -10,
+        Some(Move::from_index(80).unwrap()),
+        2,
+        Bound::Exact,
+        0,
+    ));
+    // This valid child lower bound makes the worse, policy-preferred candidate
+    // appear equal to -10 at the root until full-window verification finds -11.
+    engine.table.store(TtEntry::new(
+        PositionKey::from_position(&fixture(&[112, 96])).value(),
+        10,
+        None,
+        1,
+        Bound::Lower,
+        0,
+    ));
+    let mut state = SearchState::new(&position, &MisleadingPolicy);
+    let mut context = engine.ab_context();
+    context.root_resistance = true;
+    let mut statistics = SearchStatistics::default();
+    let result = context
+        .search_root::<true>(
+            &mut state,
+            2,
+            -SEARCH_INFINITY,
+            SEARCH_INFINITY,
+            &mut SearchResources {
+                interior_proof: None,
+                analysis: None,
+                budget: &mut SearchBudget::default(),
+                seldepth: &mut 0,
+                pv: &mut PvTable::new(),
+                statistics: &mut statistics,
+                heuristics: SearchHeuristics::default(),
+            },
+        )
+        .unwrap();
+    assert_eq!(result.score, -10);
+    assert_ne!(result.best_move, Some(Move::from_index(96).unwrap()));
+    assert!(statistics.root_resistance_researches > 0);
+    assert_eq!(state.position(), &position);
+}
+
 fn same_iteration(result: &SearchResult, info: &SearchInfo) {
     assert_eq!(result.completed_depth, info.completed_depth);
     assert_eq!(result.seldepth, info.seldepth);

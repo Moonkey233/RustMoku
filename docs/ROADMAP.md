@@ -130,29 +130,28 @@ probes; existing-selectivity ablation switches; Windows/Linux CI definitions.
 Release gates remain open: a stable trained model, independent fixed-time
 confirmation, external strong-engine games with frozen weights and resources,
 and statistical strength evidence. Current smoke samples are inconclusive.
-Proof-neighborhood perturbation/relabel generation and calibrated search
-profiles remain future work. E3-E6 algorithms are gated on those prerequisites;
-they have not been implemented merely to fill the roadmap. No persistent SMP
-pool, SIMD, or TT synchronization rewrite is justified by the current timings.
+Calibrated search profiles, policy LMR, interior proof scheduling, singular
+extension and calibrated experimental ProbCut are implemented research paths.
+Their presence does not establish strength or authorize a default-on promotion.
+Persistent SMP pools and explicit SIMD remain later measured work.
 
 Work package 1 repairs experiment identity and recovery: Rust-described actual
 player configurations, bound model export/calibration/integer evidence,
 model-versus-combination promotion, match-clock/line-ending protocol compliance,
 atomic immutable manifests, and relocated proof-bundle paths. These are trust
 and correctness gates, not a new trained model or evidence of playing strength.
-The remaining work is executed continuously as one V1.0 milestone. The current
-implementation pass starts at clean `31b71a57251304778de45d495b2b99609dd26683`.
-It preserves the checkout and ends uncommitted. Delivery status is tracked below;
-planned work is not an implemented capability.
+The current W0-W11 upgrade starts from `30886af` (`v1.0 third`). Concise active
+progress and remaining validation are tracked in [../CODEX_PROGRESS.md](../CODEX_PROGRESS.md).
+The table below records implementation availability, not validated strength.
 
 | Area | Current pass status |
 | --- | --- |
-| Compact dataset, split, streaming audit | implementation pending |
-| Root teacher, exploration, calibrated labels | implementation pending |
-| Width-8 integer V2, trainer and evidence | implementation pending |
-| Search profiles, policy LMR, proof scheduling, singular, ProbCut | implementation pending |
+| Compact dataset, split, streaming audit | implemented |
+| Root teacher, exploration, calibrated labels | implemented; broader candidate universe pending |
+| Width-8 integer V2, trainer and evidence | implemented |
+| Search profiles, policy LMR, proof scheduling, singular, ProbCut | implemented, experimental gates retained |
 | Guarded Null Move | rejected-with-evidence: immutable Position transition and side/hash/evaluator consistency conflict; see Architecture |
-| Application time management and bounded experiments | implementation pending |
+| Application time management and bounded experiments | implemented; clock and budget refinements ongoing |
 | Integrated validation and adversarial review | pending after implementation |
 | Independent strength, hosted Windows/Linux CI, release | external-gate-pending |
 

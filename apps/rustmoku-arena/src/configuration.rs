@@ -126,7 +126,10 @@ fn player(
     let (vct_probe, vct_total) = engine.interior_vct();
     Ok(
         json!({"evaluator": evaluator, "model": model, "threads": engine.threads(),
-        "tt_mib": engine.tt_memory_mib(), "profile": {
+        "tt_mib": engine.tt_memory_mib(), "root_resistance": engine.root_resistance(),
+        "adaptive_root_candidates": engine.adaptive_root_candidates(),
+        "model_version": config.prepared_model.as_ref().and_then(|model| model.model_format_version()),
+        "architecture": config.prepared_model.as_ref().map(|model| model.architecture_name()), "profile": {
             "parameters": profile.to_string(), "score_contract": format!("{:?}", contract),
             "probcut": engine.probcut().map(|calibration| calibration.to_string()),
             "policy_lmr": profile.policy_lmr(), "singular": profile.singular(),

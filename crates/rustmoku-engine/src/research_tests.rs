@@ -37,6 +37,58 @@ fn base() -> EngineConfig {
 }
 
 #[test]
+fn broad_teacher_can_find_a_best_move_outside_production_radius() {
+    struct FarBest;
+    impl Evaluator for FarBest {
+        type State = ();
+        type Undo = ();
+        fn initialize(&self, _: &Position, _: &PatternState) {}
+        fn make_move(&self, _: &mut (), _: &PatternDelta) {}
+        fn unmake_move(&self, _: &mut (), _: &PatternDelta, _: ()) {}
+        fn evaluate(&self, p: &Position, _: &PatternState, _: &()) -> i32 {
+            -i32::from(p.cell(Move::from_index(0).unwrap()).is_some())
+        }
+        fn policy_score(&self, _: &Position, _: &PatternState, _: &(), at: Move) -> Option<i32> {
+            Some(i32::from(at.index() == 0))
+        }
+    }
+    let p = position(&[112]);
+    let mut engine = AlphaBetaEngine::with_config(FarBest, base());
+    let teacher = engine
+        .analyze_root(
+            &p,
+            SearchLimits::new(1).with_max_nodes(1000),
+            3,
+            CancellationToken::new(),
+        )
+        .unwrap();
+    assert_eq!(teacher.completed_depth, 1);
+    assert_eq!(teacher.candidates.len(), 224);
+    let best = teacher
+        .candidates
+        .iter()
+        .max_by_key(|candidate| candidate.score)
+        .unwrap();
+    assert_eq!(best.at.index(), 0);
+    assert!(!crate::ProductionCandidateUniverse::new(&p).contains(best.at));
+    let ordinary = engine.search(&p, SearchLimits::new(1));
+    assert_eq!(ordinary.score, 0);
+    engine.reconfigure(base().with_adaptive_root_candidates(true));
+    engine.clear_transposition_table();
+    let adaptive = engine.search(&p, SearchLimits::new(1));
+    assert_eq!(adaptive.best_move, Some(best.at));
+    assert_eq!(adaptive.score, 1);
+    assert!(adaptive.statistics.root_candidates_added > 0);
+    assert!(
+        engine
+            .table
+            .probe(crate::zobrist::PositionKey::from_position(&p).value())
+            .is_none()
+    );
+    assert_eq!(p, position(&[112]));
+}
+
+#[test]
 fn root_teacher_keeps_common_horizon_and_does_not_touch_tt() {
     let p = position(&[112, 97, 128, 113]);
     let engine = AlphaBetaEngine::with_config(Ranked, base());

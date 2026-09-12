@@ -1,9 +1,30 @@
 # RustMoku
 
-RustMoku V0.12 is a 15 x 15 Freestyle Gomoku program and a small
+RustMoku V1.0 (development, unreleased) is a 15 x 15 Freestyle Gomoku program and a
 research-oriented engine foundation. It prioritizes correct game semantics,
 clear crate boundaries, reproducible single-thread results, and measurable
 search behavior.
+
+The current implementation includes versioned V1/V2 integer evaluators, search
+profiles and experimental search mechanisms, trajectory-bound training and
+independent-process Arena tooling. Historical milestone sections below describe
+their original scope. Release and playing-strength gates remain open; current
+upgrade progress is in [CODEX_PROGRESS.md](CODEX_PROGRESS.md).
+
+For a bounded candidate-recall analysis in PowerShell:
+
+```powershell
+cargo run --release -p rustmoku-data -- analyze --record .\position.rmk --depth 2 --nodes 20000 --top-k 8 --candidates all-legal
+```
+
+Analysis JSON v2 reports all legal root candidates at a common completed depth,
+their production-radius membership, best-score recall (including ties), and
+canonical top-k recall. An unfinished first depth reports no recall. Descendant
+search still uses the production universe; these teacher scores are not proofs.
+`--candidates production-top-k` retains the restricted ablation. Arena exposes
+`--a-root-resistance true|false` and experimental/default-off
+`--a-adaptive-root-candidates true|false` (also `--b-`); descriptions bind these
+settings. Expanded root scores never enter ordinary TT storage.
 
 ## V0.12 - Learned Local Patterns & Reversible Timeline
 

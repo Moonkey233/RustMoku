@@ -37,7 +37,7 @@ pub(super) fn run(
         let choose = if let Some(entries) = board.as_mut() {
             if line == "DONE" {
                 let entries = board.take().unwrap();
-                let own_stone = if entries.len() % 2 == 0 {
+                let own_stone = if entries.len().is_multiple_of(2) {
                     Stone::Black
                 } else {
                     Stone::White

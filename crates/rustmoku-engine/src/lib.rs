@@ -8,6 +8,7 @@ pub mod benchmarks;
 mod bitboard;
 mod board_state;
 mod candidate_frontier;
+mod candidate_universe;
 mod config;
 mod evaluation;
 mod interior_proof;
@@ -41,6 +42,10 @@ mod vcf;
 mod vct;
 mod zobrist;
 
+pub use candidate_universe::{
+    ProductionCandidateUniverse, ProofCandidateUniverse, TeacherCandidateUniverse,
+    TeacherCandidates,
+};
 pub use config::{EngineConfig, ProofLimits, SelectivityConfig, TacticalConfig};
 pub use evaluation::{ClassicalEvaluator, Evaluator, PatternEvaluator};
 pub use interior_proof::InteriorProofStatistics;

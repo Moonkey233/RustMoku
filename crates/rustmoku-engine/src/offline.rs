@@ -1101,7 +1101,7 @@ fn ordered_legal_moves(position: &Position) -> Vec<Move> {
     let side = position.side_to_move();
     let center = BOARD_SIZE / 2;
     let candidates = board.candidate_bits();
-    let mut moves: Vec<_> = Move::all().filter(|&at| position.is_legal(at)).collect();
+    let mut moves: Vec<_> = crate::ProofCandidateUniverse::moves(position).collect();
     moves.sort_by_key(|&at| {
         (
             Reverse(board.patterns().profile(at, side)),
