@@ -38,7 +38,7 @@ fn fallback_uses_practical_root_order_without_claiming_a_completed_score() {
 }
 
 #[test]
-fn negative_root_ties_preserve_score_and_have_an_independent_switch() {
+fn negative_static_root_ties_remain_canonical_with_resistance_enabled() {
     struct EqualLoss;
     impl Evaluator for EqualLoss {
         type State = ();
@@ -52,24 +52,15 @@ fn negative_root_ties_preserve_score_and_have_an_independent_switch() {
     }
     let position = fixture(&[112]);
     let state = SearchState::new(&position, &EqualLoss);
-    let expected = state
-        .candidate_bits()
-        .iter()
-        .max_by_key(|&at| resistance_key(position.side_to_move(), state.patterns(), at, None));
     for enabled in [false, true] {
         let mut engine =
             AlphaBetaEngine::with_config(EqualLoss, config().with_root_resistance(enabled));
         for _ in 0..2 {
             let result = engine.search(&position, SearchLimits::new(1));
             assert_eq!(result.score, -10);
-            assert_eq!(
-                result.best_move,
-                if enabled {
-                    expected
-                } else {
-                    state.candidate_bits().iter().next()
-                }
-            );
+            assert_eq!(result.best_move, state.candidate_bits().iter().next());
+            assert_eq!(result.statistics.root_resistance_ties, 0);
+            assert_eq!(result.statistics.root_resistance_researches, 0);
             assert_eq!(result.origin, SearchOrigin::AlphaBeta);
             assert_eq!(result.proof, None);
             let entry = engine
@@ -79,6 +70,44 @@ fn negative_root_ties_preserve_score_and_have_an_independent_switch() {
             assert_eq!(entry.score, -10);
         }
     }
+}
+
+#[test]
+fn mate_loss_resistance_preserves_distance_and_changes_only_equal_root_ties() {
+    let position = fixture(&[0, 110, 14, 111, 210, 112, 224, 140, 3, 141, 17, 142]);
+    let run = |enabled| {
+        AlphaBetaEngine::with_config(
+            PatternEvaluator,
+            config()
+                .with_root_resistance(enabled)
+                .with_selectivity(crate::SelectivityConfig::OFF),
+        )
+        .search(&position, SearchLimits::new(2))
+    };
+    let canonical = run(false);
+    let practical = run(true);
+    assert_eq!(practical.score, -MATE_SCORE + 4);
+    assert_eq!(practical.score, canonical.score);
+    assert_ne!(practical.best_move, canonical.best_move);
+    let patterns = crate::PatternState::new(&position);
+    assert!(
+        resistance_key(
+            position.side_to_move(),
+            &patterns,
+            practical.best_move.unwrap(),
+            None
+        ) > resistance_key(
+            position.side_to_move(),
+            &patterns,
+            canonical.best_move.unwrap(),
+            None
+        )
+    );
+    let mut replay = position.clone();
+    for at in &practical.principal_variation {
+        replay.make_move(*at).unwrap();
+    }
+    assert_eq!(replay.winner(), Some(position.side_to_move().opponent()));
 }
 
 #[test]
@@ -148,7 +177,7 @@ fn resistance_never_promotes_a_scout_bound_over_a_better_primary_score() {
         .unwrap();
     assert_eq!(result.score, -10);
     assert_ne!(result.best_move, Some(Move::from_index(96).unwrap()));
-    assert!(statistics.root_resistance_researches > 0);
+    assert_eq!(statistics.root_resistance_researches, 0);
     assert_eq!(state.position(), &position);
 }
 

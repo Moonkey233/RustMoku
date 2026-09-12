@@ -21,6 +21,12 @@ use crate::{
 
 const MAX_QSEARCH_PLY: u8 = 6;
 
+#[derive(Clone, Copy)]
+struct QContext {
+    qply: u8,
+    active: Option<crate::tactical::ThreatDescriptor>,
+}
+
 #[cfg(test)]
 #[path = "search_lifecycle_tests.rs"]
 mod lifecycle_tests;
@@ -83,9 +89,11 @@ pub struct SearchStatistics {
     pub qsearch_forced_blocks: u64,
     pub qsearch_stand_pat_cutoffs: u64,
     pub qsearch_cap_hits: u64,
+    pub qsearch_three_edges: u64,
+    pub qsearch_dependency_edges: u64,
     pub max_qply: u8,
     pub pvs_researches: u64,
-    /// Verified equal negative root scores resolved by practical preference.
+    /// Verified equal mate-loss root scores resolved by practical preference.
     pub root_resistance_ties: u64,
     pub root_resistance_researches: u64,
     pub root_candidates_added: u64,
@@ -181,7 +189,10 @@ pub struct SearchInfo {
     pub origin: SearchOrigin,
 }
 
-/// Research-only root analysis. Scores are always from `side_to_move` at the
+/// Research-only fixed-horizon analysis, not a proof or solved minimax value.
+/// AllLegal covers every nominal descendant; ProductionTopK retains radius two.
+/// Both use the fixed Four-class qsearch leaf policy, not experimental Three hints.
+/// Scores are always from `side_to_move` at the
 /// supplied root; incomplete candidates have no score. All scored candidates
 /// share a completed horizon and were searched with full windows, no selectivity
 /// and no ordinary TT access. Storage is allocated once at this public boundary.
@@ -366,7 +377,11 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
             .collect();
         let mut layer = vec![None; candidates.len()];
         let mut context = self.ab_context();
-        context.domain = SearchDomain::Analysis;
+        context.domain = if universe == crate::TeacherCandidates::AllLegal {
+            SearchDomain::Teacher
+        } else {
+            SearchDomain::Analysis
+        };
         context.profile = self
             .config
             .effective_profile(self.evaluator.score_contract());
@@ -949,6 +964,8 @@ impl SearchStatistics {
             ("qsearch_forced_blocks", self.qsearch_forced_blocks),
             ("qsearch_stand_pat_cutoffs", self.qsearch_stand_pat_cutoffs),
             ("qsearch_cap_hits", self.qsearch_cap_hits),
+            ("qsearch_three_edges", self.qsearch_three_edges),
+            ("qsearch_dependency_edges", self.qsearch_dependency_edges),
             ("max_qply", self.max_qply as u64),
             ("pvs_researches", self.pvs_researches),
             ("root_resistance_ties", self.root_resistance_ties),
@@ -1048,6 +1065,8 @@ impl SearchStatistics {
         self.qsearch_forced_blocks += other.qsearch_forced_blocks;
         self.qsearch_stand_pat_cutoffs += other.qsearch_stand_pat_cutoffs;
         self.qsearch_cap_hits += other.qsearch_cap_hits;
+        self.qsearch_three_edges += other.qsearch_three_edges;
+        self.qsearch_dependency_edges += other.qsearch_dependency_edges;
         self.max_qply = self.max_qply.max(other.max_qply);
         self.pvs_researches += other.pvs_researches;
         self.root_resistance_ties += other.root_resistance_ties;
@@ -1238,10 +1257,26 @@ struct AbContext<'a, E: Evaluator> {
 enum SearchDomain {
     Normal,
     Analysis,
-    Excluded { at: Move, ply: u8 },
+    /// All legal nominal descendants. Quiescence remains an explicit leaf policy.
+    Teacher,
+    Excluded {
+        at: Move,
+        ply: u8,
+    },
 }
 
 impl<'a, E: Evaluator> AbContext<'a, E> {
+    fn candidates(&self, state: &SearchState<E>) -> MoveList {
+        if self.domain == SearchDomain::Teacher {
+            let mut moves = MoveList::new();
+            for at in crate::TeacherCandidateUniverse::moves(state.position()) {
+                moves.push(at);
+            }
+            moves
+        } else {
+            state.candidates()
+        }
+    }
     fn new(
         evaluator: &'a E,
         table: &'a TranspositionTable,
@@ -1341,7 +1376,7 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
             moves.push(at);
             moves
         } else {
-            state.candidates()
+            self.candidates(state)
         };
         if forced_block.is_none() && self.adaptive_root_candidates {
             let mut bits = state.candidate_bits();
@@ -1385,7 +1420,9 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
         let mut searched_quiets = MoveList::new();
 
         for (index, at) in moves.iter().enumerate() {
-            let resistance = self.root_resistance && best_score < 0 && best_exact;
+            // A negative heuristic score is not a forced loss. Preserve ordinary
+            // fixed-horizon canonical ties; resistance is for mate-domain losses.
+            let resistance = self.root_resistance && best_score <= -MATE_THRESHOLD && best_exact;
             let preferred = best_move.is_none_or(|current| {
                 if resistance {
                     resistance_key(
@@ -1522,6 +1559,12 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
     ) -> Result<NodeResult, Stopped> {
         // Qsearch owns leaf counting and never probes/stores ordinary TT scores.
         if depth == 0 {
+            if self.domain == SearchDomain::Normal && self.profile.qsearch_threes() {
+                // Hint replies omit siblings; no ordinary nominal-depth authority.
+                return Ok(NodeResult::unverified(
+                    self.qsearch(state, alpha, beta, ply, 0, resources)?,
+                ));
+            }
             return Ok(NodeResult::verified(
                 self.qsearch(state, alpha, beta, ply, 0, resources)?,
                 alpha,
@@ -1679,7 +1722,7 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
         resources.statistics.iir_reductions += u64::from(iir);
         let mut moves = if let Some(excluded) = excluded_here {
             let mut moves = MoveList::new();
-            for at in state.candidates().iter().filter(|&at| at != excluded) {
+            for at in self.candidates(state).iter().filter(|&at| at != excluded) {
                 moves.push(at);
             }
             moves
@@ -1688,7 +1731,7 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
             moves.push(at);
             moves
         } else {
-            state.candidates()
+            self.candidates(state)
         };
         if moves.is_empty() {
             return Ok(if excluded_here.is_some() {
@@ -2070,12 +2113,32 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
     fn qsearch(
         &self,
         state: &mut SearchState<E>,
-        mut alpha: i32,
+        alpha: i32,
         beta: i32,
         ply: u8,
         qply: u8,
         resources: &mut SearchResources<'_>,
     ) -> Result<i32, Stopped> {
+        self.qsearch_inner(
+            state,
+            alpha,
+            beta,
+            ply,
+            QContext { qply, active: None },
+            resources,
+        )
+    }
+
+    fn qsearch_inner(
+        &self,
+        state: &mut SearchState<E>,
+        mut alpha: i32,
+        beta: i32,
+        ply: u8,
+        context: QContext,
+        resources: &mut SearchResources<'_>,
+    ) -> Result<i32, Stopped> {
+        let qply = context.qply;
         resources.budget.charge()?;
         resources.statistics.nodes += 1;
         resources.statistics.qnodes += 1;
@@ -2132,9 +2195,17 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
         let patterns = state.patterns();
         // Only our existing forcing continuations. Potential enemy Four+
         // placements are not check, and never remove the stand-pat option.
-        let noisy = state
-            .candidate_bits()
-            .intersection(forcing_moves(patterns, side));
+        let extended = self.domain == SearchDomain::Normal && self.profile.qsearch_threes();
+        let mut noisy = forcing_moves(patterns, side);
+        if extended && qply == 0 {
+            noisy = noisy.union(patterns.moves_at_least(side, ThreatProfile::OpenThree));
+        }
+        let replies = context
+            .active
+            .map_or(crate::bitboard::BitBoard256::EMPTY, |threat| {
+                threat.reply_hints(patterns, side)
+            });
+        noisy = noisy.union(replies);
         let mut moves = MoveList::new();
         for at in noisy.iter() {
             moves.push(at);
@@ -2150,6 +2221,16 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
         );
         for at in moves.iter() {
             resources.statistics.qsearch_forcing_edges += 1;
+            let active = if extended
+                && qply == 0
+                && state.patterns().profile(at, side) < ThreatProfile::Four
+            {
+                resources.statistics.qsearch_three_edges += 1;
+                state.threat(at)
+            } else {
+                None
+            };
+            resources.statistics.qsearch_dependency_edges += u64::from(replies.test(at));
             resources.heuristics.set_child(
                 ply + 1,
                 at,
@@ -2159,7 +2240,17 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
             let undo = state
                 .make_move(at, self.evaluator)
                 .expect("forcing frontier moves are legal");
-            let child = self.qsearch(state, -beta, -alpha, ply + 1, qply + 1, resources);
+            let child = self.qsearch_inner(
+                state,
+                -beta,
+                -alpha,
+                ply + 1,
+                QContext {
+                    qply: qply + 1,
+                    active,
+                },
+                resources,
+            );
             state.unmake_move(undo, self.evaluator);
             let score = -child?;
             if score > best_score {

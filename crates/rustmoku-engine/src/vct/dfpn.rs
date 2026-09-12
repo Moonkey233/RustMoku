@@ -7,9 +7,8 @@
 use rustmoku_core::{CELL_COUNT, Stone};
 
 use super::{
-    VctResult, VctStatistics, VctStatus, branches, fact,
+    ThreatDescriptor, VctResult, VctStatistics, VctStatus, branches, fact,
     table::{INFINITY, Numbers, Table, TacticalKey},
-    threat::ThreatDescriptor,
 };
 use crate::search_control::{ProofResources, SearchBudget};
 use crate::{board_state::BoardState, move_generation::MoveList, principal_variation::PvTable};

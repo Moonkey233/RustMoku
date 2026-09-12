@@ -1,8 +1,8 @@
 //! Dedicated four-way DFPN cache. Entries never cross public-search generations.
 use rustmoku_core::{Move, Stone};
 
-use super::threat::ThreatDescriptor;
 use crate::board_state::BoardState;
+use crate::tactical::ThreatDescriptor;
 
 pub(super) const INFINITY: u32 = u32::MAX / 2;
 

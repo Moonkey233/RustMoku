@@ -256,7 +256,7 @@ fn analysis_json(
             candidate.nominal_depth_valid, candidate.source, candidate.termination, candidate.work, production.contains(candidate.at))
     }).collect::<Vec<_>>().join(",");
     format!(
-        r#"{{"version":2,"position_key":"{}","perspective":"root-side-to-move","requested_depth":{},"completed_depth":{},"termination":"{:?}","work":{},"budget":{},"candidates":[{}],"candidate_universe":"{:?}","production_recall":{}}}"#,
+        r#"{{"version":3,"position_key":"{}","perspective":"root-side-to-move","requested_depth":{},"completed_depth":{},"termination":"{:?}","work":{},"budget":{},"candidates":[{}],"candidate_universe":"{:?}","leaf_policy":"four-q6-immediate-v1","production_recall":{}}}"#,
         key,
         depth,
         result.completed_depth,

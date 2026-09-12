@@ -167,7 +167,7 @@ impl EngineConfig {
         self.selectivity
     }
 
-    /// Practical root preference only among verified equal negative scores.
+    /// Practical root preference only among verified equal mate-domain losses.
     /// Disabling restores canonical index ties; primary scores never change.
     #[must_use]
     pub const fn with_root_resistance(mut self, enabled: bool) -> Self {

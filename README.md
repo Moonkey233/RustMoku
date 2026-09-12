@@ -17,10 +17,11 @@ For a bounded candidate-recall analysis in PowerShell:
 cargo run --release -p rustmoku-data -- analyze --record .\position.rmk --depth 2 --nodes 20000 --top-k 8 --candidates all-legal
 ```
 
-Analysis JSON v2 reports all legal root candidates at a common completed depth,
+Analysis JSON v3 reports all legal root candidates at a common completed depth,
 their production-radius membership, best-score recall (including ties), and
-canonical top-k recall. An unfinished first depth reports no recall. Descendant
-search still uses the production universe; these teacher scores are not proofs.
+canonical top-k recall. An unfinished first depth reports no recall. AllLegal also enumerates every legal nominal descendant; its leaf policy is
+fixed bounded Four-class quiescence. Exact means exact for that horizon/leaf
+policy, not a game-theoretic solution. These teacher scores are not proofs.
 `--candidates production-top-k` retains the restricted ablation. Arena exposes
 `--a-root-resistance true|false` and experimental/default-off
 `--a-adaptive-root-candidates true|false` (also `--b-`); descriptions bind these

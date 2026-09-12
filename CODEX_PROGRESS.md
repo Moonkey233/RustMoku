@@ -1,29 +1,11 @@
 # RustMoku progress
 
-- Baseline HEAD: `30886af587441a3d4d4d77fc37cba8e32c7ba1be` (`v1.0 third`); clean at start.
-- Current package: W2, tactical abstraction and broad teacher/production candidates.
-- Completed W0 implementation: eframe 0.36.1 X11/Wayland features; parity and
-  selfplay result-type lints; typed config-relative cross-version file inputs;
-  Linux fixture executable suffix/permissions; Arena reason/winner/clock audit;
-  root resistance and fallback with focused regressions; development naming.
-- Completed W1 implementation: shared named counter snapshots (including interior
-  proofs), benchmark/GUI diagnostics, CLI model architecture/version/contract,
-  explicit Native load errors preserving the active evaluator, V1/V2 benchmark load.
-- Completed W2 subtask: ThreatResolver separates exact immediate facts from hints;
-  distinct production/teacher/proof universes; all-legal root teacher with shared
-  horizon and reusable analysis scratch; JSON v2 candidate recall; default-off
-  adaptive tactical/policy root inclusion with TT score isolation and telemetry.
-- Decisions: preserve trusted-bound/proof architecture; risky heuristics require
-  independent switches and remain experimental without strength evidence.
-- Decisions: resistance only breaks verified equal negative root scores, with
-  full-window scout verification, independent switch and counters; no score bonus.
-- Checks: Windows workspace all-target check and all-feature Clippy passed;
-  5 Python path/receipt regressions, 4 focused root regressions, 3 teacher/universe
-  regressions passed. Debug CLI smoke compared all 224 legal replies at depth 1;
-  two one-move Arena legs passed real clock/record verification. No final gate yet.
-- Risks: hosted Linux CI unverified; schema-1 clocks omit startup durations,
-  so initial clock receipts allow bounded startup cost, later moves audit exactly
-  within 1 ms truncation. No performance or playing-strength claim.
-- Next: finish W2 defense/dependency and bounded qsearch continuation work, then
-  W3 LMR/improving/IID/experimental search. W3-W11 remain unimplemented in this
-  upgrade. Run the single consolidated final gate only after main implementation.
+- Current HEAD: `746e0a0f813c5044690b52b6b2b47e93a841bcbe`; this continuation's changes are uncommitted.
+- W0/W1 and initial W2 are in HEAD. Current scope: finish W2, then W3.1-W3.4; do not enter W5. W3.5 is optional only with sufficient budget.
+- CI regression repaired: resistance formerly applied to all negative heuristic scores and broke `pvs_and_aspiration_match_full_window_alpha_beta` (-840, moves 97 vs 80). It now applies only to verified equal mate-domain losses; ordinary heuristic ties remain canonical. Original differential assertion retained; real mate-loss regression checks unchanged distance and tie-only preference.
+- Teacher correction: AllLegal now covers every nominal descendant, with analysis TT isolation. Exact means the fixed horizon plus bounded Four-class qsearch leaf policy, not solved minimax. Experimental Three hints are disabled for teacher analysis. Analysis JSON is v3 with explicit leaf policy.
+- W2 implementation added: shared tactical ThreatDescriptor (moved from vct/threat.rs to tactical/threat.rs), defense/dependency hints, and default-off bounded Three qsearch continuation. Hint-derived results cannot authorize ordinary TT bounds; interruption restores reversible state. RMPROFILE1 remains unchanged by default; enabled Three continuation uses RMPROFILE2.
+- Passed targeted checks: original PVS/aspiration differential; mate_loss_resistance; bounded_three_continuations; teacher_nominal_descendants; both search_profile tests; open_three_responses_are_audited_against_every_legal_move; defender_four_counter_threat; qsearch_cap_cannot; root_teacher_keeps. Engine all-target check and engine/data all-target all-feature Clippy passed; cargo fmt applied.
+- No repeated full final gate, Arena, large benchmark, or training this continuation. Hosted CI has not validated these uncommitted fixes. No performance/strength claim.
+- Next exact task: inspect this diff without repeating passed tests; finish W2 correctness review of shared defense/dependency hints, bounded qsearch and teacher candidate/leaf semantics, then implement W3.1 search module organization, W3.2 LMR V2, W3.3 improving, W3.4 IID in that order. Preserve selective-bound firewalls, independent switches, cancellation and deterministic ties. W3.1-W3.4 have not started.
+- Follow the master plan's low-test-cost strategy: only affected targeted regressions during implementation; defer the consolidated final gate. On quota/context interruption, update this file briefly and stop.

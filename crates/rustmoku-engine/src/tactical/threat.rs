@@ -28,20 +28,31 @@ fn metadata(key: LineKey, attacker: Stone) -> [u8; 4] {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct ThreatDescriptor {
-    pub(super) gain: Move,
+pub(crate) struct ThreatDescriptor {
+    pub(crate) gain: Move,
     // The seven forcing variants of ThreatProfile are the concrete vocabulary;
     // construction rejects Quiet/Three. No second synonymous enum is needed.
-    pub(super) kind: ThreatProfile,
-    pub(super) continuations: BitBoard256,
-    pub(super) defenses: BitBoard256,
-    pub(super) dependencies: BitBoard256,
+    pub(crate) kind: ThreatProfile,
+    pub(crate) continuations: BitBoard256,
+    pub(crate) defenses: BitBoard256,
+    pub(crate) dependencies: BitBoard256,
 }
 
 impl ThreatDescriptor {
+    /// Heuristic dependency/counter-threat hints; no proof omission authority.
+    pub(crate) fn reply_hints(
+        self,
+        patterns: &crate::PatternState,
+        defender: Stone,
+    ) -> BitBoard256 {
+        self.defenses
+            .union(self.dependencies)
+            .union(forcing_moves(patterns, defender))
+            .intersection(patterns.empty_cells())
+    }
     /// Called before the gain is played. The keys also remain available at an
     /// occupied center, so the same descriptor can be validated after the gain.
-    pub(super) fn new(board: &BoardState, gain: Move, attacker: Stone) -> Option<Self> {
+    pub(crate) fn new(board: &BoardState, gain: Move, attacker: Stone) -> Option<Self> {
         if !board.position().is_legal(gain) {
             return None;
         }
@@ -82,7 +93,7 @@ impl ThreatDescriptor {
 
     /// Deterministic context verification, separate from the full position key.
     /// All descriptor fields participate, including occupied dependency cells.
-    pub(super) fn signature(self) -> u64 {
+    pub(crate) fn signature(self) -> u64 {
         let mut signature = 0xcbf2_9ce4_8422_2325_u64;
         for value in [self.gain.index() as u64, self.kind as u64] {
             signature = (signature ^ value).wrapping_mul(0x100_0000_01b3);
@@ -96,7 +107,7 @@ impl ThreatDescriptor {
         signature
     }
 
-    pub(super) fn responses(self, board: &BoardState, attacker: Stone) -> BitBoard256 {
+    pub(crate) fn responses(self, board: &BoardState, attacker: Stone) -> BitBoard256 {
         let empty = board.patterns().empty_cells();
         let mut responses = self
             .defenses

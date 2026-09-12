@@ -10,10 +10,10 @@ Milestone scope and future work live in [ROADMAP.md](ROADMAP.md).
 
 V1/V2 learned inference and V1.0 research mechanisms are described later in this
 document. The current development version is not a release or strength claim.
-At the root, verified equal negative search scores can use tactical, policy and
+At the root, verified equal mate-domain losing search scores can use tactical, policy and
 center preference before canonical index. This configurable preference never
 changes the primary score or its bound authority. Scout ties require full-window
-verification. Nonnegative scores retain canonical ties; immediate known losses
+verification. All ordinary heuristic scores retain canonical ties; immediate known losses
 still resist at actual opponent winning points. Fallback uses the same practical
 ordering without claiming a completed search score.
 

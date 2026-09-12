@@ -44,6 +44,10 @@ impl<E: Evaluator> SearchState<E> {
         self.board.candidate_bits()
     }
 
+    pub(crate) fn threat(&self, at: Move) -> Option<crate::tactical::ThreatDescriptor> {
+        crate::tactical::ThreatDescriptor::new(&self.board, at, self.position().side_to_move())
+    }
+
     pub(crate) fn evaluate(&self, evaluator: &E) -> i32 {
         evaluator.evaluate(self.position(), self.patterns(), &self.evaluator_state)
     }

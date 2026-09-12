@@ -1,4 +1,6 @@
 use rustmoku_core::{Move, Stone};
+mod threat;
+pub(crate) use threat::{ThreatDescriptor, attacks};
 
 use crate::{
     PatternState, bitboard::BitBoard256, pattern::ThreatProfile, principal_variation::PvTable,

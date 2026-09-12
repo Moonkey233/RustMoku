@@ -37,6 +37,107 @@ fn base() -> EngineConfig {
 }
 
 #[test]
+fn teacher_nominal_descendants_are_all_legal_not_radius_two() {
+    struct FarReply;
+    impl Evaluator for FarReply {
+        type State = ();
+        type Undo = ();
+        fn initialize(&self, _: &Position, _: &PatternState) {}
+        fn make_move(&self, _: &mut (), _: &PatternDelta) {}
+        fn unmake_move(&self, _: &mut (), _: &PatternDelta, _: ()) {}
+        fn evaluate(&self, p: &Position, _: &PatternState, _: &()) -> i32 {
+            -100 * i32::from(
+                p.cell(Move::from_index(0).unwrap()) == Some(rustmoku_core::Stone::Black),
+            )
+        }
+    }
+    let p = position(&[112, 113]);
+    let engine = AlphaBetaEngine::with_config(FarReply, base());
+    for (domain, expected) in [(SearchDomain::Analysis, 0), (SearchDomain::Teacher, 100)] {
+        let mut context = engine.ab_context();
+        context.domain = domain;
+        context.selectivity = SelectivityConfig::OFF;
+        let mut state = SearchState::new(&p, &FarReply);
+        let mut stats = SearchStatistics::default();
+        let result = context
+            .negamax::<false>(
+                &mut state,
+                1,
+                -SEARCH_INFINITY,
+                SEARCH_INFINITY,
+                0,
+                &mut SearchResources {
+                    budget: &mut SearchBudget::default(),
+                    statistics: &mut stats,
+                    seldepth: &mut 0,
+                    pv: &mut PvTable::new(),
+                    heuristics: SearchHeuristics::default(),
+                    interior_proof: None,
+                    analysis: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(result.score, expected);
+        assert!(result.validity.supports(Bound::Exact));
+        assert_eq!(stats.tt_probes + stats.tt_stores, 0);
+        state.assert_consistent(&FarReply);
+    }
+}
+
+#[test]
+fn bounded_three_continuations_are_unverified_and_restore_on_stop() {
+    struct Flat;
+    impl Evaluator for Flat {
+        type State = ();
+        type Undo = ();
+        fn initialize(&self, _: &Position, _: &PatternState) {}
+        fn make_move(&self, _: &mut (), _: &PatternDelta) {}
+        fn unmake_move(&self, _: &mut (), _: &PatternDelta, _: ()) {}
+        fn evaluate(&self, _: &Position, _: &PatternState, _: &()) -> i32 {
+            -10
+        }
+    }
+    let p = position(&[110, 0, 111, 224]);
+    let engine = AlphaBetaEngine::with_config(Flat, base());
+    for cap in [1, 3000] {
+        let mut state = SearchState::new(&p, &Flat);
+        let mut context = engine.ab_context();
+        context.profile = SearchProfile::baseline(ScoreContract::Pattern).with_qsearch_threes(true);
+        let mut stats = SearchStatistics::default();
+        let mut budget = SearchBudget::new(
+            SearchLimits::new(1).with_max_nodes(cap),
+            CancellationToken::new(),
+        );
+        let result = context.negamax::<true>(
+            &mut state,
+            0,
+            -SEARCH_INFINITY,
+            SEARCH_INFINITY,
+            0,
+            &mut SearchResources {
+                budget: &mut budget,
+                statistics: &mut stats,
+                seldepth: &mut 0,
+                pv: &mut PvTable::new(),
+                heuristics: SearchHeuristics::default(),
+                interior_proof: None,
+                analysis: None,
+            },
+        );
+        if cap == 1 {
+            assert!(result.is_err());
+        } else {
+            assert_eq!(result.unwrap().validity, BoundValidity::UNVERIFIED);
+            assert!(stats.qsearch_three_edges > 0 && stats.qsearch_dependency_edges > 0);
+        }
+        assert!(budget.work_nodes() <= cap);
+        assert_eq!(stats.tt_stores, 0);
+        state.assert_consistent(&Flat);
+        assert_eq!(state.position(), &p);
+    }
+}
+
+#[test]
 fn broad_teacher_can_find_a_best_move_outside_production_radius() {
     struct FarBest;
     impl Evaluator for FarBest {

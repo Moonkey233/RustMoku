@@ -2,11 +2,11 @@
 //! a game-theoretic loss. Board-only make/unmake keeps evaluators uninvolved.
 mod dfpn;
 mod table;
-mod threat;
 
+pub(crate) use crate::tactical::attacks;
 pub(crate) use dfpn::VctSolver;
-pub(crate) use threat::attacks;
 
+use crate::tactical::ThreatDescriptor;
 use crate::{
     bitboard::BitBoard256,
     board_state::BoardState,
@@ -15,7 +15,6 @@ use crate::{
 };
 use rustmoku_core::{Move, Stone};
 use table::Numbers;
-use threat::ThreatDescriptor;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum VctStatus {
