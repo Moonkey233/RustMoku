@@ -7,10 +7,12 @@ audited, but cannot invent missing lineage or historical teacher metadata.
 from __future__ import annotations
 
 import argparse
+import bisect
 import dataclasses
 import hashlib
 import json
 import os
+import sqlite3
 from collections import defaultdict
 from pathlib import Path
 from typing import Sequence
@@ -40,27 +42,47 @@ def publish_shard(source: Path, destination: Path) -> None:
             raise ValueError(f'immutable shard output changed: {destination}')
 
 
-def describe_shard(path: Path, teacher: dict, run_id: str) -> dict:
-    games = defaultdict(list)
-    with DatasetFile(path) as data:
-        for record in data:
-            games[record.game_id].append(record)
+def game_ranges(data):
+    """One bounded game at a time; compact formats require physical ordering."""
+    seen = set()
+    start = 0
+    records = []
+    for index, record in enumerate(data):
+        if records and record.game_id != records[0].game_id:
+            yield start, records
+            seen.add(records[0].game_id)
+            start, records = index, []
+        if record.game_id in seen:
+            raise ValueError('interleaved game records require offline migration')
+        if record.ply > 225 or (records and record.ply <= records[-1].ply):
+            raise ValueError('invalid or non-increasing game_id/ply')
+        records.append(record)
+    if records:
+        yield start, records
+
+
+def trajectory_content(records):
+    return [[r.ply, r.position_key.hex()] for r in records]
+
+
+def describe_shard(path: Path, teacher: dict, run_id: str, *, compact=False) -> dict:
     descriptions = {}
-    for game_id, records in games.items():
-        records.sort(key=lambda record: record.ply)
-        content = [[r.ply, r.position_key.hex()] for r in records]
-        identity = hashlib.sha256(json.dumps(content, separators=(',', ':')).encode()).hexdigest()
-        descriptions[str(game_id)] = {
-            'trajectory_id': identity,
-            'lineage_id': identity,
-            'parent_lineage_id': None,
-            'opening_family': records[0].position_key.hex(),
-            'identity_content': content,
-            'records': len(records),
-            'outcome': game_outcome(records),
-        }
+    with DatasetFile(path) as data:
+        for start, records in game_ranges(data):
+            content = trajectory_content(records)
+            identity = hashlib.sha256(json.dumps(content, separators=(',', ':')).encode()).hexdigest()
+            descriptions[str(records[0].game_id)] = {
+                'trajectory_id': identity,
+                'lineage_id': identity,
+                'parent_lineage_id': None,
+                'opening_family': records[0].position_key.hex(),
+                **({'start': start} if compact else {'identity_content': content}),
+                'records': len(records),
+                'outcome': game_outcome(records),
+            }
     return {'path': str(path.resolve()), 'sha256': file_hash(path),
-            'run_id': run_id, 'teacher': teacher, 'games': descriptions}
+            'run_id': run_id, 'teacher': teacher, 'games': descriptions,
+            **({'index_version': 2} if compact else {})}
 
 
 def game_outcome(records):
@@ -74,14 +96,24 @@ def game_outcome(records):
 class DatasetBundle(Sequence[DataRecord]):
     """Shard IDs are namespaced by content, not concatenated local game IDs."""
 
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, resolver=None):
         if path.stat().st_size > 64 * 1024 * 1024:
             raise ValueError('dataset descriptor exceeds 64 MiB')
         self.descriptor = read_manifest(path)
-        if self.descriptor.get('version') != 1:
+        if self.descriptor.get('version') not in (1, 2):
             raise ValueError('unsupported dataset descriptor')
+        self.comparisons = None
+        companion = self.descriptor.get('comparisons')
+        if companion is not None:
+            companion_path = Path((resolver or {}).get(companion['path'], companion['path']))
+            if file_hash(companion_path) != companion['sha256']:
+                raise ValueError('comparison sidecar identity mismatch')
+            self.comparisons = sqlite3.connect(companion_path.resolve().as_uri() + '?mode=ro&immutable=1', uri=True)
+            self.comparisons.execute('PRAGMA cache_size=-4096')
         self.shards = []
-        self.rows = []
+        self.ranges = []
+        self.ends = []
+        self.count = 0
         seen_files = set()
         identities = {}
         game_index = 0
@@ -90,6 +122,7 @@ class DatasetBundle(Sequence[DataRecord]):
                 source = Path(shard['path'])
                 if not source.is_absolute():
                     source = path.parent / source
+                source = Path((resolver or {}).get(shard['path'], (resolver or {}).get(str(source.resolve()), source)))
                 digest = file_hash(source)
                 if digest != shard['sha256']:
                     raise ValueError('shard fingerprint mismatch')
@@ -98,53 +131,84 @@ class DatasetBundle(Sequence[DataRecord]):
                 seen_files.add(digest)
                 data = DatasetFile(source)
                 self.shards.append(data)
-                groups = defaultdict(list)
-                for i, record in enumerate(data):
-                    groups[record.game_id].append(i)
-                if set(map(str, groups)) != set(shard['games']):
-                    raise ValueError('descriptor game coverage mismatch')
-                for local_id, indices in groups.items():
+                compact = shard.get('index_version', 1) == 2
+                if shard.get('index_version', 1) not in (1, 2):
+                    raise ValueError('unsupported shard index schema')
+                covered = set()
+                for start, records in game_ranges(data):
+                    local_id = records[0].game_id
+                    covered.add(str(local_id))
+                    if str(local_id) not in shard['games']:
+                        raise ValueError('descriptor game coverage mismatch')
                     meta = shard['games'][str(local_id)]
-                    content = [[data[i].ply, data[i].position_key.hex()] for i in indices]
-                    if content != meta['identity_content'] or len(indices) != meta['records']:
+                    content = trajectory_content(records)
+                    if (type(meta['records']) is not int or len(records) != meta['records']
+                            or (compact and (type(meta.get('start')) is not int or meta['start'] != start))
+                            or (not compact and content != meta['identity_content'])):
                         raise ValueError('trajectory content mismatch')
-                    if meta.get('outcome', game_outcome([data[i] for i in indices])) != game_outcome([data[i] for i in indices]):
+                    if meta.get('outcome', game_outcome(records)) != game_outcome(records):
                         raise ValueError('trajectory outcome mismatch')
                     identity = hashlib.sha256(json.dumps(content, separators=(',', ':')).encode()).hexdigest()
                     if identity != meta['trajectory_id']:
                         raise ValueError('trajectory fingerprint mismatch')
-                    if identity in identities and identities[identity] != content:
-                        raise ValueError('trajectory digest collision')
-                    identities[identity] = content
+                    if identity in identities:
+                        old_shard, old_start, old_count = identities[identity]
+                        previous = self.shards[old_shard]
+                        if old_count != len(records) or any(
+                                (previous[old_start + j].ply, previous[old_start + j].position_key)
+                                != (r.ply, r.position_key) for j, r in enumerate(records)):
+                            raise ValueError('trajectory digest collision')
+                    else:
+                        identities[identity] = (len(self.shards) - 1, start, len(records))
                     lineage = meta['lineage_id']
                     if not isinstance(lineage, str) or not lineage:
                         raise ValueError('missing lineage identity')
                     if meta['parent_lineage_id'] not in (None, lineage):
                         raise ValueError('branch must retain its original parent lineage')
-                    for i in indices:
-                        self.rows.append((len(self.shards) - 1, i, game_index, meta, shard['run_id']))
+                    self.ranges.append((len(self.shards) - 1, start, game_index, meta, shard['run_id']))
+                    self.count += len(records)
+                    if self.count > 10_000_000:
+                        raise ValueError('bundle exceeds 10000000 record limit')
+                    self.ends.append(self.count)
                     game_index += 1
+                if covered != set(shard['games']):
+                    raise ValueError('descriptor game coverage mismatch')
         except Exception:
             self.close()
             raise
 
     def __len__(self):
-        return len(self.rows)
+        return self.count
 
     def __getitem__(self, index):
         if isinstance(index, slice):
             return [self[i] for i in range(*index.indices(len(self)))]
-        shard, local, game, meta, run = self.rows[index]
+        if index < 0:
+            index += len(self)
+        if not 0 <= index < len(self):
+            raise IndexError(index)
+        group = bisect.bisect_right(self.ends, index)
+        shard, start, game, meta, run = self.ranges[group]
+        local = start + index - (self.ends[group - 1] if group else 0)
         record = self.shards[shard][local]
         outcome = meta.get('outcome', {})
         value = None
         if outcome.get('status') == 'terminal':
             value = 0 if outcome['winner'] is None else (1 if outcome['winner'] == record.position_key[-1] else -1)
-        return dataclasses.replace(record, game_id=game, outcome=value,
+        comparison = None
+        if self.comparisons is not None:
+            row = self.comparisons.execute('SELECT payload FROM comparisons WHERE position=?', (record.position_key.hex(),)).fetchone()
+            if row is not None:
+                from teacher import validate_comparison
+                comparison = validate_comparison(json.loads(row[0]))
+        return dataclasses.replace(record, game_id=game, outcome=value, comparison=comparison,
                                    run_id=run, trajectory_id=meta['trajectory_id'],
                                    lineage_id=meta['lineage_id'], opening_family=meta['opening_family'])
 
     def close(self):
+        if self.comparisons is not None:
+            self.comparisons.close()
+            self.comparisons = None
         for shard in self.shards:
             shard.close()
         self.shards = []
@@ -156,8 +220,8 @@ class DatasetBundle(Sequence[DataRecord]):
         self.close()
 
 
-def open_dataset(path: Path):
-    return DatasetBundle(path) if path.suffix == '.json' else DatasetFile(path)
+def open_dataset(path: Path, resolver=None):
+    return DatasetBundle(path, resolver=resolver) if path.suffix == '.json' else DatasetFile(path)
 
 
 def main():
@@ -167,9 +231,9 @@ def main():
     args = parser.parse_args()
     # Importing existing data cannot establish which executable created it.
     # The generator wrapper supplies actual teacher/config identity instead.
-    shards = [describe_shard(path, {'status': 'unknown-legacy'}, file_hash(path)) for path in args.shard]
+    shards = [describe_shard(path, {'status': 'unknown-legacy'}, file_hash(path), compact=True) for path in args.shard]
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    save_split_manifest(args.output, {'version': 1, 'shards': shards})
+    save_split_manifest(args.output, {'version': 2, 'shards': shards})
 
 
 if __name__ == '__main__':

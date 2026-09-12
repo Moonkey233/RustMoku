@@ -1041,11 +1041,112 @@ replaced. Model provenance and actual player profiles must both pass promotion
 checks. See [training/README.md](../training/README.md) for receipt/version and
 external-resource limits. No new search technique or default was added here.
 
+## V1.0 continuous implementation design
+
+The pass beginning at `31b71a5` implements the remaining milestone in dependency
+order. This section specifies intended contracts; the Roadmap records delivery
+status. Existing V1 raw files and model bytes keep their original identities.
+
+Data tools own a versioned compact descriptor with contiguous game ranges over
+immutable raw shards. Opening a bundle keeps game ranges rather than a tuple per
+record. Content identities are streamed using the historical canonical encoding;
+equal digests require complete trajectory comparison. Published descriptors reject
+invalid ranges, interleaved games, non-increasing plies and incomplete coverage.
+Legacy descriptors remain readable. Splitting and auditing use bounded disk-backed
+indexes for trajectory/lineage connectivity and position conflicts; partition
+indices are compact and bound to the dataset fingerprint. Temporary state is
+separate from immutable no-clobber publication. Generation estimates bytes before
+launch; resource exhaustion leaves resumable state and never overwrites data.
+
+Research root analysis owns bounded output storage outside recursive search. Each
+candidate carries perspective, horizon, bound validity, provenance, termination
+and work. Only common-depth verified scores enter masked soft/ranking targets;
+unsearched candidates remain unknown. Exact forced moves override exploration.
+Generation randomness derives from run seed and stable game id. Outcome, teacher
+and proof targets retain separate source weights. Score calibration uses train or
+calibration data only and freezes a bounded monotonic STM contract independently
+of mate scores. Proof branches replay legal history and retain parent lineage.
+
+Integer V2 uses width 8, independent magic and architecture/score identifiers,
+i16 embedding/head weights, i32 preactivations and i64 head sums. Four direction
+embeddings plus center occupancy form each center's preactivation; ReLU is applied
+before heads. Global summation precedes division with truncation toward zero.
+The model parser bounds all dimensions/scales/biases before allocation/arithmetic.
+Models are immutable shared values; each worker owns two perspective accumulators.
+PatternDelta supplies the changed center as well as direction deltas. Dirty centers
+are deduplicated in fixed-capacity storage; undo restores preactivation and head
+sums without copying a full board feature map. Python float, Python integer, Rust
+rebuild and Rust incremental comparisons gate production export. Model/profile
+replacement clears ordinary TT. Native loads explicitly selected models through
+its persistent worker and preserves request-generation checks.
+
+SearchProfile owns immutable existing margins and experiment parameters, with an
+explicit evaluator score contract. Baseline constants are preserved before tuning.
+Policy reductions use quiet within-class ranks and retain nominal-depth retry.
+Interior VCF/tiny VCT share bounded single-worker scheduling and global admission;
+verified certificates initially supply ordering only. Excluded-move verification
+has a distinct search context with ordinary TT cutoffs/stores and heuristic/PV
+side effects disabled; incomplete alternatives cannot establish singularity.
+Extensions are bounded per path. Guarded Null Move is **rejected-with-evidence**
+for this implementation. `Position::side_to_move` is private; `make_move(at)`
+always places the real side's stone, advances the count/history-facing state and
+returns an opaque undo token. `would_win(at, stone)` is a read-only one-move query,
+not an alternate-side transition API. `SearchState::make_move` derives its hash,
+PatternDelta stone, frontier and evaluator update from that real transition.
+Consequently, flipping only a search hash makes the hash name the opponent's turn
+while `Position`, subsequent moves and both tactical/evaluator dispatch still see
+the original turn. For example, after `H8 A1 I8 A2 J8 B1 K8 B2`, a hypothetical
+white continuation cannot be applied with `Position::make_move`: the actual side
+is Black and the move places Black. A wrapper with an overridden getter cannot
+change this transition. Building a second transition/win engine or copying a
+Position at every hypothetical node violates this milestone's constraints. No
+null flag, Core pass move, forged undo token, TT entry or teacher label is emitted.
+This is an interface-based rejection of this implementation route, not a claim
+that null-move heuristics are impossible in every Gomoku architecture. ProbCut requires frozen
+model/profile calibration and sufficient heldout buckets; unverified statistical
+cutoffs never acquire ordinary nominal-depth TT bounds. Each accepted experiment
+needs a public-entry trigger regression, negative case, cancellation and on/off
+measurement before it can be considered validated; defaults stay unchanged.
+
+Apps own TimeManager clocks and completed-iteration stability. Engine observers
+accept boundary soft stops while retaining hard deadline/cancellation checks.
+Experiment modes have explicit persisted cumulative wall-time, process deadlines,
+disk and worker budgets. Immutable snapshots bind checkpoint/data/split/model and
+producer/engine/profile identity; cross-version players run independent processes.
+Paired statistics exclude incomplete pairs and deduplicate opening clusters.
+Power estimates and Monte Carlo uncertainty cannot substitute for confirmation.
+The default exploration allowance is 1,200 seconds, 2 GiB new artifacts, at most
+four generation workers and two training threads. Normal builds and correctness
+tests are outside this allowance. Optional wider/head/convolution models and SMP
+pools require measured bottlenecks before implementation. No release or default
+change follows from a smoke run.
+
 ## Remaining research non-goals
 
-No Null Move, ProbCut, singular extension, qsearch TT, interior VCT,
-policy-based reduction/pruning, explicit SIMD optimization, unsafe code, MCTS, AlphaZero,
+No Null Move, qsearch TT, policy hard pruning, explicit SIMD optimization, unsafe code, MCTS, AlphaZero,
 Transformer evaluation, GPU compute, opening database, server/protocol layer,
 Renju, Swap/Swap2, or a generic persistent
 thread pool. Core's backing storage remains 225 cells. Future scope is in
 [ROADMAP.md](ROADMAP.md).
+
+
+### V2 expansion decisions
+
+Width eight is the implemented production topology. Wider or more expensive
+heads remain external performance gates; no empty runtime switches stand in for
+an implementation. All comparisons must use the same dataset, frozen score
+scale, training steps and fixed-time paired matches, with one component changed.
+
+| Candidate | Additional parameters/state versus width eight | Incremental consequence | Decision and required ablation |
+| --- | --- | --- | --- |
+| Width 16 | Another 524,328 i16 weights (1,048,656 bytes); another 14,400 bytes of two-view preactivations | Same at-most-33 dirty centers, approximately twice the embedding/head traffic | Retain width eight until value/policy capacity rather than latency is the measured bottleneck; compare equal CPU training time and equal move time |
+| Four spatial value heads | 24 additional i16 head weights; six additional i64 partial sums | One group per center; update its head sum and restore from reversible preactivation | Only test if phase/spatial residuals justify it; report initialization, dirty updates and heldout error by group |
+| Global-conditioned policy | A minimal 8-by-8 conditioning matrix adds 64 weights and an eight-wide global context | Global context changes each move; local activations remain valid but every requested policy logit must use current context | Candidate only if within-position ranking is the bottleneck; compare ordering gain against per-candidate query cost |
+| Width-eight 3-by-3 DWConv | 72 kernel weights plus eight biases, plus up to another 14,400 bytes of two-view local outputs | A changed center dirties its neighborhood; union can reach all 225 centers, making undo/update much wider | Not selected without a measured advantage over codebook features under equal move time |
+| CNN teacher / codebook distillation | Offline teacher parameters depend on the selected teacher; a distilled width-eight runtime keeps the same 1,048,656 weight bytes | Runtime dirty regions and undo stay unchanged only when the exported student is the existing topology | Offline-only candidate; bind teacher identity and lineage, compare student calibration/rank/strength on identical training data |
+
+Parameter byte counts exclude the 44-byte V2 header and read-only allocation
+metadata. A persistent SMP pool is also deferred until measurements separate
+thread creation from evaluator initialization and actual search work. Portable
+safe Rust remains the baseline; NUMA and unsafe SIMD have no selected workload
+or profiling evidence in this milestone.

@@ -26,6 +26,7 @@ pub(crate) struct SearchHeuristics {
     continuation_1: Box<[i16]>,
     continuation_2: Box<[i16]>,
     stack: [StackEntry; STACK_SIZE],
+    parameters: crate::SearchParameters,
 }
 
 impl Default for SearchHeuristics {
@@ -37,11 +38,15 @@ impl Default for SearchHeuristics {
             continuation_1: vec![0; CONTINUATION_SIZE].into_boxed_slice(),
             continuation_2: vec![0; CONTINUATION_SIZE].into_boxed_slice(),
             stack: [StackEntry::default(); STACK_SIZE],
+            parameters: crate::SearchParameters::BASELINE,
         }
     }
 }
 
 impl SearchHeuristics {
+    pub(crate) fn set_parameters(&mut self, parameters: crate::SearchParameters) {
+        self.parameters = parameters;
+    }
     pub(crate) fn begin_root(&mut self) {
         self.stack[0] = StackEntry::default();
     }
@@ -133,7 +138,7 @@ impl SearchHeuristics {
     ) -> bool {
         self.killer_rank(ply, at) != 0
             || self.is_countermove(side, at, previous)
-            || self.contextual_score(side, at, previous, two_back) >= search_params::STRONG_HISTORY
+            || self.contextual_score(side, at, previous, two_back) >= self.parameters.strong_history
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -150,15 +155,22 @@ impl SearchHeuristics {
     ) -> u8 {
         let own = patterns.profile(at, side);
         let opponent = patterns.profile(at, side.opponent());
-        if depth < search_params::LMR_MIN_DEPTH
-            || index < search_params::LMR_MIN_INDEX
+        if depth < self.parameters.lmr_min_depth
+            || index < usize::from(self.parameters.lmr_min_index)
             || own != ThreatProfile::Quiet
             || opponent != ThreatProfile::Quiet
             || self.is_strong_context(side, at, ply, previous, two_back)
         {
             return 0;
         }
-        let mut reduction = search_params::lmr_base(depth, index);
+        let mut reduction = 1 + self
+            .parameters
+            .lmr_stages
+            .into_iter()
+            .filter(|&(minimum_depth, minimum_index)| {
+                depth >= minimum_depth && index >= usize::from(minimum_index)
+            })
+            .count() as u8;
         if self.cut_node(ply) && reduction < depth - 1 {
             reduction += 1;
         }
@@ -206,9 +218,10 @@ impl SearchHeuristics {
         if !lower_verified || !Self::is_quiet(patterns, side, at) {
             return;
         }
-        let bonus = search_params::history_bonus(depth);
+        let bonus =
+            (i32::from(depth).pow(2) * i32::from(self.parameters.history_bonus_factor)).min(1024);
         self.update_histories(side, at, previous, two_back, bonus);
-        let malus = -search_params::history_malus(depth);
+        let malus = -(bonus / 2).max(1);
         for &quiet in searched_quiets {
             if quiet != at {
                 self.update_histories(side, quiet, previous, two_back, malus);

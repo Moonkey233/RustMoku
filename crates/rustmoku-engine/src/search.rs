@@ -19,12 +19,14 @@ use crate::{
     vct::{VctSolver, VctStatus},
 };
 
-const ASPIRATION_DELTA: i32 = 10_000;
 const MAX_QSEARCH_PLY: u8 = 6;
 
 #[cfg(test)]
 #[path = "search_lifecycle_tests.rs"]
 mod lifecycle_tests;
+#[cfg(test)]
+#[path = "research_tests.rs"]
+mod research_tests;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SearchLimits {
@@ -85,6 +87,17 @@ pub struct SearchStatistics {
     pub pvs_researches: u64,
     pub lmr_reductions: u64,
     pub lmr_researches: u64,
+    pub policy_lmr_reductions: u64,
+    pub policy_lmr_researches: u64,
+    pub policy_lmr_failed_verifications: u64,
+    pub singular_attempts: u64,
+    pub singular_extensions: u64,
+    pub singular_incomplete: u64,
+    pub singular_work: u64,
+    pub probcut_attempts: u64,
+    pub probcut_cutoffs: u64,
+    pub probcut_work: u64,
+    pub probcut_unqualified: u64,
     pub lmp_pruned_moves: u64,
     pub futility_pruned_moves: u64,
     pub rfp_attempts: u64,
@@ -163,6 +176,236 @@ pub struct SearchInfo {
     pub origin: SearchOrigin,
 }
 
+/// Research-only root analysis. Scores are always from `side_to_move` at the
+/// supplied root; incomplete candidates have no score. All scored candidates
+/// share a completed horizon and were searched with full windows, no selectivity
+/// and no ordinary TT access. Storage is allocated once at this public boundary.
+#[derive(Clone, Debug)]
+pub struct RootAnalysis {
+    pub side_to_move: rustmoku_core::Stone,
+    pub candidates: Vec<RootCandidate>,
+    pub completed_depth: u8,
+    pub termination: SearchTermination,
+    pub work: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CandidateBound {
+    Unknown,
+    Exact,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct RootCandidate {
+    pub at: Move,
+    pub score: Option<i32>,
+    pub bound: CandidateBound,
+    pub completed_depth: u8,
+    pub nominal_depth_valid: bool,
+    pub source: SearchOrigin,
+    pub termination: SearchTermination,
+    pub work: u64,
+}
+
+/// Exact fixed-horizon analysis for calibration, with no selective or ordinary TT authority.
+#[derive(Clone, Debug)]
+pub struct ScoreAnalysis {
+    pub score: Option<i32>,
+    pub requested_depth: u8,
+    pub completed_depth: u8,
+    pub termination: SearchTermination,
+    pub work: u64,
+    pub quiet: bool,
+}
+
+impl<E: Evaluator> AlphaBetaEngine<E> {
+    /// A full-window search over the normal candidate universe. Research probes,
+    /// selectivity, proof shortcuts, and normal TT reads/writes are disabled.
+    pub fn analyze_score(
+        &self,
+        position: &Position,
+        limits: SearchLimits,
+        cancellation: CancellationToken,
+    ) -> Result<ScoreAnalysis, &'static str> {
+        if limits.max_depth == 0 || limits.max_nodes.is_none() {
+            return Err("score analysis requires positive depth and an explicit work cap");
+        }
+        let mut state = SearchState::new(position, &self.evaluator);
+        let side = position.side_to_move();
+        let quiet = [side, side.opponent()].into_iter().all(|stone| {
+            state
+                .patterns()
+                .moves_at_least(stone, ThreatProfile::OpenThree)
+                .is_empty()
+        });
+        let mut budget = SearchBudget::new(limits, cancellation);
+        let mut statistics = SearchStatistics::default();
+        let mut pv = PvTable::new();
+        let mut seldepth = 0;
+        let mut context = self.ab_context();
+        context.domain = SearchDomain::Analysis;
+        context.profile = self
+            .config
+            .effective_profile(self.evaluator.score_contract());
+        context.selectivity = crate::SelectivityConfig::OFF;
+        let result = context.negamax::<false>(
+            &mut state,
+            limits.max_depth,
+            -SEARCH_INFINITY,
+            SEARCH_INFINITY,
+            0,
+            &mut SearchResources {
+                seldepth: &mut seldepth,
+                pv: &mut pv,
+                statistics: &mut statistics,
+                heuristics: SearchHeuristics::default(),
+                interior_proof: None,
+                analysis: None,
+                budget: &mut budget,
+            },
+        );
+        let score = match result {
+            Ok(value) if value.validity.supports(Bound::Exact) && budget.poll().is_ok() => {
+                Some(value.score)
+            }
+            Ok(_) | Err(_) => None,
+        };
+        Ok(ScoreAnalysis {
+            score,
+            requested_depth: limits.max_depth,
+            completed_depth: if score.is_some() { limits.max_depth } else { 0 },
+            termination: budget.termination(),
+            work: budget.work_nodes(),
+            quiet,
+        })
+    }
+
+    /// Bounded teacher interface, independent of the normal public search result.
+    /// Top-k applies to ordinary candidates; every current winning point and
+    /// opponent winning point is retained even when it exceeds k.
+    pub fn analyze_root(
+        &self,
+        position: &Position,
+        limits: SearchLimits,
+        top_k: usize,
+        cancellation: CancellationToken,
+    ) -> Result<RootAnalysis, &'static str> {
+        if !(1..=16).contains(&top_k) || limits.max_depth == 0 || limits.max_nodes.is_none() {
+            return Err(
+                "root analysis requires top-k 1..16, positive depth and an explicit work cap",
+            );
+        }
+        let mut state = SearchState::new(position, &self.evaluator);
+        let mut budget = SearchBudget::new(limits, cancellation);
+        let mut statistics = SearchStatistics::default();
+        let mut pv = PvTable::new();
+        let mut seldepth = 0;
+        let mut moves = state.candidates();
+        let side = position.side_to_move();
+        let protected = state
+            .patterns()
+            .winning_moves(side)
+            .union(state.patterns().winning_moves(side.opponent()));
+        order_moves(
+            side,
+            state.patterns(),
+            &mut moves,
+            None,
+            &SearchHeuristics::default(),
+            0,
+            |at| state.policy_score(&self.evaluator, at),
+        );
+        let mut selected = crate::bitboard::BitBoard256::EMPTY;
+        for at in moves.iter().take(top_k) {
+            selected.set(at);
+        }
+        selected = selected.union(protected);
+        let mut candidates: Vec<_> = selected
+            .iter()
+            .filter(|&at| position.is_legal(at))
+            .map(|at| RootCandidate {
+                at,
+                score: None,
+                bound: CandidateBound::Unknown,
+                completed_depth: 0,
+                nominal_depth_valid: false,
+                source: SearchOrigin::Analysis,
+                termination: SearchTermination::Completed,
+                work: 0,
+            })
+            .collect();
+        let mut layer = vec![None; candidates.len()];
+        let mut context = self.ab_context();
+        context.domain = SearchDomain::Analysis;
+        context.profile = self
+            .config
+            .effective_profile(self.evaluator.score_contract());
+        context.selectivity = crate::SelectivityConfig::OFF;
+        let mut completed_depth = 0;
+        if !candidates.is_empty() {
+            'depth: for depth in 1..=limits.max_depth {
+                for (i, candidate) in candidates.iter_mut().enumerate() {
+                    if budget.poll().is_err() {
+                        break 'depth;
+                    }
+                    let before = budget.work_nodes();
+                    let undo = state
+                        .make_move(candidate.at, &self.evaluator)
+                        .expect("checked root candidate");
+                    let result = context.negamax::<false>(
+                        &mut state,
+                        depth - 1,
+                        -SEARCH_INFINITY,
+                        SEARCH_INFINITY,
+                        1,
+                        &mut SearchResources {
+                            seldepth: &mut seldepth,
+                            pv: &mut pv,
+                            statistics: &mut statistics,
+                            heuristics: SearchHeuristics::default(),
+                            interior_proof: None,
+                            analysis: None,
+                            budget: &mut budget,
+                        },
+                    );
+                    state.unmake_move(undo, &self.evaluator);
+                    candidate.work += budget.work_nodes() - before;
+                    let Ok(result) = result else {
+                        break 'depth;
+                    };
+                    if budget.poll().is_err() {
+                        break 'depth;
+                    }
+                    let result = -result;
+                    if !result.validity.supports(Bound::Exact) {
+                        return Err("full-window root analysis returned an unverified score");
+                    }
+                    layer[i] = Some(result.score);
+                }
+                for (candidate, score) in candidates.iter_mut().zip(&layer) {
+                    candidate.score = *score;
+                    candidate.bound = CandidateBound::Exact;
+                    candidate.completed_depth = depth;
+                    candidate.nominal_depth_valid = true;
+                    candidate.source = SearchOrigin::AlphaBeta;
+                }
+                completed_depth = depth;
+            }
+        }
+        let termination = budget.termination();
+        for candidate in &mut candidates {
+            candidate.termination = termination;
+        }
+        Ok(RootAnalysis {
+            side_to_move: side,
+            candidates,
+            completed_depth,
+            termination,
+            work: budget.work_nodes(),
+        })
+    }
+}
+
 impl From<&SearchResult> for SearchInfo {
     fn from(result: &SearchResult) -> Self {
         Self {
@@ -181,6 +424,11 @@ impl From<&SearchResult> for SearchInfo {
 /// Called only at completed root events; dispatch is outside recursive search.
 pub trait SearchObserver {
     fn on_info(&mut self, info: SearchInfo);
+    /// A soft decision at a completed iteration boundary. Hard deadlines and
+    /// cancellation remain under SearchBudget; this is a successful completion.
+    fn should_stop(&mut self) -> bool {
+        false
+    }
 }
 
 impl<F: FnMut(SearchInfo)> SearchObserver for F {
@@ -282,6 +530,9 @@ impl<E> AlphaBetaEngine<E> {
     /// Reconfigures the engine between public searches. Changing TT capacity
     /// is performed by the engine-owning thread and clears the old table.
     pub fn reconfigure(&mut self, config: EngineConfig) {
+        if config != self.config {
+            self.clear_transposition_table();
+        }
         if config.tt_memory_mib() != self.config.tt_memory_mib() {
             self.resize_transposition_table(config.tt_memory_mib());
         }
@@ -413,6 +664,7 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
                     statistics,
                     heuristics: SearchHeuristics::default(),
                     interior_proof: None,
+                    analysis: None,
                     budget,
                 },
             );
@@ -520,6 +772,7 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
             statistics,
             heuristics: SearchHeuristics::default(),
             interior_proof: None,
+            analysis: None,
             budget,
         };
         resources.interior_proof = crate::interior_proof::InteriorProof::new(self.config);
@@ -545,6 +798,16 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
         let threads = self.config.threads();
         let mut principal = AbContext::new(&self.evaluator, &self.table, self.generation, 0);
         principal.selectivity = self.config.selectivity();
+        principal.profile = self
+            .config
+            .effective_profile(self.evaluator.score_contract());
+        principal.probcut = self.config.probcut().filter(|calibration| {
+            calibration.matches(
+                self.evaluator.model_fingerprint(),
+                principal.profile,
+                principal.selectivity,
+            )
+        });
         if threads == 1 {
             let mut completed =
                 run_principal_iterations(&principal, state, limits, resources, completed, observer);
@@ -558,6 +821,8 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
         let table = &self.table;
         let generation = self.generation;
         let selectivity = self.config.selectivity();
+        let profile = principal.profile;
+        let probcut = principal.probcut;
         let (completed, helper_results) = std::thread::scope(|scope| {
             let mut handles = Vec::with_capacity(threads.saturating_sub(1));
             for worker_id in 1..threads {
@@ -574,6 +839,8 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
                     let mut context =
                         AbContext::new(helper_evaluator, helper_table, generation, worker_id);
                     context.selectivity = selectivity;
+                    context.profile = profile;
+                    context.probcut = probcut;
                     run_helper_iterations(
                         &context,
                         &mut helper_state,
@@ -631,6 +898,17 @@ impl SearchStatistics {
         self.pvs_researches += other.pvs_researches;
         self.lmr_reductions += other.lmr_reductions;
         self.lmr_researches += other.lmr_researches;
+        self.policy_lmr_reductions += other.policy_lmr_reductions;
+        self.policy_lmr_researches += other.policy_lmr_researches;
+        self.policy_lmr_failed_verifications += other.policy_lmr_failed_verifications;
+        self.singular_attempts += other.singular_attempts;
+        self.singular_extensions += other.singular_extensions;
+        self.singular_incomplete += other.singular_incomplete;
+        self.singular_work += other.singular_work;
+        self.probcut_attempts += other.probcut_attempts;
+        self.probcut_cutoffs += other.probcut_cutoffs;
+        self.probcut_work += other.probcut_work;
+        self.probcut_unqualified += other.probcut_unqualified;
         self.lmp_pruned_moves += other.lmp_pruned_moves;
         self.futility_pruned_moves += other.futility_pruned_moves;
         self.rfp_attempts += other.rfp_attempts;
@@ -665,6 +943,36 @@ struct HelperResult {
     work_nodes: u64,
 }
 
+struct PolicyRanks {
+    scores: [i32; rustmoku_core::CELL_COUNT],
+    len: usize,
+}
+impl PolicyRanks {
+    fn new<E: Evaluator>(state: &SearchState<E>, evaluator: &E, moves: &MoveList) -> Self {
+        let mut result = Self {
+            scores: [0; rustmoku_core::CELL_COUNT],
+            len: 0,
+        };
+        for at in moves.iter() {
+            if SearchHeuristics::is_quiet(state.patterns(), state.position().side_to_move(), at)
+                && let Some(score) = state.policy_score(evaluator, at)
+            {
+                result.scores[result.len] = score;
+                result.len += 1;
+            }
+        }
+        result.scores[..result.len].sort_unstable();
+        result
+    }
+    fn lower_half(&self, score: Option<i32>) -> bool {
+        score.is_some_and(|score| {
+            self.len >= 4
+                && self.len - self.scores[..self.len].partition_point(|&other| other <= score)
+                    >= self.len.div_ceil(2)
+        })
+    }
+}
+
 fn run_principal_iterations<E: Evaluator>(
     context: &AbContext<'_, E>,
     state: &mut SearchState<E>,
@@ -673,6 +981,12 @@ fn run_principal_iterations<E: Evaluator>(
     mut completed: SearchResult,
     observer: &mut dyn SearchObserver,
 ) -> SearchResult {
+    resources
+        .heuristics
+        .set_parameters(context.profile.parameters());
+    if context.profile.singular() || context.probcut.is_some() {
+        resources.analysis = Some(AnalysisScratch::new());
+    }
     for depth in 1..=limits.max_depth {
         if resources.budget.poll().is_err() {
             break;
@@ -698,6 +1012,9 @@ fn run_principal_iterations<E: Evaluator>(
         );
         completed.origin = SearchOrigin::AlphaBeta;
         observer.on_info(SearchInfo::from(&completed));
+        if observer.should_stop() {
+            break;
+        }
     }
     completed
 }
@@ -718,8 +1035,15 @@ fn run_helper_iterations<E: Evaluator>(
         statistics,
         heuristics: SearchHeuristics::default(),
         interior_proof: None,
+        analysis: None,
         budget,
     };
+    resources
+        .heuristics
+        .set_parameters(context.profile.parameters());
+    if context.profile.singular() || context.probcut.is_some() {
+        resources.analysis = Some(AnalysisScratch::new());
+    }
     for depth in 1..=limits.max_depth {
         if resources.budget.poll().is_err() {
             break;
@@ -745,6 +1069,16 @@ struct AbContext<'a, E: Evaluator> {
     generation: u8,
     root_rotation: usize,
     selectivity: crate::SelectivityConfig,
+    domain: SearchDomain,
+    profile: crate::SearchProfile,
+    probcut: Option<crate::ProbCutCalibration>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SearchDomain {
+    Normal,
+    Analysis,
+    Excluded { at: Move, ply: u8 },
 }
 
 impl<'a, E: Evaluator> AbContext<'a, E> {
@@ -760,6 +1094,9 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
             generation,
             root_rotation,
             selectivity: crate::SelectivityConfig::BASELINE,
+            domain: SearchDomain::Normal,
+            profile: crate::SearchProfile::baseline(evaluator.score_contract()),
+            probcut: None,
         }
     }
 
@@ -773,7 +1110,7 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
         let mut delta = if depth < 2 || previous_score.abs() >= MATE_THRESHOLD {
             2 * SEARCH_INFINITY
         } else {
-            ASPIRATION_DELTA
+            self.profile.parameters().aspiration
         };
         loop {
             let alpha = previous_score.saturating_sub(delta).max(-SEARCH_INFINITY);
@@ -980,10 +1317,23 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
             return Ok(NodeResult::complete(score));
         }
         let tactic = immediate_tactic(state.patterns(), state.position().side_to_move());
-        if let Some((_, score)) = tactic.resolve(ply, resources.pv, resources.seldepth) {
+        let excluded_here = match self.domain {
+            SearchDomain::Excluded {
+                at,
+                ply: excluded_ply,
+            } if excluded_ply == ply => Some(at),
+            _ => None,
+        };
+        if excluded_here.is_none()
+            && let Some((_, score)) = tactic.resolve(ply, resources.pv, resources.seldepth)
+        {
             return Ok(NodeResult::complete(score));
         }
-        let forced_block = tactic.forced_block();
+        let forced_block = if excluded_here.is_some() {
+            None
+        } else {
+            tactic.forced_block()
+        };
         let input_alpha = alpha;
         let input_beta = beta;
         match mate_distance_window(alpha, beta, ply) {
@@ -1030,8 +1380,8 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
             && scout_node
             && forced_block.is_none()
             && depth >= 3
-            && candidate_bits.iter().count() <= 32
-            && !forcing_moves(state.patterns(), side).is_empty()
+            && candidate_bits.iter().count() <= 96
+            && !crate::vct::attacks(state.patterns(), side).is_empty()
         {
             if let Some(proof) = resources.interior_proof.as_mut() {
                 proof.probe(
@@ -1051,6 +1401,16 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
             && !strong_threats
             && alpha.abs() < MATE_THRESHOLD
             && beta.abs() < MATE_THRESHOLD;
+        if selective_node
+            && self.domain == SearchDomain::Normal
+            && (8..=190).contains(&state.position().move_count())
+            && let Some(bucket) = self
+                .probcut
+                .and_then(|calibration| calibration.bucket(depth, state.position().move_count()))
+            && let Some(result) = self.probcut_probe(state, bucket, beta, ply, resources)?
+        {
+            return Ok(result);
+        }
         let static_eval = if selective_node && depth <= 3 {
             resources.statistics.static_evaluations += 1;
             let score = state.evaluate(self.evaluator);
@@ -1061,9 +1421,13 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
         };
         if self.selectivity.reverse_futility && selective_node && depth <= 3 {
             resources.statistics.rfp_attempts += 1;
-            if static_eval
-                .is_some_and(|score| score - search_params::reverse_futility_margin(depth) >= beta)
-            {
+            if static_eval.is_some_and(|score| {
+                score
+                    - self
+                        .profile
+                        .margin(self.profile.parameters().reverse_futility, depth)
+                    >= beta
+            }) {
                 resources.statistics.rfp_cutoffs += 1;
                 return Ok(NodeResult::unverified(
                     static_eval.expect("computed static eval"),
@@ -1073,7 +1437,9 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
         if self.selectivity.razoring
             && selective_node
             && depth <= 2
-            && static_eval.is_some_and(|score| score + search_params::razor_margin(depth) < alpha)
+            && static_eval.is_some_and(|score| {
+                score + self.profile.margin(self.profile.parameters().razor, depth) < alpha
+            })
         {
             resources.statistics.razor_attempts += 1;
             let score = self.qsearch(state, alpha, beta, ply, 0, resources)?;
@@ -1088,10 +1454,16 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
             && forced_block.is_none()
             && !strong_threats
             && probe.best_move.is_none()
-            && depth >= search_params::IIR_MIN_DEPTH;
+            && depth >= self.profile.parameters().iir_min_depth;
         let searched_depth = depth - u8::from(iir);
         resources.statistics.iir_reductions += u64::from(iir);
-        let mut moves = if let Some(at) = forced_block {
+        let mut moves = if let Some(excluded) = excluded_here {
+            let mut moves = MoveList::new();
+            for at in state.candidates().iter().filter(|&at| at != excluded) {
+                moves.push(at);
+            }
+            moves
+        } else if let Some(at) = forced_block {
             let mut moves = MoveList::new();
             moves.push(at);
             moves
@@ -1099,8 +1471,31 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
             state.candidates()
         };
         if moves.is_empty() {
-            return Ok(NodeResult::complete(0));
+            return Ok(if excluded_here.is_some() {
+                NodeResult::unverified(0)
+            } else {
+                NodeResult::complete(0)
+            });
         }
+        let singular_move = if PVS
+            && self.domain == SearchDomain::Normal
+            && self.profile.singular()
+            && !iir
+            && forced_block.is_none()
+            && resources.heuristics.extensions(ply) == 0
+            && depth >= 5
+            && let Some(entry) = probe.entry
+            && entry.depth >= depth.saturating_sub(2)
+            && matches!(entry.bound, Bound::Exact | Bound::Lower)
+            && score_from_tt(entry.score, ply).abs() < MATE_THRESHOLD
+            && let Some(at) = probe.best_move
+            && moves.iter().any(|candidate| candidate != at)
+        {
+            self.verify_singular(state, entry, depth, ply, resources)?
+                .then_some(at)
+        } else {
+            None
+        };
         order_moves(
             side,
             state.patterns(),
@@ -1119,6 +1514,9 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
         let mut best_move = None;
         let mut best_score = -SEARCH_INFINITY;
         let (previous, two_back) = resources.heuristics.previous_moves(ply);
+        let policy_ranks =
+            (PVS && self.profile.policy_lmr() && scout_node && forced_block.is_none())
+                .then(|| PolicyRanks::new(state, self.evaluator, &moves));
         let mut searched_quiets = MoveList::new();
         for (index, at) in moves.iter().enumerate() {
             let quiet = SearchHeuristics::is_quiet(state.patterns(), side, at);
@@ -1133,7 +1531,11 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
             if self.selectivity.lmp
                 && late_quiet
                 && searched_depth <= 3
-                && index >= search_params::lmp_threshold(searched_depth)
+                && index
+                    >= usize::from(
+                        self.profile.parameters().lmp
+                            [usize::from(searched_depth.saturating_sub(1).min(2))],
+                    )
             {
                 resources.statistics.lmp_pruned_moves += 1;
                 validity.upper = false;
@@ -1143,7 +1545,11 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
                 && late_quiet
                 && searched_depth <= 2
                 && static_eval.is_some_and(|score| {
-                    score + search_params::futility_margin(searched_depth) <= alpha
+                    score
+                        + self
+                            .profile
+                            .margin(self.profile.parameters().futility, searched_depth)
+                        <= alpha
                 })
             {
                 resources.statistics.futility_pruned_moves += 1;
@@ -1151,15 +1557,20 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
                 continue;
             }
             let extension = u8::from(
-                self.selectivity.threat_extension
-                    && threat_extension(
-                        state.patterns().profile(at, side),
-                        resources.heuristics.extensions(ply),
-                    ),
+                singular_move == Some(at)
+                    || (self.selectivity.threat_extension
+                        && resources.heuristics.extensions(ply)
+                            < self.profile.parameters().extension_budget
+                        && threat_extension(
+                            state.patterns().profile(at, side),
+                            resources.heuristics.extensions(ply),
+                        )),
             );
-            resources.statistics.threat_extensions += u64::from(extension);
+            resources.statistics.singular_extensions += u64::from(singular_move == Some(at));
+            resources.statistics.threat_extensions +=
+                u64::from(extension != 0 && singular_move != Some(at));
             let child_depth = searched_depth - 1 + extension;
-            let reduction = if PVS
+            let mut reduction = if PVS
                 && self.selectivity.lmr
                 && scout_node
                 && forced_block.is_none()
@@ -1180,6 +1591,15 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
             } else {
                 0
             };
+            let policy_reduced = reduction > 0
+                && reduction < child_depth
+                && policy_ranks
+                    .as_ref()
+                    .is_some_and(|ranks| ranks.lower_half(state.policy_score(self.evaluator, at)));
+            if policy_reduced {
+                reduction += 1;
+                resources.statistics.policy_lmr_reductions += 1;
+            }
 
             resources.heuristics.set_child(
                 ply + 1,
@@ -1205,6 +1625,7 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
                         return Ok((reduced, true));
                     }
                     resources.statistics.lmr_researches += 1;
+                    resources.statistics.policy_lmr_researches += u64::from(policy_reduced);
                     // Improvement must survive the ordinary full-depth PVS path.
                 }
                 let mut result;
@@ -1242,6 +1663,9 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
             })();
             state.unmake_move(undo, self.evaluator);
             let (result, reduced_fail_low) = child?;
+            if policy_reduced && !reduced_fail_low && result.score <= alpha {
+                resources.statistics.policy_lmr_failed_verifications += 1;
+            }
             if reduced_fail_low {
                 // Unverified reduced values cannot improve alpha/PV or support
                 // nominal-depth upper bounds, including after interruption.
@@ -1307,6 +1731,120 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
                 validity
             },
         })
+    }
+
+    fn probcut_probe(
+        &self,
+        state: &mut SearchState<E>,
+        bucket: crate::ProbCutBucket,
+        beta: i32,
+        ply: u8,
+        resources: &mut SearchResources<'_>,
+    ) -> Result<Option<NodeResult>, Stopped> {
+        let Some(mut scratch) = resources.analysis.take() else {
+            return Ok(None);
+        };
+        let mut context = Self::new(self.evaluator, self.table, self.generation, 0);
+        context.domain = SearchDomain::Analysis;
+        context.selectivity = crate::SelectivityConfig::OFF;
+        resources.statistics.probcut_attempts += 1;
+        let before = resources.budget.work_nodes();
+        let (result, heuristics) = {
+            let mut isolated = SearchResources {
+                seldepth: &mut scratch.seldepth,
+                pv: &mut scratch.pv,
+                statistics: resources.statistics,
+                heuristics: scratch
+                    .heuristics
+                    .take()
+                    .expect("exclusive analysis scratch"),
+                interior_proof: None,
+                analysis: None,
+                budget: resources.budget,
+            };
+            let result = context.negamax::<false>(
+                state,
+                bucket.shallow,
+                -SEARCH_INFINITY,
+                SEARCH_INFINITY,
+                ply,
+                &mut isolated,
+            );
+            (result, isolated.heuristics)
+        };
+        scratch.heuristics = Some(heuristics);
+        resources.analysis = Some(scratch);
+        resources.statistics.probcut_work += resources.budget.work_nodes() - before;
+        let result = result?;
+        if !result.validity.supports(Bound::Exact) || result.score.abs() >= MATE_THRESHOLD {
+            resources.statistics.probcut_unqualified += 1;
+            return Ok(None);
+        }
+        if (bucket.min_shallow..=bucket.max_shallow).contains(&result.score)
+            && bucket.lower_prediction(result.score) >= i64::from(beta)
+        {
+            resources.statistics.probcut_cutoffs += 1;
+            // A regression fit is not a nominal-depth legal witness. Neither
+            // this node nor an ancestor may promote it to an ordinary bound.
+            return Ok(Some(NodeResult::unverified(beta)));
+        }
+        Ok(None)
+    }
+
+    fn verify_singular(
+        &self,
+        state: &mut SearchState<E>,
+        entry: TtEntry,
+        depth: u8,
+        ply: u8,
+        resources: &mut SearchResources<'_>,
+    ) -> Result<bool, Stopped> {
+        let Some(mut scratch) = resources.analysis.take() else {
+            return Ok(false);
+        };
+        let at = entry
+            .best_move()
+            .expect("singular entry move was validated");
+        let threshold = score_from_tt(entry.score, ply)
+            - self
+                .profile
+                .margin(self.profile.parameters().futility, depth);
+        let mut context = Self::new(self.evaluator, self.table, self.generation, 0);
+        context.domain = SearchDomain::Excluded { at, ply };
+        context.selectivity = crate::SelectivityConfig::OFF;
+        resources.statistics.singular_attempts += 1;
+        let before = resources.budget.work_nodes();
+        let (result, heuristics) = {
+            let mut isolated = SearchResources {
+                seldepth: &mut scratch.seldepth,
+                pv: &mut scratch.pv,
+                statistics: resources.statistics,
+                heuristics: scratch
+                    .heuristics
+                    .take()
+                    .expect("scratch returned after every probe"),
+                interior_proof: None,
+                analysis: None,
+                budget: resources.budget,
+            };
+            let result = context.negamax::<false>(
+                state,
+                (depth - 1) / 2,
+                threshold - 1,
+                threshold,
+                ply,
+                &mut isolated,
+            );
+            (result, isolated.heuristics)
+        };
+        scratch.heuristics = Some(heuristics);
+        resources.analysis = Some(scratch);
+        resources.statistics.singular_work += resources.budget.work_nodes() - before;
+        if !result.as_ref().is_ok_and(|result| result.validity.upper) {
+            resources.statistics.singular_incomplete += 1;
+        }
+        let result = result?;
+        Ok(result.score < threshold && result.validity.upper)
     }
 
     fn qsearch(
@@ -1426,6 +1964,9 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
         ply: u8,
         statistics: &mut SearchStatistics,
     ) -> TtProbe {
+        if self.domain != SearchDomain::Normal {
+            return TtProbe::default();
+        }
         statistics.tt_probes += 1;
         let Some(entry) = self.table.probe(state.key().value()) else {
             return TtProbe::default();
@@ -1442,10 +1983,14 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
         TtProbe {
             best_move,
             cutoff_score,
+            entry: Some(entry),
         }
     }
 
     fn store_tt(&self, store: TtStore, statistics: &mut SearchStatistics) {
+        if self.domain != SearchDomain::Normal {
+            return;
+        }
         let entry = TtEntry::new(
             store.key,
             score_to_tt(store.score, store.ply),
@@ -1626,7 +2171,23 @@ struct SearchResources<'a> {
     statistics: &'a mut SearchStatistics,
     heuristics: SearchHeuristics,
     interior_proof: Option<crate::interior_proof::InteriorProof>,
+    analysis: Option<Box<AnalysisScratch>>,
     budget: &'a mut SearchBudget,
+}
+
+struct AnalysisScratch {
+    pv: PvTable,
+    heuristics: Option<SearchHeuristics>,
+    seldepth: u8,
+}
+impl AnalysisScratch {
+    fn new() -> Box<Self> {
+        Box::new(Self {
+            pv: PvTable::new(),
+            heuristics: Some(SearchHeuristics::default()),
+            seldepth: 0,
+        })
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1643,6 +2204,7 @@ struct TtStore {
 struct TtProbe {
     best_move: Option<Move>,
     cutoff_score: Option<i32>,
+    entry: Option<TtEntry>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1992,6 +2554,7 @@ mod tests {
         let mut seldepth = 0;
         let mut resources = super::SearchResources {
             interior_proof: None,
+            analysis: None,
             budget: &mut crate::search_control::SearchBudget::default(),
             statistics: &mut statistics,
             pv: &mut pv,
@@ -2073,6 +2636,7 @@ mod tests {
                 0,
                 &mut super::SearchResources {
                     interior_proof: None,
+                    analysis: None,
                     budget: &mut crate::search_control::SearchBudget::default(),
                     seldepth: &mut seldepth,
                     pv: &mut pv,
@@ -2121,6 +2685,7 @@ mod tests {
                 0,
                 &mut super::SearchResources {
                     interior_proof: None,
+                    analysis: None,
                     budget: &mut crate::search_control::SearchBudget::default(),
                     seldepth: &mut seldepth,
                     pv: &mut pv,
@@ -2168,6 +2733,7 @@ mod tests {
                 0,
                 &mut super::SearchResources {
                     interior_proof: None,
+                    analysis: None,
                     budget: &mut crate::search_control::SearchBudget::default(),
                     seldepth: &mut guided_seldepth,
                     pv: &mut guided_pv,
@@ -2195,6 +2761,7 @@ mod tests {
                 crate::score::SEARCH_INFINITY,
                 &mut super::SearchResources {
                     interior_proof: None,
+                    analysis: None,
                     budget: &mut crate::search_control::SearchBudget::default(),
                     seldepth: &mut seldepth,
                     pv: &mut pv,
@@ -2257,6 +2824,7 @@ mod tests {
                     reference.score + offset,
                     &mut super::SearchResources {
                         interior_proof: None,
+                        analysis: None,
                         budget: &mut crate::search_control::SearchBudget::default(),
                         seldepth: &mut seldepth,
                         pv: &mut pv,
@@ -2328,6 +2896,7 @@ mod tests {
                     crate::score::SEARCH_INFINITY,
                     &mut super::SearchResources {
                         interior_proof: None,
+                        analysis: None,
                         budget: &mut crate::search_control::SearchBudget::default(),
                         seldepth: &mut seldepth,
                         pv: &mut pv,
@@ -2356,6 +2925,7 @@ mod tests {
                 qply,
                 &mut super::SearchResources {
                     interior_proof: None,
+                    analysis: None,
                     budget: &mut crate::search_control::SearchBudget::default(),
                     seldepth: &mut seldepth,
                     pv: &mut pv,
@@ -2519,6 +3089,7 @@ mod tests {
                 7,
                 &mut super::SearchResources {
                     interior_proof: None,
+                    analysis: None,
                     budget: &mut crate::search_control::SearchBudget::default(),
                     seldepth: &mut selective_depth,
                     pv: &mut line,
@@ -2606,6 +3177,7 @@ mod tests {
                 0,
                 &mut super::SearchResources {
                     interior_proof: None,
+                    analysis: None,
                     budget: &mut crate::search_control::SearchBudget::default(),
                     seldepth: &mut seldepth,
                     pv: &mut pv,
@@ -2712,6 +3284,7 @@ mod tests {
             let mut seldepth = 0;
             let mut resources = super::SearchResources {
                 interior_proof: None,
+                analysis: None,
                 budget: &mut crate::search_control::SearchBudget::default(),
                 seldepth: &mut seldepth,
                 pv: &mut pv,
@@ -2757,6 +3330,7 @@ mod tests {
             let mut seldepth = 0;
             let mut resources = super::SearchResources {
                 interior_proof: None,
+                analysis: None,
                 budget: &mut crate::search_control::SearchBudget::default(),
                 seldepth: &mut seldepth,
                 pv: &mut pv,
@@ -2848,6 +3422,7 @@ mod tests {
                     0,
                     &mut super::SearchResources {
                         interior_proof: None,
+                        analysis: None,
                         budget: &mut crate::search_control::SearchBudget::default(),
                         seldepth: &mut seldepth,
                         pv: &mut pv,

@@ -32,6 +32,9 @@ def main() -> None:
     checkpoint = load_checkpoint(args.checkpoint)
     model = load_training_model(args.checkpoint, args.device)
     model.eval()
+    nonlinear = checkpoint.get('format') == 'rustmoku-nonlinear-v2'
+    architecture = 'v2' if nonlinear else 'v1'
+    score_scale = checkpoint['configuration'].get('score_scale')
     absolute_error = 0.0
     value_count = 0
     policy_correct = 0
@@ -48,8 +51,8 @@ def main() -> None:
             raise ValueError(f"split {args.split!r} is empty")
         for index in indices:
             # Validation/test stay in their stored canonical, unaugmented view.
-            global_keys, candidates, target, value, _ = make_example(
-                dataset[index], 0, args.device
+            global_keys, candidates, target, value, _, _ = make_example(
+                dataset[index], 0, args.device, architecture, score_scale
             )
             prediction = float(model.value(global_keys.unsqueeze(0)).item())
             record = dataset[index]
@@ -79,11 +82,11 @@ def main() -> None:
                 policy_count += 1
     print(
         f"split={args.split} samples={value_count} "
-        f"value_mae_score_units={absolute_error / value_count * EVALUATION_LIMIT:.3f} "
+        f"value_mae_normalized={absolute_error / value_count:.6f} "
         f"policy_top1={policy_correct / policy_count:.4f} policy_samples={policy_count}"
         if policy_count
         else f"split={args.split} samples={value_count} "
-        f"value_mae_score_units={absolute_error / value_count * EVALUATION_LIMIT:.3f} "
+        f"value_mae_normalized={absolute_error / value_count:.6f} "
         "policy_top1=unavailable policy_samples=0"
     )
 

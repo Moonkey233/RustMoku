@@ -33,6 +33,7 @@ struct PatternChange {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PatternDelta {
     at: Move,
+    stone: Stone,
     changes: [PatternChange; MAX_PATTERN_CHANGES],
     len: u8,
 }
@@ -41,6 +42,7 @@ impl Default for PatternDelta {
     fn default() -> Self {
         Self {
             at: Move::CENTER,
+            stone: Stone::Black,
             changes: [PatternChange::default(); MAX_PATTERN_CHANGES],
             len: 0,
         }
@@ -51,6 +53,12 @@ impl PatternDelta {
     #[must_use]
     pub const fn played_move(&self) -> Move {
         self.at
+    }
+
+    /// The accepted move changes center occupancy from empty to this stone.
+    #[must_use]
+    pub const fn played_stone(&self) -> Stone {
+        self.stone
     }
 
     pub(crate) fn changes(&self) -> impl Iterator<Item = (LineKey, LineKey)> + '_ {
@@ -156,6 +164,7 @@ impl PatternState {
         self.occupied.set(at);
         let mut delta = PatternDelta {
             at,
+            stone,
             ..PatternDelta::default()
         };
         self.update_lines(at, 0, stone_code(Some(stone)), Some(&mut delta));

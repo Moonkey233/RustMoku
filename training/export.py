@@ -73,6 +73,16 @@ def main() -> None:
     args = parse_args()
     identity = export_identity(args.checkpoint, args.dataset)
     model = load_training_model(args.checkpoint, "cpu")
+    from nonlinear_model import NonlinearModel, export_integer
+    if isinstance(model, NonlinearModel):
+        from checkpoint import load_checkpoint
+        payload, quantization = export_integer(model, args, load_checkpoint(args.checkpoint)['configuration']['score_scale'])
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        check_file(identity['checkpoint'])
+        publish_model(args.output, payload)
+        write_export(args.output, identity, quantization)
+        print(f'saved={args.output} architecture=2 bytes={len(payload)}')
+        return
     embeddings, embedding_scale = quantize(
         model.embedding.weight, args.embedding_scale, "embeddings"
     )

@@ -1,12 +1,10 @@
 //! Small bounded F-stage matrix driver. Timings are diagnostics, never strength.
 use rustmoku_core::{Move, Position};
 use rustmoku_engine::{
-    AlphaBetaEngine, EngineConfig, LearnedEvaluator, LearnedModel, ProofLimits, RuntimeEvaluator,
-    SearchEngine, SearchLimits,
+    AlphaBetaEngine, EngineConfig, ProofLimits, RuntimeEvaluator, SearchEngine, SearchLimits,
 };
 use std::{
     error::Error,
-    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -19,9 +17,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--model" => {
-                evaluator = RuntimeEvaluator::Learned(LearnedEvaluator::new(Arc::new(
-                    LearnedModel::read_from_path(args.next().ok_or("missing model")?)?,
-                )))
+                evaluator = RuntimeEvaluator::read_from_path(args.next().ok_or("missing model")?)?;
             }
             "--threads" => threads = args.next().ok_or("missing threads")?.parse()?,
             "--mode" => mode = args.next().ok_or("missing mode")?,

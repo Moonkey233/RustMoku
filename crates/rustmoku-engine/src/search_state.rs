@@ -84,6 +84,17 @@ impl<E: Evaluator> SearchState<E> {
         solver.ordering_hint(&mut self.board, depth, work, budget)
     }
 
+    pub(crate) fn vct_ordering_hint(
+        &mut self,
+        solver: &mut crate::vct::VctSolver,
+        depth: u8,
+        work: u64,
+        budget: &mut crate::search_control::SearchBudget,
+        pv: &mut crate::principal_variation::PvTable,
+    ) -> (crate::vct::VctStatus, Option<Move>) {
+        solver.ordering_hint(&mut self.board, depth, work, budget, pv)
+    }
+
     pub(crate) fn make_move(
         &mut self,
         at: Move,

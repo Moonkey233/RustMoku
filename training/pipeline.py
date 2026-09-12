@@ -16,6 +16,7 @@ from common import save_split_manifest
 from dataset import file_hash, DatasetBundle
 from promote import promote
 from provenance import sidecar
+from budget import ExplorationBudget
 
 
 def publish_state(path, state):
@@ -34,8 +35,18 @@ def publish_state(path, state):
 
 
 def run(config, root, only=None):
-    if not (1 <= config['games'] <= 32 and 1 <= config['epochs'] <= 3 and 1 <= config['pairs'] <= 4):
-        raise ValueError('smoke caps: 32 games, 3 epochs, 4 pairs')
+    mode = config.get('mode', 'smoke')
+    if mode not in ('smoke', 'pilot', 'formal'):
+        raise ValueError('mode must be smoke, pilot, or formal')
+    caps = (32, 3, 4) if mode == 'smoke' else (10000, 10000, 100000)
+    if not all(1 <= config[key] <= cap for key, cap in zip(('games', 'epochs', 'pairs'), caps)):
+        raise ValueError('run exceeds mode safety caps')
+    if mode != 'smoke' and 'budget' not in config:
+        raise ValueError('pilot/formal requires an explicit cumulative budget')
+    resources = config.get('budget', {'seconds': 1200, 'artifact_bytes': 2 * 1024**3})
+    if not 1 <= config.get('workers', 1) <= 4 or not 1 <= config.get('torch_threads', 2) <= 2:
+        raise ValueError('worker/thread safety cap exceeded')
+    budget = ExplorationBudget(root / 'budget.json', **resources)
     root.mkdir(parents=True, exist_ok=True)
     scripts = Path(__file__).resolve().parent
     repository = scripts.parent
@@ -54,17 +65,19 @@ def run(config, root, only=None):
     arena_config = {'arena': str(arena_engine), 'arguments': [
         '--depth', '8', '--move-ms', str(config.get('move_ms', 10)),
         '--a-model', str(model.resolve()), '--a-tt-mib', '1', '--b-tt-mib', '1'],
-        'max_pairs': config['pairs'], 'suite_role': 'smoke', 'stop_rule': 'fixed_pairs',
+        'max_pairs': config['pairs'], 'suite_role': 'smoke' if mode == 'smoke' else 'tuning', 'stop_rule': 'fixed_pairs',
         'sprt': {'h0': 0, 'h1': 5, 'alpha': .05, 'beta': .05}, 'game_timeout_seconds': 30}
     save_split_manifest(root / 'arena.json', arena_config)
     python = sys.executable
     stages = [
         ('generate', [python, str(scripts / 'generate.py'), '--engine', str(data_engine), '--output', str(root / 'data'),
-                      '--games', str(config['games']), '--seed', str(config['seed']), '--depth', '1', '--nodes', '100'], [data]),
+                      '--games', str(config['games']), '--seed', str(config['seed']), '--depth', str(config.get('teacher_depth', 1)), '--nodes', str(config.get('teacher_nodes', 100)),
+                      '--workers', str(config.get('workers', 1))], [data]),
         ('audit-split', [python, str(scripts / 'audit.py'), '--dataset', str(data), '--manifest', str(root / 'split.json'),
                         '--seed', str(config['seed'])], [root / 'split.json']),
         ('train', [python, str(scripts / 'train.py'), '--dataset', str(data), '--output', str(checkpoint),
-                   '--epochs', str(config['epochs']), '--seed', str(config['seed']), '--batch-size', '8'], [checkpoint]),
+                   '--epochs', str(config['epochs']), '--seed', str(config['seed']), '--batch-size', str(config.get('batch_size', 8)), '--architecture', config.get('architecture', 'v1'),
+                   '--torch-threads', str(config.get('torch_threads', 2))], [checkpoint]),
         ('evaluate', [python, str(scripts / 'evaluate.py'), '--dataset', str(data), '--checkpoint', str(checkpoint)], []),
         ('export', [python, str(scripts / 'export.py'), '--checkpoint', str(checkpoint), '--dataset', str(data),
                     '--output', str(model)], [model, sidecar(model, 'export')]),
@@ -96,7 +109,11 @@ def run(config, root, only=None):
             command += ['--resume', str(checkpoint)]
         publish_state(state_path, {'status': 'running', 'command': command})
         try:
-            result = subprocess.run(command, cwd=repository, capture_output=True, text=True, check=True, timeout=60)
+            if name == 'tactical':
+                result = subprocess.run(command, cwd=repository, capture_output=True, text=True, check=True, timeout=600)
+            else:
+                result = budget.run(command, artifact_root=root, cwd=repository, capture_output=True, text=True,
+                                    check=True, timeout=config.get('stage_seconds', 60))
             (root / f'{name}.log').write_text(result.stdout + result.stderr, encoding='utf-8')
             publish_state(state_path, {'status': 'complete', 'command': command,
                 'outputs': {str(path.resolve()): file_hash(path) for path in outputs + [root / f'{name}.log']}})

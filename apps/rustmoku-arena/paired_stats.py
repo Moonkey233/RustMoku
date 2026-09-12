@@ -108,3 +108,49 @@ def summarize(counts, h0=0, h1=5, alpha=.05, beta=.05, max_pairs=1000):
     elif n >= max_pairs:
         result['cap_reached'] = True
     return result
+
+
+def power_budget(counts, target_elo=5, alpha=.05, beta=.2):
+    """Planning estimates, not a new stop rule or a sufficiency guarantee."""
+    if len(counts) != 5 or any(type(n) is not int or n < 0 for n in counts):
+        raise ValueError('expected five nonnegative counts')
+    if not math.isfinite(target_elo) or target_elo <= 0 or not 0 < alpha < .5 or not 0 < beta < .5:
+        raise ValueError('invalid power target')
+    n = sum(counts)
+    mean = sum(count * score for count, score in zip(counts, SCORES)) / n if n else .5
+    observed = sum(count * (score - mean)**2 for count, score in zip(counts, SCORES)) / (n - 1) if n > 1 else None
+    delta = logistic(target_elo) - .5
+    variance = observed if observed is not None and observed > 0 else .25
+    z = NormalDist().inv_cdf(1 - alpha) + NormalDist().inv_cdf(1 - beta)
+    return {'target_elo': target_elo, 'target_score_gain': delta, 'observed_pair_variance': observed,
+            'normal_approximate_independent_pairs': math.ceil(z*z*variance/(delta*delta)),
+            'worst_case_hoeffding_independent_pairs': math.ceil((math.sqrt(math.log(1/alpha)) + math.sqrt(math.log(1/beta)))**2 / (2*delta*delta)),
+            'assumptions': 'new independent opening pairs; fixed sample; stable distribution; approximation is diagnostic'}
+
+
+def monte_carlo_fixed_gate(probabilities, pairs=64, trials=1000, seed=0):
+    """Known-distribution check of the retained fixed-sample Hoeffding gate."""
+    import random
+    if (len(probabilities) != 5 or any(not math.isfinite(p) or p < 0 for p in probabilities)
+            or abs(sum(probabilities)-1) > 1e-12 or not 1 <= pairs <= 10000 or not 1 <= trials <= 10000
+            or pairs * trials > 2_000_000):
+        raise ValueError('invalid or unbounded Monte Carlo budget')
+    rng = random.Random(seed)
+    truth = sum(p*x for p, x in zip(probabilities, SCORES))
+    radius = math.sqrt(math.log(40)/(2*pairs))
+    accepted = covered = 0
+    for _ in range(trials):
+        mean = sum(rng.choices(SCORES, weights=probabilities, k=pairs))/pairs
+        accepted += mean - radius > .5
+        covered += abs(mean-truth) <= radius
+    def estimate(count):
+        proportion = count / trials
+        # Wilson interval remains informative when no failures were observed.
+        z = NormalDist().inv_cdf(.975)
+        denominator = 1 + z*z/trials
+        center = (proportion + z*z/(2*trials))/denominator
+        radius = z*math.sqrt(proportion*(1-proportion)/trials + z*z/(4*trials*trials))/denominator
+        return {'estimate': proportion, 'mc_ci95_wilson': [max(0, center-radius), min(1, center+radius)]}
+    return {'pairs': pairs, 'trials': trials, 'seed': seed, 'true_mean': truth,
+            'type_I' if truth <= .5 else 'power': estimate(accepted), 'coverage': estimate(covered),
+            'type_II': estimate(trials-accepted) if truth > .5 else None}

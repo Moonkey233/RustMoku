@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+mod pipe;
+
 use std::{
     env,
     error::Error,
@@ -7,17 +9,13 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     process::ExitCode,
-    sync::Arc,
     thread,
 };
 
-use rustmoku_core::{
-    CELL_COUNT, CanonicalPosition, CanonicalPositionKey, Game, Move, OPENINGS, Symmetry,
-};
+use rustmoku_core::{CanonicalPosition, CanonicalPositionKey, Game, Move, OPENINGS, Symmetry};
 use rustmoku_engine::{
-    AlphaBetaEngine, EngineConfig, LearnedEvaluator, LearnedModel, PatternEvaluator, ProofBook,
-    ProofBookVerifyLimits, ProofDistance, SearchEngine, SearchLimits, SearchOrigin,
-    SearchTermination,
+    AlphaBetaEngine, EngineConfig, Evaluator, ProofBook, ProofBookVerifyLimits, ProofDistance,
+    RuntimeEvaluator, SearchEngine, SearchLimits, SearchOrigin, SearchTermination,
 };
 
 const MAGIC: &[u8; 8] = b"RMDATA01";
@@ -63,7 +61,9 @@ fn main() -> ExitCode {
 fn run() -> Result<(), Box<dyn Error>> {
     let mut args = Arguments::new(env::args().skip(1));
     match args.command()?.as_str() {
+        "pipe" => pipe_player(args),
         "record" => generate_record(args),
+        "analyze" => analyze_record(args),
         "proof" => generate_proof(args),
         "selfplay" => generate_selfplay(args),
         "inspect" => inspect(args),
@@ -74,6 +74,139 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
         other => Err(format!("unknown command {other:?}").into()),
     }
+}
+
+fn pipe_player(mut args: Arguments) -> Result<(), Box<dyn Error>> {
+    let model: Option<PathBuf> = args.optional("--model")?;
+    let profile: Option<rustmoku_engine::SearchProfile> = args
+        .optional::<String>("--profile")?
+        .map(|value| value.parse())
+        .transpose()?;
+    let describe = args.optional("--describe")?.unwrap_or(false);
+    let depth = args.optional("--depth")?.unwrap_or(64);
+    let nodes = args.optional("--nodes")?.unwrap_or(u64::MAX);
+    let threads: usize = args.optional("--threads")?.unwrap_or(1);
+    let tt_mib: usize = args.optional("--tt-mib")?.unwrap_or(64);
+    args.finish()?;
+    if !(1..=8).contains(&threads) || tt_mib > 1024 || depth == 0 || nodes == 0 {
+        return Err("invalid pipe resource limits".into());
+    }
+    let evaluator = model
+        .map(RuntimeEvaluator::read_from_path)
+        .transpose()?
+        .unwrap_or(RuntimeEvaluator::Pattern);
+    let config = teacher_config(&evaluator, profile)?
+        .with_threads(threads)
+        .with_tt_memory_mib(tt_mib);
+    if describe {
+        let fingerprint = evaluator
+            .model_fingerprint()
+            .ok_or("missing model identity")?
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        println!(
+            r#"{{"protocol":"rustmoku-pipe-v1","version":"{}","model_fingerprint":"{}","profile":"{}","threads":{},"tt_mib":{},"depth":{},"nodes":{}}}"#,
+            env!("CARGO_PKG_VERSION"),
+            fingerprint,
+            config.effective_profile(evaluator.score_contract()),
+            threads,
+            tt_mib,
+            depth,
+            nodes
+        );
+        return Ok(());
+    }
+    pipe::run(
+        AlphaBetaEngine::with_config(evaluator, config),
+        depth,
+        nodes,
+        std::io::stdin().lock(),
+        std::io::stdout().lock(),
+    )
+}
+
+/// Explicit offline analysis uses a shared work cap and a common completed horizon.
+fn analyze_record(mut args: Arguments) -> Result<(), Box<dyn Error>> {
+    let input = PathBuf::from(args.required("--record")?);
+    let depth = args.optional("--depth")?.unwrap_or(4);
+    let nodes = args.optional("--nodes")?.unwrap_or(20_000);
+    let top_k = args.optional("--top-k")?.unwrap_or(8);
+    let score_only = args.optional("--score-only")?.unwrap_or(false);
+    let model: Option<PathBuf> = args.optional("--model")?;
+    let profile: Option<rustmoku_engine::SearchProfile> = args
+        .optional::<String>("--profile")?
+        .map(|value| value.parse())
+        .transpose()?;
+    args.finish()?;
+    let evaluator = model
+        .map(RuntimeEvaluator::read_from_path)
+        .transpose()?
+        .unwrap_or(RuntimeEvaluator::Pattern);
+    let game = Game::from_record(&std::fs::read_to_string(input)?)?;
+    let engine =
+        AlphaBetaEngine::with_config(evaluator.clone(), teacher_config(&evaluator, profile)?);
+    if score_only {
+        let result = engine.analyze_score(
+            game.position(),
+            SearchLimits::new(depth).with_max_nodes(nodes),
+            rustmoku_engine::CancellationToken::new(),
+        )?;
+        let score = result
+            .score
+            .map_or_else(|| "null".to_string(), |value| value.to_string());
+        let key = CanonicalPosition::new(game.position())
+            .key()
+            .as_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        println!(
+            r#"{{"version":1,"position_key":"{}","stones":{},"perspective":"root-side-to-move","score":{},"requested_depth":{},"completed_depth":{},"quiet":{},"termination":"{:?}","work":{}}}"#,
+            key,
+            game.position().move_count(),
+            score,
+            depth,
+            result.completed_depth,
+            result.quiet,
+            result.termination,
+            result.work
+        );
+        return Ok(());
+    }
+    let result = engine.analyze_root(
+        game.position(),
+        SearchLimits::new(depth).with_max_nodes(nodes),
+        top_k,
+        rustmoku_engine::CancellationToken::new(),
+    )?;
+    println!("{}", analysis_json(&game, &result, depth, nodes));
+    Ok(())
+}
+
+fn analysis_json(
+    game: &Game,
+    result: &rustmoku_engine::RootAnalysis,
+    depth: u8,
+    nodes: u64,
+) -> String {
+    let canonical = CanonicalPosition::new(game.position());
+    let key = canonical
+        .key()
+        .as_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    let candidates = result.candidates.iter().map(|candidate| {
+        let score = candidate.score.map_or_else(|| "null".to_string(), |value| value.to_string());
+        format!(r#"{{"move":{},"score":{},"bound":"{:?}","completed_depth":{},"nominal_depth_valid":{},"source":"{:?}","termination":"{:?}","work":{}}}"#,
+            canonical.move_to_canonical(candidate.at).index(), score, candidate.bound, candidate.completed_depth,
+            candidate.nominal_depth_valid, candidate.source, candidate.termination, candidate.work)
+    }).collect::<Vec<_>>().join(",");
+    format!(
+        r#"{{"version":1,"position_key":"{}","perspective":"root-side-to-move","requested_depth":{},"completed_depth":{},"termination":"{:?}","work":{},"budget":{},"candidates":[{}]}}"#,
+        key, depth, result.completed_depth, result.termination, result.work, nodes, candidates
+    )
 }
 
 fn generate_proof(mut args: Arguments) -> Result<(), Box<dyn Error>> {
@@ -107,9 +240,9 @@ fn generate_proof(mut args: Arguments) -> Result<(), Box<dyn Error>> {
             sample.attacker, sample.distance.plies()));
     })?;
     write_dataset(&output, &records)?;
-    std::fs::write(
-        output.with_extension("proof.json"),
-        format!("{{\"version\":1,\"games\":{{{}}}}}\n", metadata.join(",")),
+    write_companion(
+        &output.with_extension("proof.json"),
+        format!("{{\"version\":1,\"games\":{{{}}}}}\n", metadata.join(",")).as_bytes(),
     )?;
     println!(
         "exported {} independently verified proof labels",
@@ -123,10 +256,38 @@ fn generate_record(mut args: Arguments) -> Result<(), Box<dyn Error>> {
     let output = PathBuf::from(args.required("--output")?);
     let depth = args.optional("--depth")?.unwrap_or(8);
     let nodes = args.optional("--nodes")?.unwrap_or(50_000);
+    let branch_ply: Option<usize> = args.optional("--branch-ply")?;
+    let branch_choice: usize = args.optional("--branch-choice")?.unwrap_or(0);
+    let model: Option<PathBuf> = args.optional("--model")?;
     args.finish()?;
     let source = Game::from_record(&std::fs::read_to_string(input)?)?;
+    let source = if let Some(ply) = branch_ply {
+        if ply >= source.history().len() {
+            return Err("branch ply must precede an existing historical move".into());
+        }
+        let mut branch = Game::new(source.position().rules());
+        for at in source.history().take(ply) {
+            branch.play_move(at)?;
+        }
+        let original = source.history().nth(ply).unwrap();
+        let alternatives: Vec<_> = Move::all()
+            .filter(|&at| at != original && branch.position().is_legal(at))
+            .collect();
+        if alternatives.is_empty() {
+            return Err("branch has no legal alternative".into());
+        }
+        branch.play_move(alternatives[branch_choice % alternatives.len()])?;
+        branch
+    } else {
+        source
+    };
     let mut trajectory = Game::new(source.position().rules());
-    let mut teacher = teacher_engine();
+    let evaluator = model
+        .map(RuntimeEvaluator::read_from_path)
+        .transpose()?
+        .unwrap_or(RuntimeEvaluator::Pattern);
+    let mut teacher =
+        AlphaBetaEngine::with_config(evaluator, EngineConfig::new(64).with_threads(1));
     let mut records = Vec::with_capacity(source.history().len() + 1);
     for (ply, historical) in source.history().enumerate() {
         records.push(label_position(
@@ -160,88 +321,146 @@ fn generate_selfplay(mut args: Arguments) -> Result<(), Box<dyn Error>> {
     let depth = args.optional("--depth")?.unwrap_or(6);
     let nodes = args.optional("--nodes")?.unwrap_or(20_000);
     let random_plies: usize = args.optional("--random-plies")?.unwrap_or(0);
-    let cold_games: bool = args.optional("--cold-games")?.unwrap_or(false);
+    let explore_top_k: usize = args.optional("--explore-top-k")?.unwrap_or(0);
+    let explore_temperature: f64 = args.optional("--explore-temperature")?.unwrap_or(1000.0);
+    let explore_plies: usize = args.optional("--explore-plies")?.unwrap_or(80);
+    let cold_games: bool = args.optional("--cold-games")?.unwrap_or(true);
+    let first_game: u64 = args.optional("--first-game")?.unwrap_or(0);
+    let model: Option<PathBuf> = args.optional("--model")?;
+    let profile: Option<rustmoku_engine::SearchProfile> = args
+        .optional::<String>("--profile")?
+        .map(|value| value.parse())
+        .transpose()?;
+    let evaluator = model
+        .map(RuntimeEvaluator::read_from_path)
+        .transpose()?
+        .unwrap_or(RuntimeEvaluator::Pattern);
     args.finish()?;
     if random_plies > 8 {
         return Err("random prefix must be 0..=8 plies".into());
     }
-    if games == 0 || games > MAX_RECORDS / (CELL_COUNT + 1) {
-        return Err("game count can exceed the dataset record safety limit".into());
+    if explore_top_k > 16
+        || !explore_temperature.is_finite()
+        || explore_temperature <= 0.0
+        || explore_plies > 225
+    {
+        return Err("invalid bounded teacher exploration configuration".into());
     }
-    if requested_workers == 0 || requested_workers > 256 {
-        return Err("workers must be in 1..=256".into());
+    if games == 0 || games > 32 {
+        return Err("selfplay accepts 1..=32 games per shard".into());
     }
+    if requested_workers == 0 || requested_workers > 4 {
+        return Err("workers must be in 1..=4".into());
+    }
+    if !cold_games {
+        return Err("selfplay requires cold-per-game TT for worker-independent semantics".into());
+    }
+    first_game
+        .checked_add(games as u64)
+        .ok_or("stable game id overflow")?;
+    let config = teacher_config(&evaluator, profile)?;
     let workers = requested_workers.min(games);
-    let mut records = thread::scope(|scope| {
+    let (mut records, mut comparisons) = thread::scope(|scope| {
         let mut handles = Vec::new();
         for worker in 0..workers {
-            handles.push(scope.spawn(move || -> Result<Vec<DataRecord>, String> {
-                // Independent persistent teacher state: no globally locked
-                // engine and no scheduler-dependent cross-worker TT sharing.
-                let mut teacher = teacher_engine();
-                let mut records = Vec::new();
-                for game_id in (worker..games).step_by(workers) {
-                    if cold_games {
-                        teacher = teacher_engine();
-                    }
-                    let opening_index =
-                        (splitmix64(seed ^ game_id as u64) as usize) % OPENINGS.len();
-                    let mut game = OPENINGS[opening_index]
-                        .game()
-                        .map_err(|error| error.to_string())?;
-                    let opening_plies = game.history().len();
-                    while game.status() == rustmoku_core::GameStatus::Ongoing {
-                        let record = label_position(
-                            &mut teacher,
-                            game_id as u64,
-                            game.history().len(),
-                            &game,
-                            depth,
-                            nodes,
-                        )
-                        .map_err(|error| error.to_string())?;
-                        let Some(at) = record.policy_move.map(|at| {
-                            let canonical = CanonicalPosition::new(game.position());
-                            canonical.move_to_original(at)
-                        }) else {
-                            break;
-                        };
-                        let at = if game.history().len() - opening_plies < random_plies {
-                            diverse_move(
+            let evaluator = evaluator.clone();
+            handles.push(scope.spawn(
+                move || -> Result<(Vec<DataRecord>, Vec<(u64, usize, String)>), String> {
+                    // Independent persistent teacher state: no globally locked
+                    // engine and no scheduler-dependent cross-worker TT sharing.
+                    let mut teacher = AlphaBetaEngine::with_config(evaluator, config);
+                    let mut records = Vec::new();
+                    let mut comparisons = Vec::new();
+                    for local_game in (worker..games).step_by(workers) {
+                        let game_id = first_game + local_game as u64;
+                        teacher.clear_transposition_table();
+                        let opening_index = (splitmix64(seed ^ game_id) as usize) % OPENINGS.len();
+                        let mut game = OPENINGS[opening_index]
+                            .game()
+                            .map_err(|error| error.to_string())?;
+                        let opening_plies = game.history().len();
+                        while game.status() == rustmoku_core::GameStatus::Ongoing {
+                            let record = label_position(
+                                &mut teacher,
+                                game_id,
+                                game.history().len(),
                                 &game,
-                                at,
-                                splitmix64(
-                                    seed ^ ((game_id as u64) << 32) ^ game.history().len() as u64,
-                                ),
+                                depth,
+                                nodes,
                             )
-                        } else {
-                            at
-                        };
-                        records.push(record);
-                        game.play_move(at).map_err(|error| error.to_string())?;
+                            .map_err(|error| error.to_string())?;
+                            let Some(at) = record.policy_move.map(|at| {
+                                let canonical = CanonicalPosition::new(game.position());
+                                canonical.move_to_original(at)
+                            }) else {
+                                break;
+                            };
+                            let seed = splitmix64(
+                                seed ^ splitmix64(game_id) ^ game.history().len() as u64,
+                            );
+                            let explored = if explore_top_k > 0
+                                && game.history().len() < explore_plies
+                                && !record.exact
+                            {
+                                let analysis = teacher
+                                    .analyze_root(
+                                        game.position(),
+                                        SearchLimits::new(depth).with_max_nodes(nodes),
+                                        explore_top_k,
+                                        rustmoku_engine::CancellationToken::new(),
+                                    )
+                                    .map_err(str::to_string)?;
+                                comparisons.push((
+                                    game_id,
+                                    game.history().len(),
+                                    analysis_json(&game, &analysis, depth, nodes),
+                                ));
+                                near_optimal_move(&game, &analysis, at, seed, explore_temperature)
+                            } else {
+                                at
+                            };
+                            let at = if game.history().len() - opening_plies < random_plies {
+                                diverse_move(&game, at, seed)
+                            } else {
+                                explored
+                            };
+                            records.push(record);
+                            game.play_move(at).map_err(|error| error.to_string())?;
+                        }
+                        records.push(
+                            label_position(
+                                &mut teacher,
+                                game_id,
+                                game.history().len(),
+                                &game,
+                                depth,
+                                nodes,
+                            )
+                            .map_err(|error| error.to_string())?,
+                        );
                     }
-                    records.push(
-                        label_position(
-                            &mut teacher,
-                            game_id as u64,
-                            game.history().len(),
-                            &game,
-                            depth,
-                            nodes,
-                        )
-                        .map_err(|error| error.to_string())?,
-                    );
-                }
-                Ok(records)
-            }));
+                    Ok((records, comparisons))
+                },
+            ));
         }
         let mut records = Vec::new();
+        let mut comparisons = Vec::new();
         for handle in handles {
-            records.extend(handle.join().expect("data worker panicked")?);
+            let (rows, labels) = handle.join().map_err(|_| "data worker panicked")??;
+            records.extend(rows);
+            comparisons.extend(labels);
         }
-        Ok::<_, String>(records)
+        Ok::<_, String>((records, comparisons))
     })?;
     records.sort_by_key(|record| (record.game_id, record.ply));
+    if explore_top_k > 0 {
+        comparisons.sort_by_key(|(game, ply, _)| (*game, *ply));
+        let content = comparisons
+            .into_iter()
+            .map(|(_, _, value)| value + "\n")
+            .collect::<String>();
+        write_companion(&output.with_extension("policy.jsonl"), content.as_bytes())?;
+    }
     if records.len() > MAX_RECORDS {
         return Err("generated record count exceeds dataset safety limit".into());
     }
@@ -252,6 +471,81 @@ fn generate_selfplay(mut args: Arguments) -> Result<(), Box<dyn Error>> {
         output.display()
     );
     Ok(())
+}
+
+fn near_optimal_move(
+    game: &Game,
+    analysis: &rustmoku_engine::RootAnalysis,
+    fallback: Move,
+    seed: u64,
+    temperature: f64,
+) -> Move {
+    let position = game.position();
+    if Move::all().any(|at| {
+        position.is_legal(at)
+            && (position.would_win(at, position.side_to_move())
+                || position.would_win(at, position.side_to_move().opponent()))
+    }) {
+        return fallback;
+    }
+    let candidates: Vec<_> = analysis
+        .candidates
+        .iter()
+        .filter(|candidate| {
+            candidate.bound == rustmoku_engine::CandidateBound::Exact
+                && candidate.nominal_depth_valid
+                && candidate.completed_depth == analysis.completed_depth
+                && candidate.completed_depth > 0
+                && candidate
+                    .score
+                    .is_some_and(|score| score.abs() <= 10_000_000)
+        })
+        .collect();
+    let Some(maximum) = candidates
+        .iter()
+        .filter_map(|candidate| candidate.score)
+        .max()
+    else {
+        return fallback;
+    };
+    let weights: Vec<_> = candidates
+        .iter()
+        .map(|candidate| {
+            ((f64::from(candidate.score.unwrap()) - f64::from(maximum)) / temperature).exp()
+        })
+        .collect();
+    let total: f64 = weights.iter().sum();
+    let mut draw = ((seed >> 11) as f64 / (1_u64 << 53) as f64) * total;
+    for (candidate, weight) in candidates.iter().zip(weights) {
+        draw -= weight;
+        if draw < 0.0 {
+            return candidate.at;
+        }
+    }
+    candidates.last().map_or(fallback, |candidate| candidate.at)
+}
+
+fn write_companion(path: &Path, bytes: &[u8]) -> Result<(), Box<dyn Error>> {
+    let temporary = path.with_extension(format!("{}.partial", std::process::id()));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    let result = (|| {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        if path.exists() {
+            if !files_equal(&temporary, path)? {
+                return Err("immutable companion changed".into());
+            }
+        } else {
+            std::fs::hard_link(&temporary, path)?;
+        }
+        Ok(())
+    })();
+    std::fs::remove_file(temporary)?;
+    result
 }
 
 // Offline prefix diversity never changes normal engine determinism or labels.
@@ -269,8 +563,8 @@ fn diverse_move(game: &Game, teacher: Move, seed: u64) -> Move {
     legal[(seed % legal.len() as u64) as usize]
 }
 
-fn label_position(
-    engine: &mut AlphaBetaEngine<PatternEvaluator>,
+fn label_position<E: Evaluator>(
+    engine: &mut AlphaBetaEngine<E>,
     game_id: u64,
     ply: usize,
     game: &Game,
@@ -313,15 +607,69 @@ fn label_position(
     })
 }
 
-fn teacher_engine() -> AlphaBetaEngine<PatternEvaluator> {
-    AlphaBetaEngine::with_config(PatternEvaluator, EngineConfig::new(64).with_threads(1))
+fn teacher_config(
+    evaluator: &RuntimeEvaluator,
+    profile: Option<rustmoku_engine::SearchProfile>,
+) -> Result<EngineConfig, Box<dyn Error>> {
+    let config = EngineConfig::new(64).with_threads(1);
+    if let Some(profile) = profile {
+        if profile.contract() != evaluator.score_contract() {
+            return Err("teacher profile score contract mismatch".into());
+        }
+        Ok(config.with_search_profile(profile))
+    } else {
+        Ok(config)
+    }
 }
 
 fn write_dataset(path: &Path, records: &[DataRecord]) -> Result<(), Box<dyn Error>> {
+    let temporary = path.with_extension(format!("{}.partial", std::process::id()));
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    let result = (|| {
+        write_dataset_file(file, records)?;
+        if path.exists() {
+            if !files_equal(&temporary, path)? {
+                return Err("immutable dataset output changed".into());
+            }
+        } else {
+            std::fs::hard_link(&temporary, path)?;
+        }
+        Ok(())
+    })();
+    if temporary.exists() {
+        std::fs::remove_file(&temporary)?;
+    }
+    result
+}
+
+fn files_equal(a: &Path, b: &Path) -> std::io::Result<bool> {
+    if std::fs::symlink_metadata(b)?.file_type().is_symlink() {
+        return Ok(false);
+    }
+    let (mut a, mut b) = (File::open(a)?, File::open(b)?);
+    if a.metadata()?.len() != b.metadata()?.len() {
+        return Ok(false);
+    }
+    let (mut left, mut right) = ([0; 8192], [0; 8192]);
+    loop {
+        let count = a.read(&mut left)?;
+        if count == 0 {
+            return Ok(true);
+        }
+        b.read_exact(&mut right[..count])?;
+        if left[..count] != right[..count] {
+            return Ok(false);
+        }
+    }
+}
+
+fn write_dataset_file(mut file: File, records: &[DataRecord]) -> Result<(), Box<dyn Error>> {
     if records.len() > MAX_RECORDS {
         return Err("dataset record count exceeds safety limit".into());
     }
-    let mut file = File::create(path)?;
     file.write_all(MAGIC)?;
     file.write_all(&VERSION.to_le_bytes())?;
     file.write_all(&0_u16.to_le_bytes())?;
@@ -348,6 +696,7 @@ fn write_dataset(path: &Path, records: &[DataRecord]) -> Result<(), Box<dyn Erro
             file.write_all(&[u8::MAX; QUALITY_BYTES])?;
         }
     }
+    file.sync_all()?;
     Ok(())
 }
 
@@ -450,7 +799,7 @@ fn model_check(mut args: Arguments) -> Result<(), Box<dyn Error>> {
     let at: Option<Move> = args.take("--move")?.map(|text| text.parse()).transpose()?;
     args.finish()?;
     let game = Game::from_record(&std::fs::read_to_string(record)?)?;
-    let evaluator = LearnedEvaluator::new(Arc::new(LearnedModel::read_from_path(model)?));
+    let evaluator = RuntimeEvaluator::read_from_path(model)?;
     println!("value={}", evaluator.evaluate_position(game.position()));
     if let Some(at) = at {
         println!(
@@ -572,6 +921,121 @@ fn usage() {
 mod tests {
     use super::*;
     use rustmoku_core::RuleSet;
+
+    #[test]
+    fn selfplay_bytes_ignore_worker_partition_and_shard_boundaries() {
+        let root = env::temp_dir().join(format!("rustmoku-stable-games-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let generate = |name: &str, first: usize, games: usize, workers: usize| {
+            let path = root.join(name);
+            let arguments = vec![
+                "--output".to_string(),
+                path.display().to_string(),
+                "--games".to_string(),
+                games.to_string(),
+                "--seed".to_string(),
+                "321".to_string(),
+                "--first-game".to_string(),
+                first.to_string(),
+                "--workers".to_string(),
+                workers.to_string(),
+                "--depth".to_string(),
+                "1".to_string(),
+                "--nodes".to_string(),
+                "64".to_string(),
+                "--random-plies".to_string(),
+                "2".to_string(),
+            ];
+            generate_selfplay(Arguments::new(arguments.into_iter())).unwrap();
+            let records = read_dataset(&path).unwrap();
+            std::fs::remove_file(path).unwrap();
+            records
+        };
+        let baseline = generate("single.rmd", 17, 2, 1);
+        assert_eq!(baseline, generate("parallel.rmd", 17, 2, 2));
+        let mut shards = generate("first.rmd", 17, 1, 1);
+        shards.extend(generate("second.rmd", 18, 1, 1));
+        assert_eq!(baseline, shards);
+        std::fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn new_teacher_paths_preserve_exploration_identity_and_legal_branch() {
+        let root = env::temp_dir().join(format!("rustmoku-teacher-paths-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut runs = Vec::new();
+        for workers in [1, 2] {
+            let output = root.join(format!("explore-{workers}.rmd"));
+            let args = [
+                "--games",
+                "2",
+                "--seed",
+                "543",
+                "--depth",
+                "1",
+                "--nodes",
+                "500",
+                "--explore-top-k",
+                "3",
+                "--explore-plies",
+                "10",
+                "--output",
+                output.to_str().unwrap(),
+                "--workers",
+                if workers == 1 { "1" } else { "2" },
+            ];
+            generate_selfplay(Arguments::new(args.map(str::to_string).into_iter())).unwrap();
+            let policy = output.with_extension("policy.jsonl");
+            let labels = std::fs::read_to_string(&policy).unwrap();
+            assert!(!labels.is_empty());
+            assert!(
+                labels
+                    .lines()
+                    .all(|line| line.contains("root-side-to-move"))
+            );
+            runs.push((read_dataset(&output).unwrap(), labels));
+            std::fs::remove_file(output).unwrap();
+            std::fs::remove_file(policy).unwrap();
+        }
+        assert_eq!(runs[0], runs[1]);
+        let input = root.join("source.rmg");
+        let source =
+            Game::from_record("RustMoku 1\nrules=freestyle\nmoves=H8 A1 I8 A2 J8 B1\n").unwrap();
+        std::fs::write(&input, source.to_record()).unwrap();
+        let output = root.join("branch.rmd");
+        let args = [
+            "--record",
+            input.to_str().unwrap(),
+            "--output",
+            output.to_str().unwrap(),
+            "--branch-ply",
+            "4",
+            "--branch-choice",
+            "0",
+            "--depth",
+            "1",
+            "--nodes",
+            "128",
+        ];
+        generate_record(Arguments::new(args.map(str::to_string).into_iter())).unwrap();
+        let mut expected = Game::default();
+        for at in source.history().take(4) {
+            expected.play_move(at).unwrap();
+        }
+        let alternative = Move::all()
+            .find(|&at| expected.position().is_legal(at) && Some(at) != source.history().nth(4))
+            .unwrap();
+        expected.play_move(alternative).unwrap();
+        let rows = read_dataset(&output).unwrap();
+        assert_eq!(
+            rows.last().unwrap().position,
+            CanonicalPosition::new(expected.position()).key()
+        );
+        assert_eq!(rows.last().unwrap().ply, 5);
+        std::fs::remove_file(input).unwrap();
+        std::fs::remove_file(output).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
 
     #[test]
     fn offline_diversity_preserves_exact_wins_and_defenses() {

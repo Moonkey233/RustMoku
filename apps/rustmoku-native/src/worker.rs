@@ -8,6 +8,8 @@ use std::{
 };
 
 use rustmoku_core::Position;
+#[path = "../../time_manager.rs"]
+mod time_manager;
 use rustmoku_engine::{
     AlphaBetaEngine, CancellationToken, EngineConfig, RuntimeEvaluator, SearchEngine, SearchInfo,
     SearchLimits, SearchResult,
@@ -22,7 +24,7 @@ struct SearchRequest {
 
 enum Command {
     Search(Box<SearchRequest>),
-    Reconfigure(EngineConfig),
+    Reconfigure(Box<EngineConfig>),
     ReplaceEvaluator(RuntimeEvaluator),
     Shutdown,
 }
@@ -63,15 +65,21 @@ impl SearchWorker {
                             }
                             let id = request.id;
                             let started = Instant::now();
+                            let mut observer = time_manager::ManagedObserver::new(
+                                time_manager::TimeManager::new(
+                                    None,
+                                    Duration::ZERO,
+                                    request.limits.move_time,
+                                ),
+                                |info| {
+                                    let _ = outgoing.send(SearchEvent::Info { id, info });
+                                },
+                            );
                             let result = engine.search_controlled(
                                 &request.position,
                                 request.limits,
                                 request.cancellation,
-                                &mut |info| {
-                                    // Unbounded std channels keep cancellation/shutdown from
-                                    // waiting on UI consumption. Events occur only at depths.
-                                    let _ = outgoing.send(SearchEvent::Info { id, info });
-                                },
+                                &mut observer,
                             );
                             let elapsed = started.elapsed();
                             if outgoing
@@ -85,7 +93,7 @@ impl SearchWorker {
                                 break;
                             }
                         }
-                        Command::Reconfigure(config) => engine.reconfigure(config),
+                        Command::Reconfigure(config) => engine.reconfigure(*config),
                         Command::ReplaceEvaluator(evaluator) => {
                             engine.replace_evaluator(evaluator);
                         }
@@ -140,7 +148,7 @@ impl SearchWorker {
     pub(super) fn reconfigure(&mut self, config: EngineConfig) -> Result<(), &'static str> {
         self.invalidate();
         self.requests
-            .send(Command::Reconfigure(config))
+            .send(Command::Reconfigure(Box::new(config)))
             .map_err(|_| "Search worker disconnected.")
     }
 

@@ -2,17 +2,18 @@
 
 mod configuration;
 mod external;
+#[path = "../../time_manager.rs"]
+mod time_manager;
 
 use rustmoku_core::{CanonicalPosition, Game, GameStatus, OPENINGS, Stone};
 use rustmoku_engine::{
-    AlphaBetaEngine, ClassicalEvaluator, EngineConfig, LearnedEvaluator, LearnedModel,
-    PatternEvaluator, SearchEngine, SearchLimits, SearchResult,
+    AlphaBetaEngine, ClassicalEvaluator, EngineConfig, LearnedEvaluator, NonlinearEvaluator,
+    PatternEvaluator, RuntimeEvaluator, SearchEngine, SearchLimits, SearchResult,
 };
 use std::{
     env,
     error::Error,
     path::PathBuf,
-    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -32,7 +33,7 @@ struct PlayerConfig {
     external_args: Vec<String>,
     external_inputs: Vec<PathBuf>,
     external_memory: Option<u64>,
-    prepared_model: Option<Arc<LearnedModel>>,
+    prepared_model: Option<RuntimeEvaluator>,
 }
 
 struct Options {
@@ -119,6 +120,10 @@ impl Options {
                         "external-input" => config.external_inputs.push(value.into()),
                         "external-memory-bytes" => config.external_memory = Some(value.parse()?),
                         "model" => declared_models[player] = Some(value.into()),
+                        "probcut" => config.engine = config.engine.with_probcut(value.parse()?),
+                        "profile" => {
+                            config.engine = config.engine.with_search_profile(value.parse()?)
+                        }
                         "tt-mib" => {
                             config.engine = config.engine.with_tt_memory_mib(value.parse()?);
                         }
@@ -129,20 +134,23 @@ impl Options {
                             }
                             config.engine = config.engine.with_threads(threads);
                         }
-                        "interior-vcf" => {
+                        "interior-vcf" | "interior-vct" => {
                             let parts: Vec<&str> = value.split(':').collect();
                             if parts.len() != 3 {
                                 return Err(
                                     "interior-vcf requires plies:probe-work:total-work".into()
                                 );
                             }
-                            config.engine = config.engine.with_interior_vcf(
-                                rustmoku_engine::ProofLimits::new(
-                                    parts[0].parse()?,
-                                    parts[1].parse()?,
-                                ),
-                                parts[2].parse()?,
+                            let limits = rustmoku_engine::ProofLimits::new(
+                                parts[0].parse()?,
+                                parts[1].parse()?,
                             );
+                            let total = parts[2].parse()?;
+                            config.engine = if key == "interior-vcf" {
+                                config.engine.with_interior_vcf(limits, total)
+                            } else {
+                                config.engine.with_interior_vct(limits, total)
+                            };
                         }
                         "disable" => {
                             let mut selection = config.engine.selectivity();
@@ -247,6 +255,7 @@ enum Player {
     Pattern(AlphaBetaEngine),
     Classical(AlphaBetaEngine<ClassicalEvaluator>),
     Learned(AlphaBetaEngine<LearnedEvaluator>),
+    Nonlinear(AlphaBetaEngine<NonlinearEvaluator>),
     External(external::ExternalPlayer),
 }
 
@@ -269,22 +278,43 @@ impl Player {
             )),
             EvaluatorConfig::Learned(path) => {
                 let model = if let Some(model) = &config.prepared_model {
-                    Arc::clone(model)
+                    model.clone()
                 } else {
-                    Arc::new(LearnedModel::read_from_path(path)?)
+                    RuntimeEvaluator::read_from_path(path)?
                 };
-                Self::Learned(AlphaBetaEngine::with_config(
-                    LearnedEvaluator::new(model),
-                    config.engine,
-                ))
+                match model {
+                    RuntimeEvaluator::Learned(model) => {
+                        Self::Learned(AlphaBetaEngine::with_config(model, config.engine))
+                    }
+                    RuntimeEvaluator::Nonlinear(model) => {
+                        Self::Nonlinear(AlphaBetaEngine::with_config(model, config.engine))
+                    }
+                    RuntimeEvaluator::Pattern => unreachable!("model reader cannot select Pattern"),
+                }
             }
         })
     }
-    fn search(&mut self, game: &Game, limits: SearchLimits) -> SearchResult {
+    fn search(
+        &mut self,
+        game: &Game,
+        limits: SearchLimits,
+        manager: time_manager::TimeManager,
+    ) -> SearchResult {
+        let mut observer = time_manager::ManagedObserver::new(manager, |_| {});
+        let cancellation = rustmoku_engine::CancellationToken::new();
         match self {
-            Self::Pattern(engine) => engine.search(game.position(), limits),
-            Self::Classical(engine) => engine.search(game.position(), limits),
-            Self::Learned(engine) => engine.search(game.position(), limits),
+            Self::Pattern(engine) => {
+                engine.search_controlled(game.position(), limits, cancellation, &mut observer)
+            }
+            Self::Classical(engine) => {
+                engine.search_controlled(game.position(), limits, cancellation, &mut observer)
+            }
+            Self::Learned(engine) => {
+                engine.search_controlled(game.position(), limits, cancellation, &mut observer)
+            }
+            Self::Nonlinear(engine) => {
+                engine.search_controlled(game.position(), limits, cancellation, &mut observer)
+            }
             Self::External(_) => unreachable!("external moves use the protocol adapter"),
         }
     }
@@ -318,6 +348,9 @@ struct GameResult {
     moves: u64,
     work: u64,
     failure: Option<String>,
+    record: String,
+    clocks_ms: [Option<u128>; 2],
+    move_clocks: Vec<serde_json::Value>,
 }
 
 #[cfg(test)]
@@ -350,6 +383,7 @@ fn play_game(
         game.play_move(at)?;
     }
     let mut clocks = [clock; 2];
+    let mut move_clocks = Vec::new();
     // Fresh per game, persistent between its moves. Paired legs cannot inherit
     // asymmetric ordinary TT history from one another.
     let mut players = Vec::with_capacity(2);
@@ -363,7 +397,13 @@ fn play_game(
                 }
             }
             Err(error) => {
+                if error.to_string().starts_with("spawn:") {
+                    return Err(error);
+                }
                 return Ok(GameResult {
+                    record: game.to_record(),
+                    clocks_ms: clocks.map(|time| time.map(|time| time.as_millis())),
+                    move_clocks,
                     winner: if index == 0 { Winner::B } else { Winner::A },
                     plies: game.position().move_count(),
                     moves: 0,
@@ -383,6 +423,9 @@ fn play_game(
         };
         if let Some(winner) = winner {
             return Ok(GameResult {
+                record: game.to_record(),
+                clocks_ms: clocks.map(|time| time.map(|time| time.as_millis())),
+                move_clocks,
                 winner,
                 plies: game.position().move_count(),
                 moves,
@@ -391,13 +434,12 @@ fn play_game(
             });
         }
         let player = player_for(game.position().side_to_move(), a_color);
-        let allocation = allocate_time(limits.move_time, clocks[player]);
         let hard_limit = match (limits.move_time, clocks[player]) {
             (Some(turn), Some(clock)) => Some(turn.min(clock)),
             (turn, clock) => turn.or(clock),
         };
         let mut move_limits = limits;
-        move_limits.move_time = allocation.map(|time| time.mul_f64(0.95));
+        move_limits.move_time = hard_limit.map(|time| time.saturating_sub(time / 20));
         let start = Instant::now();
         let choice = match &mut players[player] {
             Player::External(external) => external
@@ -409,7 +451,11 @@ fn play_game(
                 )
                 .map(|at| (at, 0)),
             internal => {
-                let result = internal.search(&game, move_limits);
+                let result = internal.search(
+                    &game,
+                    move_limits,
+                    time_manager::TimeManager::new(clocks[player], increment, limits.move_time),
+                );
                 result
                     .best_move
                     .map(|at| (at, result.statistics.work_nodes))
@@ -428,12 +474,18 @@ fn play_game(
         let (at, used_work) = match choice {
             Ok(choice) => choice,
             Err(reason) => {
+                if let Some(remaining) = &mut clocks[player] {
+                    *remaining = remaining.saturating_sub(elapsed);
+                }
                 return Ok(GameResult {
                     winner: if player == 0 { Winner::B } else { Winner::A },
                     plies: game.position().move_count(),
                     moves,
                     work,
                     failure: Some(format!("player-{player}:{reason}")),
+                    record: game.to_record(),
+                    clocks_ms: clocks.map(|time| time.map(|time| time.as_millis())),
+                    move_clocks,
                 });
             }
         };
@@ -441,17 +493,10 @@ fn play_game(
         if let Some(remaining) = &mut clocks[player] {
             *remaining = remaining.saturating_sub(elapsed).saturating_add(increment);
         }
+        move_clocks.push(serde_json::json!({"move": at.index(), "player": player, "elapsed_ms": elapsed.as_millis(),
+            "clocks_ms": clocks.map(|time| time.map(|time| time.as_millis()))}));
         work += used_work;
         moves += 1;
-    }
-}
-
-// Application-side clock allocation; Engine receives only a per-search limit.
-fn allocate_time(per_move: Option<Duration>, remaining: Option<Duration>) -> Option<Duration> {
-    match (per_move, remaining) {
-        (Some(turn), Some(clock)) => Some(turn.min(clock / 20)),
-        (None, Some(clock)) => Some(clock / 20),
-        (turn, None) => turn,
     }
 }
 
@@ -480,6 +525,42 @@ impl Summary {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
+    if env::args().len() == 2 && env::args().nth(1).as_deref() == Some("--verify-record") {
+        use std::io::Read;
+        let mut record = String::new();
+        std::io::stdin().take(65537).read_to_string(&mut record)?;
+        if record.len() > 65536 {
+            return Err("record exceeds size limit".into());
+        }
+        let game = Game::from_record(&record)?;
+        let winner = match game.status() {
+            GameStatus::Won(Stone::Black) => "Black",
+            GameStatus::Won(Stone::White) => "White",
+            GameStatus::Draw => "draw",
+            GameStatus::Ongoing => "ongoing",
+        };
+        let mut replay = Game::new(game.position().rules());
+        let mut prefix_keys = Vec::new();
+        for at in game.history().map(Some).chain(std::iter::once(None)) {
+            prefix_keys.push(
+                CanonicalPosition::new(replay.position())
+                    .key()
+                    .as_bytes()
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>(),
+            );
+            if let Some(at) = at {
+                replay.play_move(at)?;
+            }
+        }
+        println!(
+            "{}",
+            serde_json::json!({"prefix_keys":prefix_keys,"plies":game.position().move_count(),"winner":winner,
+            "moves":game.history().map(|at| at.index()).collect::<Vec<_>>()})
+        );
+        return Ok(());
+    }
     if env::args().len() == 2 && env::args().nth(1).as_deref() == Some("--help") {
         println!(
             "RustMoku research Arena\n--describe validates inputs and prints effective JSON without playing.\n--pairs N --depth N --nodes N --move-ms N --clock-ms N --increment-ms N\nPlayer flags: --a- or --b- followed by evaluator pattern|classical|learned, model FILE, threads N,\ntt-mib N, vcf-plies N, vcf-nodes N, vct-plies N, vct-nodes N, vct-mib N, disable LIST, interior-vcf P:W:T.\nExternal players: external FILE, repeated external-arg ARG and external-input FILE; external-memory-bytes N is advisory.\nExternal threads/TT/proof options are unsupported and rejected.\nDuplicate options and conflicting model/evaluator selections are errors. CSV stdout; effective JSON/summary stderr."
@@ -554,6 +635,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                     .unwrap_or("")
                     .replace([',', '\n', '\r'], " ")
             );
+            eprintln!(
+                "GAME_RECORD {}",
+                serde_json::json!({"schema":1,"pair":pair+1,"leg":leg+1,
+                "record":result.record,"clocks_ms":result.clocks_ms,"move_clocks":result.move_clocks,
+                "termination":result.failure.as_deref().unwrap_or("terminal"),"winner":result.winner.label()})
+            );
             summary.record(&result);
         }
     }
@@ -599,6 +686,9 @@ mod tests {
         assert_eq!(summary.a + summary.b + summary.draws, 2);
         summary.record(&GameResult {
             winner: Winner::Draw,
+            record: String::new(),
+            clocks_ms: [None; 2],
+            move_clocks: Vec::new(),
             plies: 225,
             moves: 0,
             work: 0,

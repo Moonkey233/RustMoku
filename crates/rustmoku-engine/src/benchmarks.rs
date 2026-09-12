@@ -1,10 +1,10 @@
 use crate::{
-    ClassicalEvaluator, Evaluator, LearnedEvaluator, LearnedModel, LearnedModelError,
-    PatternEvaluator, PatternState, candidate_frontier::CandidateFrontier,
-    move_generation::generate_candidates, move_ordering::order_moves, search_state::SearchState,
+    ClassicalEvaluator, Evaluator, LearnedModelError, PatternEvaluator, PatternState,
+    RuntimeEvaluator, candidate_frontier::CandidateFrontier, move_generation::generate_candidates,
+    move_ordering::order_moves, search_state::SearchState,
 };
 use rustmoku_core::{Move, Position};
-use std::{hint::black_box, path::Path, sync::Arc, time::Instant};
+use std::{hint::black_box, path::Path, time::Instant};
 
 /// Runs one warm-up and five samples per operation on the historical balanced
 /// midgame. Reports the median nanoseconds per call/pair. No timing assertions.
@@ -98,8 +98,15 @@ pub fn run_learned_hotpath(
     iterations: usize,
     model_path: impl AsRef<Path>,
 ) -> Result<(), LearnedModelError> {
-    let model = Arc::new(LearnedModel::read_from_path(model_path)?);
-    let evaluator = LearnedEvaluator::new(model);
+    match RuntimeEvaluator::read_from_path(model_path)? {
+        RuntimeEvaluator::Learned(evaluator) => learned_hotpath(iterations, evaluator),
+        RuntimeEvaluator::Nonlinear(evaluator) => learned_hotpath(iterations, evaluator),
+        RuntimeEvaluator::Pattern => unreachable!("model reader does not return Pattern"),
+    }
+    Ok(())
+}
+
+fn learned_hotpath<E: Evaluator>(iterations: usize, evaluator: E) {
     let mut position = Position::default();
     for (row, column) in [
         (7, 7),
@@ -120,6 +127,13 @@ pub fn run_learned_hotpath(
             .expect("fixture moves are legal");
     }
     let patterns = PatternState::new(&position);
+    measure("learned_initialize", iterations.min(1000), |_| {
+        black_box(evaluator.initialize(black_box(&position), black_box(&patterns)));
+    });
+    eprintln!(
+        "evaluator_state_inline_bytes={}",
+        std::mem::size_of::<E::State>()
+    );
     let evaluator_state = evaluator.initialize(&position, &patterns);
     let mut search_state = SearchState::new(&position, &evaluator);
     let moves = search_state.candidates();
@@ -148,7 +162,6 @@ pub fn run_learned_hotpath(
         black_box(&search_state);
         search_state.unmake_move(undo, &evaluator);
     });
-    Ok(())
 }
 
 fn measure(name: &str, iterations: usize, mut operation: impl FnMut(usize)) {

@@ -352,6 +352,7 @@ fn interrupted_recursion_restores_all_sidecars_and_does_not_store_root_bound() {
             SEARCH_INFINITY,
             &mut SearchResources {
                 interior_proof: None,
+                analysis: None,
                 seldepth: &mut 0,
                 pv: &mut pv,
                 statistics: &mut statistics,
@@ -381,6 +382,7 @@ fn interrupted_recursion_restores_all_sidecars_and_does_not_store_root_bound() {
             MAX_QSEARCH_PLY,
             &mut SearchResources {
                 interior_proof: None,
+                analysis: None,
                 seldepth: &mut 0,
                 pv: &mut PvTable::new(),
                 statistics: &mut SearchStatistics::default(),

@@ -45,6 +45,37 @@ impl VctSolver {
         self.statistics
     }
 
+    /// Interior research uses the same checked certificate reconstruction but
+    /// exports only its first legal action, never a distance or score.
+    pub(crate) fn ordering_hint(
+        &mut self,
+        board: &mut BoardState,
+        depth: u8,
+        work: u64,
+        budget: &mut SearchBudget,
+        pv: &mut PvTable,
+    ) -> (VctStatus, Option<rustmoku_core::Move>) {
+        self.begin_search(work);
+        let depth = depth.min((CELL_COUNT - board.position().move_count()) as u8);
+        let result = self.canonical(
+            board,
+            board.position().side_to_move(),
+            None,
+            depth,
+            0,
+            &mut ProofResources { pv, budget },
+        );
+        match result {
+            Ok(Some(plies)) => (
+                VctStatus::ProvenWin { plies },
+                pv.root_line().first().copied(),
+            ),
+            Ok(None) => (VctStatus::NoProof, None),
+            Err(Exhausted::Local) => (VctStatus::BudgetExceeded, None),
+            Err(Exhausted::Outer) => (VctStatus::Interrupted, None),
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn solve(
         &mut self,

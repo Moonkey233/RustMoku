@@ -66,6 +66,20 @@ class PromotionEvidence(unittest.TestCase):
             verify(cls.data_engine, cls.model)
         cls.evidence = validate_evidence(cls.model)
 
+    def test_archived_candidate_survives_original_training_input_mutation(self):
+        original_checkpoint = self.checkpoint.read_bytes()
+        original_data = self.data.read_bytes()
+        try:
+            self.checkpoint.write_bytes(b'continued training replaced the mutable checkpoint')
+            self.data.write_bytes(b'original corpus is no longer present')
+            evidence = validate_evidence(self.model)
+            self.assertNotEqual(evidence['dataset_path'], self.data)
+            with self.assertRaises(ValueError):
+                validate_evidence(self.model, self.data)
+        finally:
+            self.checkpoint.write_bytes(original_checkpoint)
+            self.data.write_bytes(original_data)
+
     @classmethod
     def tearDownClass(cls):
         cls.storage.cleanup()

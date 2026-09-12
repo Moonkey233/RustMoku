@@ -16,6 +16,33 @@ These metrics are not interchangeable. Iterative deepening, TT, and PV remain.
 
 ## Environment
 
+### Current uncommitted V1.0 scaling observations (2026-09-12)
+
+The scaling driver compares the dataset implementation from starting HEAD
+`31b71a57251304778de45d495b2b99609dd26683` with the current compact path in separate
+processes. Synthetic legal prefixes contain at most four stones per side and use
+canonical keys; they are diagnostic fixtures, not a training-quality claim.
+Both sizes have eight records per synthetic trajectory and use raw format v1.
+Production v2 quality fields, comparison sidecars and longer trajectories change
+bytes/record; extrapolation must retain those assumptions.
+
+| Records | Path | Peak RSS MB | Descriptor bytes | Split bytes | Total bytes/record | Open s | Fingerprint s | Split s |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 4,096 | starting HEAD | 221.1 | 1,051,382 | 48,376 | 344.5 | 0.421 | 0.115 | 0.934 |
+| 4,096 | compact | 218.1 | 291,461 | 7,425 | 149.0 | 0.091 | 0.113 | 0.225 |
+| 32,768 | starting HEAD | 268.4 | 8,412,430 | 415,208 | 345.4 | 3.601 | 0.929 | 7.506 |
+| 32,768 | compact | 233.7 | 2,336,699 | 59,329 | 149.1 | 0.787 | 0.952 | 1.778 |
+
+RSS is the Windows peak working set, including about 214 MB after importing the
+Python/Torch runtime. Total bytes include raw data, descriptor and split. Hashing
+still traverses all records; the compact representation primarily reduces
+metadata retention, opening cost and splitting work. Reproduce one bounded cell
+with `python -X utf8 training/scale_bench.py --mode compact --games 4096` (or
+`--mode baseline`). The persisted exploration ledger and raw observations are in
+`target/v1-experiments`; correctness tests and builds are excluded from that ledger.
+The read-only host check found 16 logical CPUs, 25.0 GB physical RAM, 13.7 GB
+available RAM and a resulting 3.42 GB memory target at that instant.
+
 ### Unreleased V1.0 work package 1 validation (2026-09-10)
 
 This repair started from clean HEAD `e107803`; the changes remain uncommitted.

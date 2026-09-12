@@ -1,7 +1,7 @@
 //! One canonical description of the options actually used by the Arena.
 use super::{EvaluatorConfig, Options, PlayerConfig};
 use rustmoku_core::{CanonicalPosition, Game, GameStatus, OPENINGS};
-use rustmoku_engine::LearnedModel;
+use rustmoku_engine::{Evaluator, RuntimeEvaluator, ScoreContract};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
@@ -10,7 +10,6 @@ use std::{
     fs::File,
     io::Read,
     path::{Path, PathBuf},
-    sync::Arc,
 };
 
 fn absolute_file(path: &Path) -> Result<PathBuf, Box<dyn Error>> {
@@ -75,16 +74,23 @@ fn player(
             File::open(&path)?
                 .take(4 * 1024 * 1024 + 1)
                 .read_to_end(&mut bytes)?;
-            let model = LearnedModel::read_from(&mut bytes.as_slice())?;
+            let model = RuntimeEvaluator::from_model_bytes(&bytes)?;
             let hash = format!("{:x}", Sha256::digest(&bytes));
-            let metadata = model.metadata();
+            let (metadata, score_scale) = match &model {
+                RuntimeEvaluator::Learned(model) => (model.model().metadata(), None),
+                RuntimeEvaluator::Nonlinear(model) => {
+                    (model.model().metadata(), Some(model.model().score_scale()))
+                }
+                RuntimeEvaluator::Pattern => unreachable!("model reader cannot select Pattern"),
+            };
             inputs.insert(path.clone(), hash.clone());
-            config.prepared_model = Some(Arc::new(model));
+            config.prepared_model = Some(model);
             (
                 "learned",
                 json!({"path": path, "sha256": hash,
                 "format_version": metadata.format_version, "architecture_id": metadata.architecture_id,
-                "value_divisor": metadata.value_scale, "policy_divisor": metadata.policy_scale}),
+                "value_divisor": metadata.value_scale, "policy_divisor": metadata.policy_scale,
+                "score_scale": score_scale}),
             )
         }
         EvaluatorConfig::External(_) => unreachable!("external handled above"),
@@ -93,10 +99,39 @@ fn player(
     let tactical = engine.tactical();
     let (probe, total) = engine.interior_vcf();
     let selection = engine.selectivity();
+    let contract = config
+        .prepared_model
+        .as_ref()
+        .map_or(ScoreContract::Pattern, Evaluator::score_contract);
+    let profile = engine.effective_profile(contract);
+    if engine
+        .search_profile()
+        .is_some_and(|requested| requested.contract() != contract)
+    {
+        return Err("selected search profile does not match evaluator score contract".into());
+    }
+    let model_fingerprint = config.prepared_model.as_ref().map_or_else(
+        || match config.evaluator {
+            EvaluatorConfig::Pattern => rustmoku_engine::PatternEvaluator.model_fingerprint(),
+            _ => None,
+        },
+        Evaluator::model_fingerprint,
+    );
+    if engine
+        .probcut()
+        .is_some_and(|calibration| !calibration.matches(model_fingerprint, profile, selection))
+    {
+        return Err("ProbCut calibration does not match model/profile/selectivity".into());
+    }
+    let (vct_probe, vct_total) = engine.interior_vct();
     Ok(
         json!({"evaluator": evaluator, "model": model, "threads": engine.threads(),
         "tt_mib": engine.tt_memory_mib(), "profile": {
-            "parameters": "v010-baseline-constants", "score_contract": "stm-score-v1-limit10000000",
+            "parameters": profile.to_string(), "score_contract": format!("{:?}", contract),
+            "probcut": engine.probcut().map(|calibration| calibration.to_string()),
+            "policy_lmr": profile.policy_lmr(), "singular": profile.singular(),
+            "interior_vct": {"plies": vct_probe.max_plies, "probe_work": vct_probe.max_nodes,
+                "total_work": vct_total, "effective_enabled": engine.threads() == 1 && vct_probe.enabled() && vct_total > 0},
             "vcf": {"plies": tactical.vcf.max_plies, "work": tactical.vcf.max_nodes},
             "vct": {"plies": tactical.vct.max_plies, "work": tactical.vct.max_nodes, "table_mib": tactical.vct_table_memory_mib},
             "interior_vcf": {"plies": probe.max_plies, "probe_work": probe.max_nodes, "total_work": total,
@@ -157,5 +192,5 @@ pub(super) fn describe(options: &mut Options) -> Result<Value, Box<dyn Error>> {
             "turn_hard_ms": options.limits.move_time.map(|time| time.as_millis() as u64),
             "clock_ms": options.clock.map(|time| time.as_millis() as u64),
             "increment_ms": options.increment.as_millis() as u64,
-            "time_manager": "clock-div20-soft95-v1"}, "inputs_sha256": inputs}))
+            "time_manager": "completed-stability-cost-v2-hard95reserve"}, "inputs_sha256": inputs}))
 }

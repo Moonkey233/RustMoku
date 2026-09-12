@@ -83,7 +83,11 @@ pub struct EngineConfig {
     tactical: TacticalConfig,
     interior_vcf: ProofLimits,
     interior_vcf_total_work: u64,
+    interior_vct: ProofLimits,
+    interior_vct_total_work: u64,
     selectivity: SelectivityConfig,
+    profile: Option<crate::SearchProfile>,
+    probcut: Option<crate::ProbCutCalibration>,
 }
 
 impl EngineConfig {
@@ -98,7 +102,11 @@ impl EngineConfig {
             threads: 1,
             interior_vcf: ProofLimits::new(0, 0),
             interior_vcf_total_work: 0,
+            interior_vct: ProofLimits::new(0, 0),
+            interior_vct_total_work: 0,
             selectivity: SelectivityConfig::BASELINE,
+            profile: None,
+            probcut: None,
             tactical: TacticalConfig {
                 vcf: ProofLimits::new(Self::DEFAULT_VCF_MAX_PLIES, Self::DEFAULT_VCF_MAX_NODES),
                 vct: ProofLimits::new(9, 4_000),
@@ -134,6 +142,17 @@ impl EngineConfig {
     }
 
     #[must_use]
+    pub const fn with_interior_vct(mut self, limits: ProofLimits, total_work: u64) -> Self {
+        self.interior_vct = limits;
+        self.interior_vct_total_work = total_work;
+        self
+    }
+    #[must_use]
+    pub const fn interior_vct(self) -> (ProofLimits, u64) {
+        (self.interior_vct, self.interior_vct_total_work)
+    }
+
+    #[must_use]
     pub const fn with_selectivity(mut self, config: SelectivityConfig) -> Self {
         self.selectivity = config;
         self
@@ -142,6 +161,35 @@ impl EngineConfig {
     #[must_use]
     pub const fn selectivity(self) -> SelectivityConfig {
         self.selectivity
+    }
+
+    #[must_use]
+    pub const fn with_search_profile(mut self, profile: crate::SearchProfile) -> Self {
+        self.profile = Some(profile);
+        self
+    }
+
+    /// Mismatched contracts fail closed to the compatible historical profile.
+    #[must_use]
+    pub fn effective_profile(self, contract: crate::ScoreContract) -> crate::SearchProfile {
+        self.profile
+            .filter(|p| p.contract() == contract)
+            .unwrap_or(crate::SearchProfile::baseline(contract))
+    }
+
+    #[must_use]
+    pub const fn search_profile(self) -> Option<crate::SearchProfile> {
+        self.profile
+    }
+
+    #[must_use]
+    pub const fn with_probcut(mut self, calibration: crate::ProbCutCalibration) -> Self {
+        self.probcut = Some(calibration);
+        self
+    }
+    #[must_use]
+    pub const fn probcut(self) -> Option<crate::ProbCutCalibration> {
+        self.probcut
     }
 
     /// Sets the number of CPU Alpha-Beta workers. Zero is normalized to the

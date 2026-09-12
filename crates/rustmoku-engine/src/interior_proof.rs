@@ -19,12 +19,22 @@ pub struct InteriorProofStatistics {
     pub work: u64,
     pub certificate_work: u64,
     pub elapsed_nanos: u64,
+    pub vct_attempts: u64,
+    pub vct_proven: u64,
+    pub vct_not_proven: u64,
+    pub vct_local_exhausted: u64,
+    pub vct_interrupted: u64,
+    pub vct_work: u64,
 }
 
 pub(crate) struct InteriorProof {
     solver: VcfSolver,
     limits: ProofLimits,
     remaining: u64,
+    vct: Option<crate::vct::VctSolver>,
+    vct_limits: ProofLimits,
+    vct_remaining: u64,
+    vct_pv: Option<Box<crate::principal_variation::PvTable>>,
     // Collisions can only suppress an optional probe, never assert a fact.
     // The epoch is one public search, so model/window/depth changes cannot
     // revive a failed probe at every iterative-deepening revisit.
@@ -34,10 +44,16 @@ pub(crate) struct InteriorProof {
 impl InteriorProof {
     pub(crate) fn new(config: EngineConfig) -> Option<Self> {
         let (limits, total) = config.interior_vcf();
-        (config.threads() == 1 && limits.enabled() && total > 0).then(|| Self {
+        let (vct_limits, vct_total) = config.interior_vct();
+        let vct_enabled = vct_limits.enabled() && vct_total > 0;
+        (config.threads() == 1 && ((limits.enabled() && total > 0) || vct_enabled)).then(|| Self {
             solver: VcfSolver::new(),
             limits,
             remaining: total,
+            vct: vct_enabled.then(|| crate::vct::VctSolver::new(1)),
+            vct_limits,
+            vct_remaining: vct_total,
+            vct_pv: vct_enabled.then(|| Box::new(crate::principal_variation::PvTable::new())),
             seen: [None; 256],
         })
     }
@@ -55,11 +71,11 @@ impl InteriorProof {
             return Ok(None);
         }
         let work = self.remaining.min(self.limits.max_nodes);
-        if work < u64::from(self.limits.max_plies) + 2 {
-            stats.skipped += 1;
-            return Ok(None);
-        }
         self.seen[slot] = Some(key);
+        if !self.limits.enabled() || work < u64::from(self.limits.max_plies) + 2 {
+            stats.skipped += 1;
+            return self.probe_vct(state, budget, stats);
+        }
         stats.attempts += 1;
         let before = budget.work_nodes();
         let start = std::time::Instant::now();
@@ -79,6 +95,43 @@ impl InteriorProof {
             VcfStatus::BudgetExceeded => stats.local_exhausted += 1,
             VcfStatus::Interrupted => {
                 stats.interrupted += 1;
+                return Err(Stopped);
+            }
+        }
+        budget.poll()?;
+        if let Some(at) = hint.filter(|&at| state.position().is_legal(at)) {
+            return Ok(Some(at));
+        }
+        self.probe_vct(state, budget, stats)
+    }
+
+    fn probe_vct<E: Evaluator>(
+        &mut self,
+        state: &mut SearchState<E>,
+        budget: &mut SearchBudget,
+        stats: &mut InteriorProofStatistics,
+    ) -> Result<Option<Move>, Stopped> {
+        let work = self.vct_remaining.min(self.vct_limits.max_nodes);
+        let (Some(solver), Some(pv)) = (&mut self.vct, &mut self.vct_pv) else {
+            return Ok(None);
+        };
+        if work == 0 {
+            return Ok(None);
+        }
+        stats.vct_attempts += 1;
+        let before = budget.work_nodes();
+        let (status, hint) =
+            state.vct_ordering_hint(solver, self.vct_limits.max_plies, work, budget, pv);
+        let spent = budget.work_nodes() - before;
+        self.vct_remaining -= spent;
+        stats.vct_work += spent;
+        stats.work += spent;
+        match status {
+            crate::vct::VctStatus::ProvenWin { .. } => stats.vct_proven += 1,
+            crate::vct::VctStatus::NoProof => stats.vct_not_proven += 1,
+            crate::vct::VctStatus::BudgetExceeded => stats.vct_local_exhausted += 1,
+            crate::vct::VctStatus::Interrupted => {
+                stats.vct_interrupted += 1;
                 return Err(Stopped);
             }
         }

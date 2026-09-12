@@ -20,7 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'training'))
 from manifest import save_manifest
 from provenance import object_hash, sidecar, validate_evidence
 
-from paired_stats import summarize
+from paired_stats import summarize, power_budget
 
 
 def digest(path):
@@ -98,8 +98,9 @@ def statistics(completed, configuration, effective=None):
                 and effective is not None
                 and effective['limits']['turn_hard_ms'] is not None
                 and effective['limits']['work'] is None
+                and all(player['effective']['nodes'] == 2**64 - 1 for player in configuration.get('process_players', []))
                 and summary['score_ci95_hoeffding'][0] > .5)
-    return {**summary,
+    return {**summary, 'power_budget': power_budget(counts, target_elo=configuration['sprt']['h1'] - configuration['sprt']['h0']),
             'incomplete_pairs': half_pairs, 'repeated_opening_clusters': excluded,
             'completed_games': len(completed), 'promotion_eligible': eligible}
 
@@ -132,6 +133,37 @@ def verify_events(completed, manifest):
                 or row['a_color'] != ('Black' if leg == 1 else 'White')
                 or row['winner'] not in ('A', 'B', 'draw')):
             raise ValueError('game event does not match scheduled pair/opening/colors')
+        if manifest.get('game_records') == 1:
+            verify_game_record(event, manifest)
+
+
+def verify_game_record(event, manifest):
+    record = event['game_record']
+    row = event['row']
+    if (record.get('schema') != 1 or record['pair'] != int(row['pair']) or record['leg'] != int(row['leg'])
+            or record['winner'] != row['winner'] or len(record['record']) > 65536):
+        raise ValueError('game record identity mismatch')
+    process = subprocess.run([manifest['configuration']['arena'], '--verify-record'], input=record['record'],
+                             capture_output=True, text=True, check=True, timeout=10)
+    replay = json.loads(process.stdout)
+    count = int(row['searched_moves'])
+    opening_plies = replay['plies'] - count
+    if (replay['plies'] != int(row['plies']) or opening_plies < 0
+            or replay['prefix_keys'][opening_plies] != row['opening_key']
+            or len(record['move_clocks']) != count
+            or [move['move'] for move in record['move_clocks']] != replay['moves'][opening_plies:]):
+        raise ValueError('game record moves/opening disagree with result')
+    expected = 'draw' if replay['winner'] == 'draw' else 'A' if replay['winner'] == row['a_color'] else 'B'
+    if record['termination'] == 'terminal':
+        if replay['winner'] == 'ongoing' or expected != row['winner']:
+            raise ValueError('terminal outcome does not replay')
+    elif not row.get('failure') or replay['winner'] != 'ongoing':
+        raise ValueError('forfeit must retain its reason and an ongoing legal position')
+    for move in record['move_clocks']:
+        if move['player'] not in (0, 1) or type(move['elapsed_ms']) is not int or move['elapsed_ms'] < 0:
+            raise ValueError('invalid move clock receipt')
+        if len(move['clocks_ms']) != 2 or any(value is not None and (type(value) is not int or value < 0) for value in move['clocks_ms']):
+            raise ValueError('invalid remaining clock receipt')
 
 
 def run(configuration, output):
@@ -168,9 +200,35 @@ def run(configuration, output):
                                                         'sha256': digest(sidecar(model, 'evidence'))}
         elif configuration.get('suite_role') == 'confirmation':
             raise ValueError('confirmation requires completed export/calibration/integer evidence')
+    process_players = configuration.get('process_players', [])
+    if process_players:
+        if len(process_players) != 2 or any(player['evaluator'] != 'external' for player in effective['players']):
+            raise ValueError('independent process declarations require two external players')
+        for declared, actual in zip(process_players, effective['players'], strict=True):
+            command = declared['command']
+            if (str(Path(command[0]).resolve()) != actual['executable'] or command[1:] != actual['arguments']
+                    or declared['executable_sha256'] != digest(command[0])):
+                raise ValueError('independent player executable/arguments mismatch')
+            result = subprocess.run([*command, '--describe', 'true'], capture_output=True, text=True, check=True, timeout=15)
+            if json.loads(result.stdout) != declared['effective']:
+                raise ValueError('independent process effective configuration changed')
+            if '--model' in command:
+                model = Path(command[command.index('--model') + 1])
+                if digest(model) != declared['effective']['model_fingerprint']:
+                    raise ValueError('independent process loaded another model')
+                source = declared.get('model_evidence_source')
+                if source is not None:
+                    evidence = validate_evidence(Path(source))
+                    if evidence['export']['model']['sha256'] != digest(model):
+                        raise ValueError('independent process model evidence mismatch')
+                    inputs.update(evidence['inputs_sha256'])
+                    model_evidence[digest(model)] = {'path': str(sidecar(Path(source), 'evidence').resolve()),
+                                                   'sha256': digest(sidecar(Path(source), 'evidence'))}
+                elif configuration.get('suite_role') == 'confirmation':
+                    raise ValueError('independent learned confirmation requires frozen model evidence')
     for path in configuration.get('extra_inputs', []):
         inputs[str(Path(path).resolve())] = digest(path)
-    manifest = {'version': 2, 'configuration': configuration, 'inputs_sha256': inputs,
+    manifest = {'version': 2, 'game_records': 1, 'configuration': configuration, 'inputs_sha256': inputs,
                 'effective': effective, 'model_evidence': model_evidence,
                 'platform': platform.platform(), 'cpu': platform.processor(),
                 'logical_cpus': os.cpu_count(), 'python': sys.version,
@@ -211,7 +269,10 @@ def run(configuration, output):
                 row = rows[0]
                 if row['winner'] not in ('A', 'B', 'draw'):
                     raise ValueError('invalid winner')
-                event = {'status': 'completed', 'game_id': game_id, 'row': row,
+                records = [json.loads(line.removeprefix('GAME_RECORD ')) for line in process.stderr.splitlines() if line.startswith('GAME_RECORD ')]
+                if len(records) != 1:
+                    raise ValueError('Arena must emit one replayable game record')
+                event = {'game_record': records[0], 'status': 'completed', 'game_id': game_id, 'row': row,
                          'manifest_sha256': object_hash(manifest), 'effective_sha256': object_hash(effective),
                          'configuration_log': process.stderr}
                 verify_events({game_id: event}, manifest)

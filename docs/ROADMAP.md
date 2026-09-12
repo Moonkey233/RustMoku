@@ -140,7 +140,21 @@ player configurations, bound model export/calibration/integer evidence,
 model-versus-combination promotion, match-clock/line-ending protocol compliance,
 atomic immutable manifests, and relocated proof-bundle paths. These are trust
 and correctness gates, not a new trained model or evidence of playing strength.
-Work packages 2-5 remain separate; this repair does not start them.
+The remaining work is executed continuously as one V1.0 milestone. The current
+implementation pass starts at clean `31b71a57251304778de45d495b2b99609dd26683`.
+It preserves the checkout and ends uncommitted. Delivery status is tracked below;
+planned work is not an implemented capability.
+
+| Area | Current pass status |
+| --- | --- |
+| Compact dataset, split, streaming audit | implementation pending |
+| Root teacher, exploration, calibrated labels | implementation pending |
+| Width-8 integer V2, trainer and evidence | implementation pending |
+| Search profiles, policy LMR, proof scheduling, singular, ProbCut | implementation pending |
+| Guarded Null Move | rejected-with-evidence: immutable Position transition and side/hash/evaluator consistency conflict; see Architecture |
+| Application time management and bounded experiments | implementation pending |
+| Integrated validation and adversarial review | pending after implementation |
+| Independent strength, hosted Windows/Linux CI, release | external-gate-pending |
 
 Experimentally evaluate rather than automatically retain:
 

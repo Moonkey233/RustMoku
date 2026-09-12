@@ -3,11 +3,11 @@
 use eframe::egui::{self, Color32, Pos2, Sense, Stroke, Vec2};
 use rustmoku_core::{BOARD_SIZE, Game, GameStatus, Move, MoveError, OPENINGS, RecordError, Stone};
 use rustmoku_engine::{
-    EngineConfig, LearnedEvaluator, LearnedModel, RuntimeEvaluator, SearchInfo, SearchLimits,
-    SearchTermination,
+    EngineConfig, Evaluator, RuntimeEvaluator, ScoreContract, SearchInfo, SearchLimits,
+    SearchProfile, SearchTermination,
 };
 use std::{
-    sync::{Arc, mpsc::TryRecvError},
+    sync::mpsc::TryRecvError,
     time::{Duration, Instant},
 };
 mod localization;
@@ -129,6 +129,8 @@ struct RustMokuApp {
     timings: MoveTimings,
     turn_started: Option<Instant>,
     model_path: String,
+    profile_path: String,
+    loaded_contract: ScoreContract,
     loaded_model: Option<String>,
 }
 
@@ -177,6 +179,8 @@ impl RustMokuApp {
             timings: MoveTimings::default(),
             turn_started: Some(Instant::now()),
             model_path: String::from("rustmoku-model.rmlp"),
+            profile_path: String::from("rustmoku.profile"),
+            loaded_contract: ScoreContract::Pattern,
             loaded_model: None,
         }
     }
@@ -337,6 +341,7 @@ impl RustMokuApp {
     }
 
     fn use_pattern_evaluator(&mut self) {
+        self.loaded_contract = ScoreContract::Pattern;
         self.last_search = None;
         self.loaded_model = None;
         if let Err(error) = self.worker.replace_evaluator(RuntimeEvaluator::Pattern) {
@@ -349,15 +354,50 @@ impl RustMokuApp {
         }
     }
 
+    fn load_search_profile(&mut self) {
+        let result = (|| -> Result<SearchProfile, String> {
+            let metadata =
+                std::fs::metadata(&self.profile_path).map_err(|error| error.to_string())?;
+            if metadata.len() > 1024 {
+                return Err("search profile exceeds 1024 bytes".into());
+            }
+            let text =
+                std::fs::read_to_string(&self.profile_path).map_err(|error| error.to_string())?;
+            let profile: SearchProfile = text.parse().map_err(str::to_string)?;
+            if profile.contract() != self.loaded_contract {
+                return Err("search profile does not match loaded evaluator".into());
+            }
+            Ok(profile)
+        })();
+        match result {
+            Ok(profile) => {
+                let config = self.engine_config.with_search_profile(profile);
+                match self.worker.reconfigure(config) {
+                    Ok(()) => {
+                        self.engine_config = config;
+                        self.last_search = None;
+                        self.message = None;
+                        self.play_ai_if_needed();
+                    }
+                    Err(error) => {
+                        self.message = Some(self.text.detail(TextKey::ReconfigureFailed, error))
+                    }
+                }
+            }
+            Err(error) => self.message = Some(error),
+        }
+    }
+
     fn load_learned_model(&mut self) {
-        match LearnedModel::read_from_path(&self.model_path) {
-            Ok(model) => {
-                let evaluator = RuntimeEvaluator::Learned(LearnedEvaluator::new(Arc::new(model)));
+        match RuntimeEvaluator::read_from_path(&self.model_path) {
+            Ok(evaluator) => {
+                let loaded_contract = evaluator.score_contract();
                 self.last_search = None;
                 if let Err(error) = self.worker.replace_evaluator(evaluator) {
                     self.message = Some(self.text.detail(TextKey::ReconfigureFailed, error));
                     return;
                 }
+                self.loaded_contract = loaded_contract;
                 self.loaded_model = Some(self.model_path.clone());
                 self.message = None;
                 self.turn_started = None;
@@ -365,6 +405,7 @@ impl RustMokuApp {
                 self.start_human_timer_if_needed();
             }
             Err(error) => {
+                self.loaded_contract = ScoreContract::Pattern;
                 self.loaded_model = None;
                 let _ = self.worker.replace_evaluator(RuntimeEvaluator::Pattern);
                 self.message = Some(error.to_string());
@@ -578,6 +619,19 @@ impl RustMokuApp {
             if ui.button(text.get(TextKey::UsePattern)).clicked() {
                 self.use_pattern_evaluator();
             }
+        });
+        ui.horizontal(|ui| {
+            ui.label(text.get(TextKey::SearchProfile));
+            ui.text_edit_singleline(&mut self.profile_path);
+            if ui.button(text.get(TextKey::LoadProfile)).clicked() {
+                self.load_search_profile();
+            }
+            let effective = self.engine_config.effective_profile(self.loaded_contract);
+            ui.label(if effective.policy_lmr() || effective.singular() {
+                text.get(TextKey::ResearchProfile)
+            } else {
+                text.get(TextKey::BaselineProfile)
+            });
         });
         let previous_threads = self.engine_config.threads();
         let previous_auto = self.threads_auto;

@@ -8,6 +8,7 @@ use std::{
 };
 
 use rustmoku_core::{CELL_COUNT, Move, Position, Stone};
+use sha2::{Digest, Sha256};
 
 use crate::{
     Evaluator, PatternDelta, PatternState,
@@ -39,6 +40,7 @@ pub struct LearnedModelMetadata {
 /// Immutable weights shared by all search workers.
 #[derive(Debug)]
 pub struct LearnedModel {
+    fingerprint: [u8; 32],
     embeddings: Box<[i16]>,
     value_head: [i16; LEARNED_HIDDEN],
     policy_head: [i16; LEARNED_HIDDEN],
@@ -141,6 +143,7 @@ impl LearnedModel {
         debug_assert_eq!(decoder.remaining(), 0);
         let (value_table, policy_table) = compile_tables(&embeddings, &value_head, &policy_head);
         Ok(Self {
+            fingerprint: Sha256::digest(&bytes).into(),
             value_table,
             policy_table,
             embeddings: embeddings.into_boxed_slice(),
@@ -239,6 +242,7 @@ impl LearnedModel {
         let (value_table, policy_table) = compile_tables(&embeddings, &value_head, &policy_head);
         Self {
             embeddings: embeddings.into_boxed_slice(),
+            fingerprint: [0; 32],
             value_head,
             policy_head,
             value_table,
@@ -326,6 +330,12 @@ impl LearnedEvaluator {
 }
 
 impl Evaluator for LearnedEvaluator {
+    fn model_fingerprint(&self) -> Option<[u8; 32]> {
+        Some(self.model.fingerprint)
+    }
+    fn score_contract(&self) -> crate::ScoreContract {
+        crate::ScoreContract::LinearV1
+    }
     type State = LearnedState;
     type Undo = ();
 
@@ -373,20 +383,78 @@ impl Evaluator for LearnedEvaluator {
 pub enum RuntimeEvaluator {
     Pattern,
     Learned(LearnedEvaluator),
+    Nonlinear(crate::NonlinearEvaluator),
+}
+
+impl RuntimeEvaluator {
+    /// Load a explicitly selected model. Magic/version dispatch fails closed;
+    /// neither floating references nor a damaged V2 file fall back to V1.
+    pub fn read_from_path(path: impl AsRef<Path>) -> Result<Self, LearnedModelError> {
+        let file = File::open(path).map_err(LearnedModelError::Io)?;
+        let mut bytes = Vec::new();
+        file.take(MAX_MODEL_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(LearnedModelError::Io)?;
+        Self::from_model_bytes(&bytes)
+    }
+
+    pub fn from_model_bytes(bytes: &[u8]) -> Result<Self, LearnedModelError> {
+        match bytes.get(..8) {
+            Some(b"RMLPV001") => Ok(Self::Learned(LearnedEvaluator::new(Arc::new(
+                LearnedModel::read_from(&mut &*bytes)?,
+            )))),
+            Some(b"RMLPV002") => Ok(Self::Nonlinear(crate::NonlinearEvaluator::new(Arc::new(
+                crate::NonlinearModel::read_from(&mut &*bytes)?,
+            )))),
+            _ => Err(LearnedModelError::Invalid(
+                "unsupported runtime model magic",
+            )),
+        }
+    }
+
+    #[must_use]
+    pub fn evaluate_position(&self, position: &Position) -> i32 {
+        let patterns = PatternState::new(position);
+        let state = self.initialize(position, &patterns);
+        self.evaluate(position, &patterns, &state)
+    }
+
+    #[must_use]
+    pub fn policy_for(&self, position: &Position, at: Move) -> Option<i32> {
+        let patterns = PatternState::new(position);
+        let state = self.initialize(position, &patterns);
+        self.policy_score(position, &patterns, &state, at)
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum RuntimeEvaluatorState {
     Pattern,
     Learned(LearnedState),
+    Nonlinear(crate::NonlinearState),
 }
 
 pub enum RuntimeEvaluatorUndo {
     Pattern,
     Learned,
+    Nonlinear,
 }
 
 impl Evaluator for RuntimeEvaluator {
+    fn model_fingerprint(&self) -> Option<[u8; 32]> {
+        match self {
+            Self::Pattern => crate::PatternEvaluator.model_fingerprint(),
+            Self::Learned(evaluator) => evaluator.model_fingerprint(),
+            Self::Nonlinear(evaluator) => evaluator.model_fingerprint(),
+        }
+    }
+    fn score_contract(&self) -> crate::ScoreContract {
+        match self {
+            Self::Pattern => crate::ScoreContract::Pattern,
+            Self::Learned(evaluator) => evaluator.score_contract(),
+            Self::Nonlinear(evaluator) => evaluator.score_contract(),
+        }
+    }
     type State = RuntimeEvaluatorState;
     type Undo = RuntimeEvaluatorUndo;
 
@@ -395,6 +463,9 @@ impl Evaluator for RuntimeEvaluator {
             Self::Pattern => RuntimeEvaluatorState::Pattern,
             Self::Learned(evaluator) => {
                 RuntimeEvaluatorState::Learned(evaluator.initialize(position, patterns))
+            }
+            Self::Nonlinear(evaluator) => {
+                RuntimeEvaluatorState::Nonlinear(evaluator.initialize(position, patterns))
             }
         }
     }
@@ -405,6 +476,10 @@ impl Evaluator for RuntimeEvaluator {
             (Self::Learned(evaluator), RuntimeEvaluatorState::Learned(state)) => {
                 evaluator.make_move(state, delta);
                 RuntimeEvaluatorUndo::Learned
+            }
+            (Self::Nonlinear(evaluator), RuntimeEvaluatorState::Nonlinear(state)) => {
+                evaluator.make_move(state, delta);
+                RuntimeEvaluatorUndo::Nonlinear
             }
             _ => panic!("runtime evaluator state must match its immutable definition"),
         }
@@ -418,6 +493,11 @@ impl Evaluator for RuntimeEvaluator {
                 RuntimeEvaluatorState::Learned(state),
                 RuntimeEvaluatorUndo::Learned,
             ) => evaluator.unmake_move(state, delta, ()),
+            (
+                Self::Nonlinear(evaluator),
+                RuntimeEvaluatorState::Nonlinear(state),
+                RuntimeEvaluatorUndo::Nonlinear,
+            ) => evaluator.unmake_move(state, delta, ()),
             _ => panic!("runtime evaluator undo must match its immutable definition"),
         }
     }
@@ -428,6 +508,9 @@ impl Evaluator for RuntimeEvaluator {
                 crate::PatternEvaluator.evaluate(position, patterns, &())
             }
             (Self::Learned(evaluator), RuntimeEvaluatorState::Learned(state)) => {
+                evaluator.evaluate(position, patterns, state)
+            }
+            (Self::Nonlinear(evaluator), RuntimeEvaluatorState::Nonlinear(state)) => {
                 evaluator.evaluate(position, patterns, state)
             }
             _ => panic!("runtime evaluator state must match its immutable definition"),
@@ -444,6 +527,9 @@ impl Evaluator for RuntimeEvaluator {
         match (self, state) {
             (Self::Pattern, RuntimeEvaluatorState::Pattern) => None,
             (Self::Learned(evaluator), RuntimeEvaluatorState::Learned(state)) => {
+                evaluator.policy_score(position, patterns, state, at)
+            }
+            (Self::Nonlinear(evaluator), RuntimeEvaluatorState::Nonlinear(state)) => {
                 evaluator.policy_score(position, patterns, state, at)
             }
             _ => panic!("runtime evaluator state must match its immutable definition"),

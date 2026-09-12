@@ -21,6 +21,14 @@ pub(crate) const EVALUATION_LIMIT: i32 = 10_000_000;
 /// associated `State`; both associated values must therefore be movable into a
 /// worker thread.
 pub trait Evaluator: Sync {
+    fn score_contract(&self) -> crate::ScoreContract {
+        crate::ScoreContract::Pattern
+    }
+    /// Immutable scoring identity for offline-calibrated statistical experiments.
+    /// Unknown custom evaluators fail closed. Never computed in recursive nodes.
+    fn model_fingerprint(&self) -> Option<[u8; 32]> {
+        None
+    }
     /// Evaluator-specific per-search state, excluding shared tactical patterns.
     type State: Send;
     /// Consumed in strict LIFO order on the corresponding logical state.
@@ -76,6 +84,9 @@ const PATTERN_WEIGHTS: [i32; ThreatProfile::COUNT] = [
 ];
 
 impl Evaluator for PatternEvaluator {
+    fn model_fingerprint(&self) -> Option<[u8; 32]> {
+        Some(*b"RustMoku-Pattern-weights-v1.....")
+    }
     type State = ();
     type Undo = ();
 

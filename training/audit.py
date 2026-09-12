@@ -11,6 +11,9 @@ from dataset import open_dataset
 
 
 def audit(dataset, manifest, prefix_plies=8):
+    if manifest['version'] == 2:
+        from compact import audit as compact_audit
+        return compact_audit(dataset, manifest, prefix_plies)
     games = defaultdict(list)
     for record in dataset:
         games[record.game_id].append(record)

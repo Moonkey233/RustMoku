@@ -64,6 +64,7 @@ class DataRecord:
     lineage_id: str | None = None
     opening_family: str | None = None
     outcome: int | None = None
+    comparison: dict | None = None
 
 
 class DatasetFile(Sequence[DataRecord]):
@@ -274,6 +275,8 @@ def dataset_fingerprint(dataset: Sequence[DataRecord]) -> str:
             record.value, record.source, int(record.exact)))
         digest.update(record.position_key)
         digest.update(json.dumps([record.completed_depth, record.requested_depth, record.termination, record.work, record.budget, record.run_id, record.trajectory_id, record.lineage_id, record.opening_family, record.outcome]).encode())
+        if record.comparison is not None:
+            digest.update(json.dumps(record.comparison, sort_keys=True).encode())
     return digest.hexdigest()
 
 
@@ -351,6 +354,9 @@ def eligible_label(record: DataRecord) -> bool:
 
 
 def make_split_manifest(dataset: Sequence[DataRecord], seed: int) -> dict:
+    if getattr(dataset, 'descriptor', {}).get('version') == 2:
+        from compact import make_manifest
+        return make_manifest(dataset, seed)
     exact = {}
     for record in dataset:
         if record.exact and eligible_label(record):
@@ -369,7 +375,7 @@ def make_split_manifest(dataset: Sequence[DataRecord], seed: int) -> dict:
 
 
 def validate_split_manifest(dataset: Sequence[DataRecord], manifest: dict, seed=None) -> dict:
-    if not isinstance(manifest, dict) or manifest.get("version") != 1:
+    if not isinstance(manifest, dict) or manifest.get("version") not in (1, 2):
         raise ValueError("checkpoint lacks a supported immutable split manifest")
     if manifest.get("dataset_sha256") != dataset_fingerprint(dataset):
         raise ValueError("dataset fingerprint does not match checkpoint split")
@@ -378,6 +384,9 @@ def validate_split_manifest(dataset: Sequence[DataRecord], manifest: dict, seed=
     expected = make_split_manifest(dataset, manifest["seed"])
     if manifest != expected:
         raise ValueError("invalid or modified split manifest")
+    if manifest['version'] == 2:
+        from compact import filtered_partitions
+        return filtered_partitions(dataset, manifest)
     filtered = {}
     for name, indices in manifest["indices"].items():
         # Exact supervision only replaces approximations inside its own split.
@@ -418,6 +427,11 @@ class LocalPatternModel(nn.Module):
 def load_training_model(path: str | os.PathLike[str], device: str) -> LocalPatternModel:
     from checkpoint import load_checkpoint
     checkpoint = load_checkpoint(path, device)
+    if checkpoint.get('format') == 'rustmoku-nonlinear-v2':
+        from nonlinear_model import NonlinearModel
+        model = NonlinearModel(qat=checkpoint['configuration'].get('qat', False)).to(device)
+        model.load_state_dict(checkpoint.get('selected_state_dict') or checkpoint['state_dict'])
+        return model
     if checkpoint.get("format") != "rustmoku-local-pattern-v1":
         raise ValueError("unsupported training checkpoint")
     model = LocalPatternModel().to(device)
@@ -475,6 +489,9 @@ def read_quantized_model(path: str | os.PathLike[str]) -> QuantizedModel:
     if size > MAX_MODEL_BYTES:
         raise ValueError("model file exceeds safety limit")
     data = model_path.read_bytes()
+    if data[:8] == b'RMLPV002':
+        from nonlinear_model import read_integer
+        return read_integer(data)
     if len(data) < MODEL_HEADER.size:
         raise ValueError("truncated model header")
     (

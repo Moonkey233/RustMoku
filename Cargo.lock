@@ -1843,6 +1843,7 @@ version = "0.12.0"
 dependencies = [
  "loom",
  "rustmoku-core",
+ "sha2",
 ]
 
 [[package]]

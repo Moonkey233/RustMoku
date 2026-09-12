@@ -11,9 +11,17 @@ from pathlib import Path
 from dataset import file_hash, open_dataset
 
 
-def competition_identity(effective, index):
+def competition_identity(effective, index, process_players=None):
+    if process_players:
+        process = process_players[index]
+        config = process['effective']
+        return {'engine_sha256': process['executable_sha256'], 'rules': effective['rules'],
+                'evaluator': config.get('evaluator', 'learned' if '--model' in process['command'] else 'pattern'),
+                'model_sha256': config['model_fingerprint'] if '--model' in process['command'] else None,
+                'threads': config['threads'], 'tt_mib': config['tt_mib'], 'profile': config['profile'],
+                'book': False, 'tt_policy': 'fresh-per-game-warm-between-moves'}
     player = effective['players'][index]
-    return {'engine_sha256': effective['engine']['sha256'], 'rules': effective['rules'],
+    return {'engine_sha256': player.get('executable_sha256', effective['engine']['sha256']), 'rules': effective['rules'],
             'evaluator': player['evaluator'], 'model_sha256': (player['model']['sha256']
                 if player['model'] is not None else None),
             'threads': player['threads'], 'tt_mib': player['tt_mib'], 'profile': player['profile'],
@@ -38,7 +46,7 @@ def promote(experiment, candidate, champion, dataset_path=None):
     completed = completed_games(read_events(experiment / 'events.jsonl'))
     verify_events(completed, manifest)
     digest = file_hash(candidate)
-    a, b = [competition_identity(effective, index) for index in (0, 1)]
+    a, b = [competition_identity(effective, index, manifest['configuration'].get('process_players')) for index in (0, 1)]
     if a['evaluator'] != 'learned' or a['model_sha256'] != digest:
         raise ValueError('candidate is not the actual Arena player A model')
     evidence = validate_evidence(candidate, dataset_path)
@@ -66,10 +74,10 @@ def promote(experiment, candidate, champion, dataset_path=None):
             raise ValueError('actual Arena player B is not the current champion combination')
     elif b['evaluator'] != 'pattern':
         raise ValueError('initial champion must be an actual Pattern player')
-    with open_dataset(evidence['dataset_path']) as dataset:
-        training_positions = {r.position_key.hex() for r in dataset}
-    if any(event['row']['opening_key'] in training_positions for event in completed.values()):
-        raise ValueError('confirmation opening overlaps the model-bound training corpus')
+    confirmation_starts = {event['row']['opening_key'] for event in completed.values()}
+    with open_dataset(evidence['dataset_path'], resolver=evidence.get('resolver')) as dataset:
+        if any(record.position_key.hex() in confirmation_starts for record in dataset):
+            raise ValueError('confirmation opening overlaps the model-bound training corpus')
     report = statistics(completed, manifest['configuration'], effective)
     if not report['promotion_eligible']:
         return {'status': 'rejected', 'reason': 'independent fixed-time fixed-sample gate not passed'}
