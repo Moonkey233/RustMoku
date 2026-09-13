@@ -1,0 +1,165 @@
+"""Batched V3 QAT on CUDA or CPU; scalar mixlite.py remains the export oracle.
+
+Records are read lazily from the existing mmap/sharded dataset. Only indices,
+one batch of features and optimizer/model tensors are resident. There is no
+production scale cap. Split validation precedes augmentation and sampling.
+"""
+import argparse
+import math
+from pathlib import Path
+import torch
+from torch.nn import functional as F
+from mixlite import MixLite, FORMAT, GROUPS, COUNTS, features, ste_integer, ste_trunc
+from common import (decode_position_key, transform_position, transform_index,
+                    make_split_manifest, validate_split_manifest, eligible_label)
+from dataset import open_dataset
+from checkpoint import atomic_save, load_checkpoint
+from teacher import validate_comparison, masked_loss
+
+
+class BatchedMixLite(MixLite):
+    def forward(self, keys, centers):
+        local = (F.embedding(keys, ste_integer(self.embedding, -128, 127)).sum(-2)
+                 + F.embedding(centers, ste_integer(self.center, -128, 127))).clamp(0, 255)
+        # Four small reductions; no per-record model calls or whole-board CNN.
+        groups = torch.stack([local[:, [i for i,g in enumerate(GROUPS) if g == band]].sum(1)
+                              for band in range(4)], dim=1)
+        pooled = torch.cat([ste_trunc(groups.sum(1)/225)] +
+                           [ste_trunc(groups[:,g]/COUNTS[g]) for g in range(4)], dim=-1)
+        context = ste_trunc((F.linear(pooled, ste_integer(self.mixing,-128,127)) +
+                             ste_integer(self.bias,-1048576,1048576))/256).clamp(0,255)
+        evidence = ste_trunc(F.linear(context,ste_integer(self.wdl_head,-32768,32767))/self.value_divisor).relu()+1
+        wdl = evidence/evidence.sum(-1,keepdim=True)
+        dot = local @ ste_integer(self.policy_head,-32768,32767)
+        cross = (local[:,:,:8]*context[:,None,:]) @ ste_integer(self.policy_context,-32768,32767)
+        policy = ste_trunc((dot+ste_trunc(cross/256))/self.policy_divisor).clamp(-32768,32767)
+        return wdl, policy, evidence
+
+
+def hard_example_tags(*, teacher_move, student_order, teacher_value, student_value,
+                      candidate_universe=None, exact=False, forced_loss=False,
+                      value_error_threshold=.25, top_k=5):
+    """Diagnostic mining labels; they confer no proof authority on AB scores."""
+    tags = []
+    if teacher_move is not None:
+        if not student_order or teacher_move != student_order[0]: tags.append('teacher-student-disagreement')
+        if teacher_move not in student_order[:top_k]: tags.append('policy-top-k-miss')
+        if candidate_universe is not None and teacher_move not in candidate_universe: tags.append('candidate-universe-miss')
+    if abs(teacher_value-student_value) > value_error_threshold: tags.append('high-value-error')
+    if exact and teacher_value*student_value <= 0 and teacher_value != 0: tags.append('tactical-error')
+    if forced_loss: tags.append('forced-loss-resistance')
+    return tags
+
+
+def train(dataset_path, checkpoint_path, *, steps, epochs=1, batch_size=256,
+          device='cpu', seed=1, resume=None, learning_rate=.001, checkpoint_every=100,
+          policy_target='soft', exact_weight=4., hard_weight=2., outcome_weight=.25):
+    if min(steps,epochs,batch_size,checkpoint_every) < 1: raise ValueError('positive training limits required')
+    if policy_target not in ('soft','ranking'): raise ValueError('invalid policy target')
+    if not all(math.isfinite(x) and x > 0 for x in (learning_rate,exact_weight,hard_weight)) or not 0 <= outcome_weight <= 1:
+        raise ValueError('invalid optimizer/loss configuration')
+    selected = torch.device(device)
+    if selected.type == 'cuda' and not torch.cuda.is_available(): raise ValueError('CUDA requested but unavailable; select cpu explicitly')
+    torch.manual_seed(seed)
+    # Float32 QAT approximates integer rounding during learning. Export always
+    # replays rounded weights through the independent exact integer oracle.
+    with open_dataset(Path(dataset_path)) as dataset:
+        previous = load_checkpoint(resume) if resume else None
+        if previous and previous.get('format') != FORMAT: raise ValueError('V3 architecture mismatch')
+        if previous and previous.get('production') is None: raise ValueError('resume needs a production checkpoint')
+        manifest = previous['split_manifest'] if previous else make_split_manifest(dataset,seed)
+        indices = validate_split_manifest(dataset,manifest,seed)['train']
+        if not indices: raise ValueError('no training records')
+        config = dict(sampler='block-shuffle-v1',batch_size=batch_size,seed=seed,learning_rate=learning_rate,policy_target=policy_target,
+                      exact_weight=exact_weight,hard_weight=hard_weight,outcome_weight=outcome_weight)
+        if previous and previous['production'] != config: raise ValueError('resume training configuration changed')
+        sample = [abs(dataset[i].value) for i in indices[:4096] if not dataset[i].exact]
+        scale = previous['score_scale'] if previous else max(1,min(10000000,sorted(sample)[len(sample)//2] if sample else 500))
+        model = BatchedMixLite(scale).float().to(selected)
+        optimizer = torch.optim.Adam(model.parameters(),lr=learning_rate)
+        completed = epoch = cursor = 0
+        if previous:
+            model.load_state_dict(previous['model_state']); optimizer.load_state_dict(previous['optimizer_state'])
+            completed,epoch,cursor = previous['steps'],previous['epoch'],previous['cursor']
+        start = completed
+        checkpoint_path = Path(checkpoint_path); checkpoint_path.parent.mkdir(parents=True,exist_ok=True)
+        def save():
+            atomic_save(checkpoint_path,dict(format=FORMAT,model_state=model.state_dict(),optimizer_state=optimizer.state_dict(),
+                steps=completed,epoch=epoch,cursor=cursor,score_scale=scale,split_manifest=manifest,production=config,
+                configuration=dict(architecture='mixlite-width32-context8-d4-v3',value_contract='stm-rational-q15-v2',
+                    score_scale=scale,training='batched-qat-v1')))
+        while completed-start < steps and epoch < epochs:
+            generator = torch.Generator().manual_seed(seed+epoch)
+            # Shuffle bounded contiguous blocks, preserving disk locality on
+            # large sharded corpora while changing order every epoch.
+            block_size = max(batch_size, 1024)
+            blocks = torch.randperm((len(indices)+block_size-1)//block_size,generator=generator).tolist()
+            order = []
+            for block in blocks:
+                start_index = block*block_size
+                order.extend(start_index+i for i in torch.randperm(min(block_size,len(indices)-start_index),generator=generator).tolist())
+            while cursor < len(order) and completed-start < steps:
+                batch = []
+                for local in order[cursor:cursor+batch_size]:
+                    record = dataset[indices[local]]
+                    if not eligible_label(record): raise ValueError('ineligible label in training split')
+                    symmetry = (seed+epoch+indices[local])%8
+                    board,side = decode_position_key(record.position_key)
+                    board,move = transform_position(board,record.policy_move,symmetry)
+                    key,center = features(board,side)
+                    batch.append((record,board,side,move,symmetry,key,center))
+                keys = torch.stack([row[5] for row in batch]).to(selected)
+                centers = torch.stack([row[6] for row in batch]).to(selected)
+                wdl,policy,_ = model(keys,centers)
+                # One batched device transfer for mining, never one GPU sync per candidate.
+                rankings = policy.detach().masked_fill(centers != 0, float('-inf')).argsort(dim=1,descending=True,stable=True)[:,:5].cpu().tolist()
+                predictions = (wdl[:,0]-wdl[:,2]).detach().cpu().tolist()
+                losses = []
+                for j,(record,board,side,move,symmetry,_,_) in enumerate(batch):
+                    q = float((record.value>0)-(record.value<0)) if record.exact else record.value/(scale+abs(record.value))
+                    target = wdl.new_tensor([max(q,0),1-abs(q),max(-q,0)])
+                    loss = -(target*wdl[j].log()).sum()+(wdl[j,0]-wdl[j,2]-q).square()
+                    outcome = record.outcome
+                    if outcome is not None and not record.exact:
+                        outcome_target = wdl.new_tensor([max(outcome,0),1-abs(outcome),max(-outcome,0)])
+                        loss = loss + outcome_weight * -(outcome_target*wdl[j].log()).sum()
+                    legal = [i for i,c in enumerate(board) if c==0]
+                    if move is not None:
+                        if move not in legal: raise ValueError('illegal policy target')
+                        loss = loss+F.cross_entropy(policy[j,legal][None,:],torch.tensor([legal.index(move)],device=selected))
+                    candidate_universe = None
+                    if record.comparison is not None and not record.exact:
+                        comparison = validate_comparison(record.comparison)
+                        observed = [transform_index(at,symmetry) for at in comparison['moves']]
+                        if any(at not in legal for at in observed): raise ValueError('illegal comparison target')
+                        loss = loss+masked_loss(policy[j],observed,comparison['probabilities'],
+                            ranking_scores=comparison['scores'] if policy_target=='ranking' else None)
+                        candidate_universe = observed
+                    ranking = [i for i in rankings[j] if i in legal]
+                    tags = hard_example_tags(teacher_move=move,student_order=ranking,teacher_value=q,
+                        student_value=predictions[j],candidate_universe=candidate_universe,
+                        exact=record.exact,forced_loss=record.exact and record.value<0)
+                    weight = exact_weight if record.exact else hard_weight if tags else 1.
+                    losses.append(loss*weight)
+                loss = torch.stack(losses).mean()
+                if not torch.isfinite(loss): raise ValueError('nonfinite training loss')
+                optimizer.zero_grad(set_to_none=True); loss.backward(); optimizer.step()
+                cursor += len(batch); completed += 1
+                if completed%checkpoint_every==0: save()
+            if cursor == len(order): epoch += 1; cursor = 0
+        validate_split_manifest(dataset,manifest,seed)
+        save()
+        return completed
+
+
+def main():
+    p=argparse.ArgumentParser(description=__doc__)
+    p.add_argument('--dataset',type=Path,required=True); p.add_argument('--output',type=Path,required=True)
+    p.add_argument('--device',default='cpu'); p.add_argument('--batch-size',type=int,default=256)
+    p.add_argument('--steps',type=int,required=True); p.add_argument('--epochs',type=int,default=1)
+    p.add_argument('--resume',type=Path); p.add_argument('--seed',type=int,default=1)
+    p.add_argument('--checkpoint-every',type=int,default=100); p.add_argument('--learning-rate',type=float,default=.001)
+    p.add_argument('--policy-target',choices=('soft','ranking'),default='soft')
+    a=p.parse_args(); options=vars(a); dataset=options.pop('dataset'); output=options.pop('output')
+    print('steps=',train(dataset,output,**options))
+if __name__=='__main__': main()

@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "preset": "serious",
+  "games": 20000,
+  "steps": 50000,
+  "epochs": 20,
+  "batch_size": 256,
+  "depth": 6,
+  "nodes": 20000,
+  "timeout": 7200,
+  "workers": 1,
+  "shard_games": 32,
+  "random_plies": 2,
+  "explore_top_k": 8,
+  "explore_temperature": 1000.0,
+  "explore_plies": 80,
+  "checkpoint_every": 100,
+  "learning_rate": 0.001,
+  "policy_target": "soft"
+}

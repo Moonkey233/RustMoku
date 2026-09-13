@@ -2017,6 +2017,7 @@ version = "1.0.0-dev"
 dependencies = [
  "loom",
  "rustmoku-core",
+ "rustmoku-simd",
  "sha2",
 ]
 
@@ -2029,6 +2030,10 @@ dependencies = [
  "rustmoku-engine",
  "sys-locale",
 ]
+
+[[package]]
+name = "rustmoku-simd"
+version = "1.0.0-dev"
 
 [[package]]
 name = "rustmoku-solver"

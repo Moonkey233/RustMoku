@@ -17,7 +17,7 @@ struct StackEntry {
     extensions: u8,
 }
 
-/// Rebuilt for every public search and fully private to one Lazy-SMP worker.
+/// Storage is reused by one worker; semantic history resets each public search.
 /// Large continuation tables are allocated once here, never in recursion.
 pub(crate) struct SearchHeuristics {
     history: [[i16; CELL_COUNT]; 2],
@@ -44,6 +44,23 @@ impl Default for SearchHeuristics {
 }
 
 impl SearchHeuristics {
+    #[cfg(test)]
+    pub(crate) fn storage_addresses(&self) -> (usize, usize) {
+        (
+            self.continuation_1.as_ptr() as usize,
+            self.continuation_2.as_ptr() as usize,
+        )
+    }
+    pub(crate) fn reset(&mut self) {
+        self.history.fill([0; CELL_COUNT]);
+        self.killers.fill([None; 2]);
+        self.countermoves.fill([None; CELL_COUNT]);
+        self.continuation_1.fill(0);
+        self.continuation_2.fill(0);
+        self.stack.fill(StackEntry::default());
+        self.parameters = crate::SearchParameters::BASELINE;
+    }
+
     pub(crate) fn set_parameters(&mut self, parameters: crate::SearchParameters) {
         self.parameters = parameters;
     }
@@ -156,6 +173,31 @@ impl SearchHeuristics {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub(crate) fn lmr_eligible(
+        &self,
+        depth: u8,
+        index: usize,
+        side: Stone,
+        at: Move,
+        ply: u8,
+        previous: Option<Move>,
+        two_back: Option<Move>,
+        patterns: &PatternState,
+    ) -> bool {
+        depth >= self.parameters.lmr_min_depth
+            && index >= usize::from(self.parameters.lmr_min_index)
+            && Self::is_quiet(patterns, side, at)
+            && !self.is_strong_context(side, at, ply, previous, two_back)
+    }
+
+    /// Use both continuation tables and main history below the hard protection
+    /// threshold. Units derive from the versioned strong-history threshold.
+    pub(crate) fn lmr_history_adjustment(&self, score: i16, limit: u8) -> i16 {
+        (score / (self.parameters.strong_history / 2).max(1))
+            .clamp(-i16::from(limit), i16::from(limit))
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn adaptive_lmr_reduction(
         &self,
         depth: u8,
@@ -167,14 +209,7 @@ impl SearchHeuristics {
         two_back: Option<Move>,
         patterns: &PatternState,
     ) -> u8 {
-        let own = patterns.profile(at, side);
-        let opponent = patterns.profile(at, side.opponent());
-        if depth < self.parameters.lmr_min_depth
-            || index < usize::from(self.parameters.lmr_min_index)
-            || own != ThreatProfile::Quiet
-            || opponent != ThreatProfile::Quiet
-            || self.is_strong_context(side, at, ply, previous, two_back)
-        {
+        if !self.lmr_eligible(depth, index, side, at, ply, previous, two_back, patterns) {
             return 0;
         }
         let mut reduction = 1 + self
@@ -317,6 +352,54 @@ mod tests {
         assert!(heuristics.is_countermove(Stone::Black, reply, Some(prior)));
         assert!(heuristics.contextual_score(Stone::Black, reply, Some(prior), Some(older)) > 0);
         assert!(heuristics.contextual_score(Stone::Black, failed, Some(prior), Some(older)) < 0);
+    }
+
+    #[test]
+    fn scratch_reset_reuses_storage_without_retaining_history() {
+        let mut h = SearchHeuristics::default();
+        let addresses = h.storage_addresses();
+        h.continuation_1.fill(123);
+        h.continuation_2.fill(-321);
+        h.history[0][0] = 123;
+        h.killers[1][0] = Some(Move::CENTER);
+        h.countermoves[0][0] = Some(Move::CENTER);
+        h.set_static_eval(2, 999);
+        h.reset();
+        assert_eq!(h.storage_addresses(), addresses);
+        assert!(
+            h.continuation_1
+                .iter()
+                .chain(h.continuation_2.iter())
+                .all(|&v| v == 0)
+        );
+        assert_eq!(h.history[0][0], 0);
+        assert_eq!(h.killer_rank(1, Move::CENTER), 0);
+        assert_eq!(h.countermoves[0][0], None);
+        assert_eq!(h.static_eval(2), None);
+    }
+
+    #[test]
+    fn lmr_v2_context_changes_magnitude_below_protection() {
+        let mut h = SearchHeuristics::default();
+        let at = Move::CENTER;
+        let prior = Move::from_index(0).unwrap();
+        let older = Move::from_index(14).unwrap();
+        h.history[0][at.index()] = 200;
+        h.continuation_1[continuation_index(Stone::Black, prior, at)] = 200;
+        h.continuation_2[continuation_index(Stone::Black, older, at)] = 200;
+        let score = h.contextual_score(Stone::Black, at, Some(prior), Some(older));
+        assert_eq!(h.lmr_history_adjustment(score, 1), 1);
+        assert_eq!(h.lmr_history_adjustment(-score, 1), -1);
+        assert!(h.lmr_eligible(
+            8,
+            20,
+            Stone::Black,
+            at,
+            0,
+            Some(prior),
+            Some(older),
+            &PatternState::new(&Position::default())
+        ));
     }
 
     #[test]

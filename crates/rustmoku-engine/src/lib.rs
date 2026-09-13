@@ -21,6 +21,7 @@ mod move_generation;
 mod move_ordering;
 mod nonlinear;
 pub use mixlite::{MixLiteEvaluator, MixLiteModel, MixLiteState};
+pub use rustmoku_simd::Backend as EvaluatorBackend;
 /// Offline float architecture oracle; never a runtime evaluator default.
 #[cfg(feature = "experimental-v2")]
 pub mod nonlinear_reference;

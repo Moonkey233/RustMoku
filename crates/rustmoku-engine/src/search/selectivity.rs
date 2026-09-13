@@ -267,3 +267,44 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
         result
     }
 }
+
+/// Policy confidence cannot discard a descriptor's defense/dependency witness.
+pub(super) fn policy_candidate_unprotected(
+    at: Move,
+    protected: crate::bitboard::BitBoard256,
+) -> bool {
+    !protected.test(at)
+}
+
+#[cfg(test)]
+mod cr_tests {
+    use super::*;
+    #[test]
+    fn low_policy_dependency_is_protected_even_when_quiet() {
+        use rustmoku_core::Stone;
+        let state = SearchState::new(&Position::default(), &crate::PatternEvaluator);
+        let at = Move::CENTER;
+        assert!(SearchHeuristics::is_quiet(
+            state.patterns(),
+            Stone::Black,
+            at
+        ));
+        let mut dependencies = crate::bitboard::BitBoard256::EMPTY;
+        dependencies.set(at);
+        let descriptor = crate::tactical::ThreatDescriptor {
+            gain: at,
+            kind: crate::pattern::ThreatProfile::OpenThree,
+            continuations: crate::bitboard::BitBoard256::EMPTY,
+            defenses: crate::bitboard::BitBoard256::EMPTY,
+            dependencies,
+        };
+        let low_policy = true;
+        assert!(
+            !(low_policy
+                && policy_candidate_unprotected(
+                    at,
+                    descriptor.reply_hints(state.patterns(), Stone::White)
+                ))
+        );
+    }
+}

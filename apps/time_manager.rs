@@ -12,6 +12,7 @@ pub struct TimeManager {
     previous_move: Option<Move>,
     previous_score: Option<i32>,
     stable: u8,
+    instability: u8,
     elapsed: Duration,
     iteration_cost: Duration,
     stop: bool,
@@ -43,6 +44,7 @@ impl TimeManager {
             previous_move: None,
             previous_score: None,
             stable: 0,
+            instability: 0,
             elapsed: Duration::ZERO,
             iteration_cost: Duration::ZERO,
             stop: false,
@@ -100,10 +102,15 @@ impl TimeManager {
         let drop = self.previous_score.is_some_and(|previous| {
             i64::from(previous) - i64::from(score) > i64::from(parameters.time_drop)
         });
+        // Retain pressure through the next stable iteration; only consecutive
+        // stability pays it down. Four units represent half the base budget.
+        if drop || mate_transition || (self.previous_score.is_some() && self.stable == 0) {
+            self.instability = self.instability.saturating_add(4).min(4);
+        } else if self.stable >= 2 {
+            self.instability = self.instability.saturating_sub(1);
+        }
         if let Some(mut soft) = self.soft {
-            if drop || mate_transition {
-                soft = soft.saturating_add(soft / 2);
-            }
+            soft = soft.saturating_add(soft / 8 * u32::from(self.instability));
             if self.stable
                 >= if (20..80).contains(&self.phase_stones) {
                     4
@@ -199,6 +206,27 @@ mod tests {
 #[cfg(test)]
 mod v2_tests {
     use super::*;
+    #[test]
+    fn instability_survives_one_stable_iteration_then_decays() {
+        let mut manager = TimeManager::new(Some(Duration::from_secs(100)), Duration::ZERO, None);
+        for (depth, score, expected) in [
+            (1, 20000, 0),
+            (2, -20000, 4),
+            (3, -20000, 4),
+            (4, -20000, 3),
+            (5, -20000, 2),
+            (6, -20000, 1),
+            (7, -20000, 0),
+        ] {
+            manager.completed(
+                depth,
+                Some(Move::CENTER),
+                score,
+                Duration::from_millis(u64::from(depth) * 10),
+            );
+            assert_eq!(manager.instability, expected);
+        }
+    }
     #[test]
     fn empirical_growth_can_fall_below_two_and_scaled_scores_match() {
         let mut a = TimeManager::new(Some(Duration::from_secs(100)), Duration::ZERO, None);

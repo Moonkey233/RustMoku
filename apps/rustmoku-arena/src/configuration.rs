@@ -198,5 +198,5 @@ pub(super) fn describe(options: &mut Options) -> Result<Value, Box<dyn Error>> {
             "turn_hard_ms": options.limits.move_time.map(|time| time.as_millis() as u64),
             "clock_ms": options.clock.map(|time| time.as_millis() as u64),
             "increment_ms": options.increment.as_millis() as u64,
-            "time_manager": "completed-stability-cost-v2-hard95reserve"}, "inputs_sha256": inputs}))
+            "time_manager": "completed-stability-pressure-cost-v3-hard90reserve"}, "inputs_sha256": inputs}))
 }

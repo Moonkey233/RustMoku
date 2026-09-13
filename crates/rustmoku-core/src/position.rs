@@ -11,6 +11,7 @@ pub struct Position {
     move_count: usize,
     last_move: Option<Move>,
     winner: Option<Stone>,
+    analysis_depth: usize,
 }
 
 /// Opaque state required to reverse exactly one successful move.
@@ -25,9 +26,12 @@ pub struct MoveUndo {
 /// Opaque undo for an analysis-only turn change. This is not a played Move,
 /// is never recorded by Game, and must be restored after all child moves.
 #[derive(Debug)]
+#[doc(hidden)]
+#[must_use = "restore the analysis turn after unmaking its children"]
 pub struct AnalysisTurnUndo {
     side: Stone,
     count: usize,
+    depth: usize,
     last: Option<Move>,
 }
 
@@ -41,6 +45,7 @@ impl Position {
             move_count: 0,
             last_move: None,
             winner: None,
+            analysis_depth: 0,
         }
     }
 
@@ -83,6 +88,10 @@ impl Position {
     /// stone, history entry or change to terminal status. This state is not a
     /// reachable game record. Callers must isolate all derived evidence and
     /// restore in strict LIFO order. Game deliberately exposes no such operation.
+    /// Internal engine contract: never pass this hypothetical Position to Game,
+    /// canonical records, proof solvers/books or ordinary search entry points.
+    /// Cross-crate visibility exists solely for reversible engine analysis.
+    #[doc(hidden)]
     pub fn begin_analysis_opponent_turn(&mut self) -> Result<AnalysisTurnUndo, MoveError> {
         if self.winner.is_some() || self.is_full() {
             return Err(MoveError::GameOver);
@@ -90,12 +99,18 @@ impl Position {
         let undo = AnalysisTurnUndo {
             side: self.side_to_move,
             count: self.move_count,
+            depth: self.analysis_depth,
             last: self.last_move,
         };
+        self.analysis_depth = self
+            .analysis_depth
+            .checked_add(1)
+            .expect("analysis nesting overflow");
         self.side_to_move = self.side_to_move.opponent();
         Ok(undo)
     }
     /// Restores a hypothetical turn after every child has been unmade.
+    #[doc(hidden)]
     pub fn end_analysis_opponent_turn(&mut self, undo: AnalysisTurnUndo) {
         assert_eq!(
             self.move_count, undo.count,
@@ -110,6 +125,9 @@ impl Position {
             undo.side.opponent(),
             "analysis turn LIFO"
         );
+        assert!(self.winner.is_none(), "analysis children must be unmade");
+        assert_eq!(self.analysis_depth, undo.depth + 1, "analysis turn LIFO");
+        self.analysis_depth = undo.depth;
         self.side_to_move = undo.side;
     }
 
@@ -250,6 +268,15 @@ impl Default for Position {
 #[cfg(test)]
 mod analysis_turn_tests {
     use super::*;
+    #[test]
+    #[should_panic(expected = "analysis turn LIFO")]
+    fn out_of_order_analysis_tokens_are_rejected_even_with_matching_side() {
+        let mut p = Position::default();
+        let first = p.begin_analysis_opponent_turn().unwrap();
+        let _second = p.begin_analysis_opponent_turn().unwrap();
+        let _third = p.begin_analysis_opponent_turn().unwrap();
+        p.end_analysis_opponent_turn(first);
+    }
     #[test]
     fn hypothetical_turn_is_not_a_move_and_real_children_restore() {
         let mut p = Position::default();

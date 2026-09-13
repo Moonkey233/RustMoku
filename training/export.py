@@ -73,6 +73,18 @@ def main() -> None:
     args = parse_args()
     identity = export_identity(args.checkpoint, args.dataset)
     model = load_training_model(args.checkpoint, "cpu")
+    from mixlite import MixLite, IntegerMixLite
+    if isinstance(model, MixLite):
+        payload = model.bytes()
+        IntegerMixLite(payload)
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        check_file(identity['checkpoint'])
+        check_file(identity['dataset'])
+        publish_model(args.output, payload)
+        write_export(args.output, identity, dict(contract='mixlite-d4-int8-int16-v1',
+            value_divisor=model.value_divisor, policy_divisor=model.policy_divisor, score_scale=model.score_scale))
+        print(f'saved={args.output} architecture=4 bytes={len(payload)}')
+        return
     from nonlinear_model import NonlinearModel, export_integer
     if isinstance(model, NonlinearModel):
         from checkpoint import load_checkpoint

@@ -15,6 +15,10 @@ impl PvTable {
         }
     }
 
+    pub(crate) fn reset(&mut self) {
+        // Stale move cells are inaccessible once all row lengths are zero.
+        self.lengths.fill(0);
+    }
     pub(crate) fn clear(&mut self, ply: u8) {
         self.lengths[usize::from(ply)] = 0;
     }

@@ -29,13 +29,29 @@ class MixLiteTests(unittest.TestCase):
             self.assertEqual(sum(wdl_q15),32768)
             self.assertAlmostEqual(float(wdl.detach().sum()),1)
 
+    def test_d4_value_invariance_and_policy_equivariance(self):
+        from common import transform_position, transform_index
+        torch.manual_seed(9)
+        integer = IntegerMixLite(MixLite().bytes())
+        board = [0]*225
+        for at, stone in [(0,1),(14,2),(17,1),(95,2),(111,1),(167,2),(224,1)]: board[at] = stone
+        for side in (0,1):
+            value, policy, wdl = integer.infer(board, side)
+            for symmetry in range(8):
+                transformed, _ = transform_position(board, None, symmetry)
+                actual, logits, actual_wdl = integer.infer(transformed, side)
+                self.assertEqual((value, wdl), (actual, actual_wdl))
+                for at in range(225): self.assertEqual(policy[at], logits[transform_index(at, symmetry)])
+        old = bytearray(MixLite().bytes()); old[10] = 3
+        with self.assertRaises(ValueError): IntegerMixLite(old)
+
     def test_remote_center_changes_value_and_policy_without_local_change(self):
         model = MixLite()
         with torch.no_grad():
             for p in model.parameters(): p.zero_()
             model.center[:,0] = 16
             model.center[1,0] = 127
-            model.mixing[0,32] = 127
+            model.mixing[0,128] = 127
             model.bias[1] = 256
             model.wdl_head[0,0] = 100
             model.wdl_head[2,1] = 100

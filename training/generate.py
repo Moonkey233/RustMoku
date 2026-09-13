@@ -15,13 +15,13 @@ from manifest import read_manifest
 
 
 def generate(args):
-    if not 1 <= args.games <= 10_000 or not 1 <= args.shard_games <= 32:
-        raise ValueError('games must be 1..10000 and shard-games 1..32')
+    if args.games < 1 or not 1 <= args.shard_games <= 32:
+        raise ValueError('games must be positive and shard-games 1..32')
     if not 1 <= args.workers <= 4 or args.nodes < 1 or not 1 <= args.depth <= 255:
         raise ValueError('invalid explicit teacher budget')
     args.output.mkdir(parents=True, exist_ok=True)
     estimated_bytes = args.games * 226 * 95 + args.games * 2048
-    if estimated_bytes > 2 * 1024**3 or shutil.disk_usage(args.output).free < estimated_bytes * 2:
+    if shutil.disk_usage(args.output).free < estimated_bytes * 2:
         raise ValueError('generation exceeds artifact or available-disk budget')
     teacher = {'executable_sha256': file_hash(args.engine), 'evaluator': 'learned' if getattr(args, 'model', None) else 'pattern',
                'model_sha256': file_hash(args.model) if getattr(args, 'model', None) else None,
@@ -31,6 +31,8 @@ def generate(args):
                'explore_top_k': getattr(args, 'explore_top_k', 0),
                'explore_temperature': getattr(args, 'explore_temperature', 1000.0),
                'explore_plies': getattr(args, 'explore_plies', 80),
+               'comparison_domain': 'distillation', 'root_universe': 'all-legal',
+               'descendant_universe': 'production-radius-two',
                'analysis_work_per_move': args.nodes if getattr(args, 'explore_top_k', 0) else 0,
                'seed': args.seed, 'games': args.games, 'shard_games': args.shard_games}
     run_id = hashlib.sha256(json.dumps(teacher, sort_keys=True).encode()).hexdigest()

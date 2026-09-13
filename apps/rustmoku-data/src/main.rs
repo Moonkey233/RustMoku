@@ -878,9 +878,23 @@ fn model_check(mut args: Arguments) -> Result<(), Box<dyn Error>> {
     let model = PathBuf::from(args.required("--model")?);
     let record = PathBuf::from(args.required("--record")?);
     let at: Option<Move> = args.take("--move")?.map(|text| text.parse()).transpose()?;
+    let backend = args.take("--backend")?.unwrap_or_else(|| "auto".into());
     args.finish()?;
     let game = Game::from_record(&std::fs::read_to_string(record)?)?;
     let evaluator = RuntimeEvaluator::read_from_path(model)?;
+    let selected = match backend.as_str() {
+        "auto" => rustmoku_engine::EvaluatorBackend::detect(),
+        "scalar" => rustmoku_engine::EvaluatorBackend::SCALAR,
+        "avx2" => rustmoku_engine::EvaluatorBackend::avx2().ok_or("AVX2 unavailable")?,
+        _ => return Err("backend must be auto, scalar or avx2".into()),
+    };
+    let evaluator = match evaluator {
+        RuntimeEvaluator::MixLite(evaluator) => {
+            RuntimeEvaluator::MixLite(evaluator.with_backend(selected))
+        }
+        other if backend != "avx2" => other,
+        _ => return Err("explicit AVX2 backend requires MixLite V3".into()),
+    };
     println!("value={}", evaluator.evaluate_position(game.position()));
     if let Some(at) = at {
         println!(

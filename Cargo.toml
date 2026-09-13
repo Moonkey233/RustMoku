@@ -7,6 +7,7 @@ members = [
     "apps/rustmoku-solver",
     "crates/rustmoku-core",
     "crates/rustmoku-engine",
+    "crates/rustmoku-simd",
 ]
 
 [workspace.package]
@@ -18,3 +19,14 @@ rust-version = "1.98"
 [workspace.dependencies]
 rustmoku-core = { path = "crates/rustmoku-core" }
 rustmoku-engine = { path = "crates/rustmoku-engine" }
+rustmoku-simd = { path = "crates/rustmoku-simd" }
+
+# Portable CPU ISA remains the compiler target baseline in both profiles.
+# Explicit native CPU tuning is opt-in through scripts/build-performance.ps1.
+[profile.release-portable]
+inherits = "release"
+lto = "thin"
+codegen-units = 1
+
+[profile.release-native]
+inherits = "release-portable"

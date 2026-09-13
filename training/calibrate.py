@@ -18,6 +18,10 @@ from provenance import read_export, write_check, file_identity, object_hash
 
 def calibration(model, quantized, records):
     from nonlinear_model import NonlinearModel, QuantizedNonlinear, UNIT, CLIP
+    from mixlite import MixLite, IntegerMixLite, features
+    mixlite = isinstance(model, MixLite)
+    if mixlite != isinstance(quantized, IntegerMixLite):
+        raise ValueError('float/integer V3 architecture mismatch')
     nonlinear = isinstance(model, NonlinearModel)
     if nonlinear != isinstance(quantized, QuantizedNonlinear):
         raise ValueError('float/integer architecture mismatch')
@@ -28,10 +32,16 @@ def calibration(model, quantized, records):
         for record in records:
             board, side = decode_position_key(record.position_key)
             keys = torch.tensor(feature_keys(board, side), dtype=torch.long)
-            reference = float(model.board_value(board, side).item()) if nonlinear else float(model.value(keys).item())
-            actual = quantized.normalized(board, side) / UNIT if nonlinear else quantized.value(board, side) / EVALUATION_LIMIT
+            if mixlite:
+                wdl, policy, _ = model(*features(board, side))
+                reference = float(wdl[0] - wdl[2])
+                raw, integer_policy, _ = quantized.infer(board, side)
+                actual = raw / (quantized.score_scale + abs(raw))
+            else:
+                reference = float(model.board_value(board, side).item()) if nonlinear else float(model.value(keys).item())
+                actual = quantized.normalized(board, side) / UNIT if nonlinear else quantized.value(board, side) / EVALUATION_LIMIT
             # Compare against the declared clamped float score contract.
-            limit = CLIP / UNIT if nonlinear else 1.0
+            limit = 10000000 / (model.score_scale + 10000000) if mixlite else CLIP / UNIT if nonlinear else 1.0
             reference = max(-limit, min(limit, reference))
             errors.append(abs(actual - reference))
             relative.append(abs(actual - reference) / max(abs(reference), .01))
@@ -40,8 +50,8 @@ def calibration(model, quantized, records):
             values.append((reference, actual))
             moves, candidates = legal_policy_features(board, side)
             if moves:
-                logits = model.policy(torch.tensor(candidates, dtype=torch.long)).tolist()
-                integers = [quantized.policy(board, side, move) / POLICY_OUTPUT_SCALE for move in moves]
+                logits = [float(policy[at]) / POLICY_OUTPUT_SCALE for at in moves] if mixlite else model.policy(torch.tensor(candidates, dtype=torch.long)).tolist()
+                integers = [(integer_policy[move] if mixlite else quantized.policy(board, side, move)) / POLICY_OUTPUT_SCALE for move in moves]
                 ranking = sorted(range(len(moves)), key=lambda i: (-logits[i], moves[i]))
                 if len(ranking) > 1 and logits[ranking[0]] - logits[ranking[1]] > .01:
                     top1_samples += 1
@@ -51,9 +61,9 @@ def calibration(model, quantized, records):
                         if abs(logits[i] - logits[j]) > .01:
                             policy_pairs += 1
                             policy_correct += (logits[i] - logits[j]) * (integers[i] - integers[j]) > 0
-                for move, logit in zip(moves, logits, strict=True):
+                for integer, logit in zip(integers, logits, strict=True):
                     policies.append((max(-8, min(32767 / POLICY_OUTPUT_SCALE, logit)),
-                                     quantized.policy(board, side, move) / POLICY_OUTPUT_SCALE))
+                                     integer))
     if not errors:
         raise ValueError('no eligible calibration records')
     def ordering(pairs):
@@ -97,7 +107,7 @@ def main():
         raise ValueError('calibration dataset differs from model export')
     model = load_training_model(args.checkpoint, 'cpu')
     quantized = read_quantized_model(args.model)
-    if hasattr(quantized, 'score_scale') and quantized.score_scale != checkpoint['configuration']['score_scale']:
+    if hasattr(quantized, 'score_scale') and quantized.score_scale != checkpoint['configuration'].get('score_scale', checkpoint.get('score_scale')):
         raise ValueError('V2 calibration score contract mismatch')
     with open_dataset(args.dataset) as dataset:
         indices = validate_split_manifest(dataset, checkpoint.get('split_manifest'))['validation'][:args.samples]

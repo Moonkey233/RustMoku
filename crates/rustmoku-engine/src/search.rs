@@ -311,6 +311,8 @@ pub struct AlphaBetaEngine<E = PatternEvaluator> {
     vcf: VcfSolver,
     vct: VctSolver,
     proof_book: Option<Arc<VerifiedProofBook>>,
+    scratch: Option<WorkerScratch>,
+    helper_scratch: Vec<WorkerScratch>,
 }
 
 impl<E> AlphaBetaEngine<E> {
@@ -329,6 +331,8 @@ impl<E> AlphaBetaEngine<E> {
             vcf: VcfSolver::new(),
             vct: VctSolver::new(config.tactical().vct_table_memory_mib),
             proof_book: None,
+            scratch: None,
+            helper_scratch: Vec::new(),
         }
     }
 
@@ -416,6 +420,8 @@ impl<E: Evaluator> SearchEngine for AlphaBetaEngine<E> {
             worker_count: self.config.threads(),
             ..SearchStatistics::default()
         };
+        let mut scratch = self.scratch.take().unwrap_or_default();
+        scratch.reset();
         let mut result = self.search_with_budget(
             position,
             &mut state,
@@ -423,7 +429,9 @@ impl<E: Evaluator> SearchEngine for AlphaBetaEngine<E> {
             &mut budget,
             &mut statistics,
             observer,
+            &mut scratch,
         );
+        self.scratch = Some(scratch);
         // Final statistics include discarded partial work; score/PV/seldepth
         // still describe the last completed iteration or exact proof.
         if self.config.threads() == 1 || statistics.work_nodes == 0 {
@@ -440,6 +448,7 @@ impl<E: Evaluator> SearchEngine for AlphaBetaEngine<E> {
 }
 
 impl<E: Evaluator> AlphaBetaEngine<E> {
+    #[allow(clippy::too_many_arguments)]
     fn search_with_budget(
         &mut self,
         root_position: &Position,
@@ -448,9 +457,10 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
         budget: &mut SearchBudget,
         statistics: &mut SearchStatistics,
         observer: &mut dyn SearchObserver,
+        scratch: &mut WorkerScratch,
     ) -> SearchResult {
         let mut seldepth = 0;
-        let mut pv = PvTable::new();
+        let pv = &mut scratch.pv;
         if let Some(score) = terminal_score(state.position(), 0) {
             // Exact facts remain usable even if admission is already stopped.
             // Never exceed the cap merely to account for a known root fact.
@@ -462,7 +472,7 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
         let side = state.position().side_to_move();
         if limits.max_depth != 0
             && let Some((at, score)) =
-                immediate_tactic(state.patterns(), side).resolve(0, &mut pv, &mut seldepth)
+                immediate_tactic(state.patterns(), side).resolve(0, pv, &mut seldepth)
         {
             statistics.nodes = u64::from(budget.charge().is_ok());
             statistics.work_nodes = budget.work_nodes();
@@ -507,22 +517,24 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
         }
         if limits.max_depth == 0 {
             completed.origin = SearchOrigin::Analysis;
+            let mut resources = SearchResources {
+                seldepth: &mut seldepth,
+                pv,
+                statistics,
+                heuristics: scratch.heuristics.take().expect("exclusive worker scratch"),
+                interior_proof: None,
+                analysis: None,
+                budget,
+            };
             let outcome = self.qsearch(
                 state,
                 -SEARCH_INFINITY,
                 SEARCH_INFINITY,
                 0,
                 0,
-                &mut SearchResources {
-                    seldepth: &mut seldepth,
-                    pv: &mut pv,
-                    statistics,
-                    heuristics: SearchHeuristics::default(),
-                    interior_proof: None,
-                    analysis: None,
-                    budget,
-                },
+                &mut resources,
             );
+            scratch.heuristics = Some(resources.heuristics);
             if let Ok(score) = outcome
                 && budget.poll().is_ok()
             {
@@ -624,26 +636,29 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
         }
         let mut resources = SearchResources {
             seldepth: &mut seldepth,
-            pv: &mut pv,
+            pv,
             statistics,
-            heuristics: SearchHeuristics::default(),
+            heuristics: scratch.heuristics.take().expect("exclusive worker scratch"),
             interior_proof: None,
-            analysis: None,
+            analysis: scratch.analysis.take(),
             budget,
         };
         resources.interior_proof = crate::interior_proof::InteriorProof::new(self.config);
-        self.search_ordinary(
+        let result = self.search_ordinary(
             root_position,
             state,
             limits,
             completed,
             &mut resources,
             observer,
-        )
+        );
+        scratch.heuristics = Some(resources.heuristics);
+        scratch.analysis = resources.analysis;
+        result
     }
 
     fn search_ordinary(
-        &self,
+        &mut self,
         root_position: &Position,
         state: &mut SearchState<E>,
         limits: SearchLimits,
@@ -675,6 +690,11 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
             return completed;
         }
 
+        self.helper_scratch
+            .resize_with(threads - 1, WorkerScratch::default);
+        for scratch in &mut self.helper_scratch {
+            scratch.reset();
+        }
         let evaluator = &self.evaluator;
         let table = &self.table;
         let generation = self.generation;
@@ -683,7 +703,8 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
         let probcut = principal.probcut;
         let (completed, helper_results) = std::thread::scope(|scope| {
             let mut handles = Vec::with_capacity(threads.saturating_sub(1));
-            for worker_id in 1..threads {
+            for (index, scratch) in self.helper_scratch.iter_mut().enumerate() {
+                let worker_id = index + 1;
                 let helper_budget = resources.budget.worker();
                 let helper_position = root_position;
                 let helper_evaluator = evaluator;
@@ -692,7 +713,6 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
                     let mut helper_budget = helper_budget;
                     let mut helper_state = SearchState::new(helper_position, helper_evaluator);
                     let mut helper_statistics = SearchStatistics::default();
-                    let mut helper_pv = PvTable::new();
                     let mut helper_seldepth = 0;
                     let mut context =
                         AbContext::new(helper_evaluator, helper_table, generation, worker_id);
@@ -705,7 +725,7 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
                         limits,
                         &mut helper_budget,
                         &mut helper_statistics,
-                        &mut helper_pv,
+                        scratch,
                         &mut helper_seldepth,
                     );
                     HelperResult {
@@ -982,7 +1002,7 @@ fn run_principal_iterations<E: Evaluator>(
         || context.profile.research().null_move
         || context.probcut.is_some()
     {
-        resources.analysis = Some(AnalysisScratch::new());
+        resources.analysis.get_or_insert_with(AnalysisScratch::new);
     }
     for depth in 1..=limits.max_depth {
         if resources.budget.poll().is_err() {
@@ -1022,17 +1042,17 @@ fn run_helper_iterations<E: Evaluator>(
     limits: SearchLimits,
     budget: &mut SearchBudget,
     statistics: &mut SearchStatistics,
-    pv: &mut PvTable,
+    scratch: &mut WorkerScratch,
     seldepth: &mut u8,
 ) {
     let mut previous_score = state.evaluate(context.evaluator);
     let mut resources = SearchResources {
         seldepth,
-        pv,
+        pv: &mut scratch.pv,
         statistics,
-        heuristics: SearchHeuristics::default(),
+        heuristics: scratch.heuristics.take().expect("exclusive helper scratch"),
         interior_proof: None,
-        analysis: None,
+        analysis: scratch.analysis.take(),
         budget,
     };
     resources
@@ -1043,7 +1063,7 @@ fn run_helper_iterations<E: Evaluator>(
         || context.profile.research().null_move
         || context.probcut.is_some()
     {
-        resources.analysis = Some(AnalysisScratch::new());
+        resources.analysis.get_or_insert_with(AnalysisScratch::new);
     }
     for depth in 1..=limits.max_depth {
         if resources.budget.poll().is_err() {
@@ -1059,6 +1079,8 @@ fn run_helper_iterations<E: Evaluator>(
         previous_score = iteration.score;
         resources.statistics.work_nodes = resources.budget.work_nodes();
     }
+    scratch.heuristics = Some(resources.heuristics);
+    scratch.analysis = resources.analysis;
 }
 
 /// Borrowed immutable engine components plus worker-specific deterministic
@@ -1266,6 +1288,39 @@ struct SearchResources<'a> {
     interior_proof: Option<crate::interior_proof::InteriorProof>,
     analysis: Option<Box<AnalysisScratch>>,
     budget: &'a mut SearchBudget,
+}
+
+struct WorkerScratch {
+    pv: PvTable,
+    heuristics: Option<SearchHeuristics>,
+    analysis: Option<Box<AnalysisScratch>>,
+}
+impl Default for WorkerScratch {
+    fn default() -> Self {
+        Self {
+            pv: PvTable::new(),
+            heuristics: Some(SearchHeuristics::default()),
+            analysis: None,
+        }
+    }
+}
+impl WorkerScratch {
+    fn reset(&mut self) {
+        self.pv.reset();
+        self.heuristics
+            .as_mut()
+            .expect("returned worker scratch")
+            .reset();
+        if let Some(analysis) = &mut self.analysis {
+            analysis.pv.reset();
+            analysis.seldepth = 0;
+            analysis
+                .heuristics
+                .as_mut()
+                .expect("returned analysis scratch")
+                .reset();
+        }
+    }
 }
 
 struct AnalysisScratch {

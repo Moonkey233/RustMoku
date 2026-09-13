@@ -427,6 +427,11 @@ class LocalPatternModel(nn.Module):
 def load_training_model(path: str | os.PathLike[str], device: str) -> LocalPatternModel:
     from checkpoint import load_checkpoint
     checkpoint = load_checkpoint(path, device)
+    if checkpoint.get('format') == 'rustmoku-mixlite-v3-d4':
+        from mixlite import MixLite
+        model = MixLite(checkpoint['score_scale']).to(device)
+        model.load_state_dict(checkpoint['model_state'])
+        return model
     if checkpoint.get('format') == 'rustmoku-nonlinear-v2':
         from nonlinear_model import NonlinearModel
         model = NonlinearModel(qat=checkpoint['configuration'].get('qat', False)).to(device)

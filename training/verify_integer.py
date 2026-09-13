@@ -13,15 +13,16 @@ def verify(engine, model_path):
     exported = read_export(model_path)
     engine_identity = file_identity(engine)
     model = read_quantized_model(model_path)
+    backends = ['scalar', 'auto', 'avx2'] if exported['architecture']['architecture_id'] == 4 else [None]
     checks = 0
     with tempfile.TemporaryDirectory() as directory:
         record = Path(directory) / 'position.rmg'
         for moves in ('', 'H8', 'H8 I8', 'H8 I8 H9', 'A1 O15 A2 O14 B1 N15'):
             record.write_text(f'RustMoku 1\nrules=freestyle\nmoves={moves}\n', encoding='utf-8')
             board, side = parse_game_record(record)
-            for at in ('A15', 'O1', 'G7'):
+            for at, backend in ((at, backend) for at in ('A15', 'O1', 'G7') for backend in backends):
                 result = subprocess.run([str(engine.resolve()), 'model-check', '--model', str(model_path.resolve()),
-                                         '--record', str(record), '--move', at],
+                                         '--record', str(record), '--move', at] + (['--backend', backend] if backend else []),
                                         capture_output=True, text=True, check=True, timeout=10)
                 actual = dict(line.split('=', 1) for line in result.stdout.splitlines())
                 expected = {'value': str(model.value(board, side)),
@@ -32,7 +33,9 @@ def verify(engine, model_path):
     print(f'integer_differential_checks={checks} passed')
     check_file(engine_identity)
     check_file(exported['model'])
-    write_check(model_path, 'integer', {'checks': checks}, engine=engine_identity,
+    report = {'checks': checks}
+    if backends != [None]: report['backends'] = backends
+    write_check(model_path, 'integer', report, engine=engine_identity,
                 producer=file_identity(__file__), fixture='five-positions-three-candidates-v1')
 
 

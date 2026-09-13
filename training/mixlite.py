@@ -28,9 +28,13 @@ WIDTH, CONTEXT, FEATURES = 32, 8, 65536
 HEADER = struct.Struct('<8sHHIHHiii')
 BYTE_WEIGHTS = (FEATURES + 3) * WIDTH + CONTEXT * 5 * WIDTH
 FILE_BYTES = HEADER.size + BYTE_WEIGHTS + CONTEXT * 4 + (3 * CONTEXT + WIDTH + CONTEXT) * 2
-GROUPS = [(i // 15 >= 8) * 2 + (i % 15 >= 8) for i in range(225)]
-COUNTS = [64, 56, 56, 49]
-FORMAT = 'rustmoku-mixlite-v3'
+GROUPS = [max(abs(i // 15 - 7), abs(i % 15 - 7)) // 2 for i in range(225)]
+COUNTS = [9, 40, 72, 104]
+FORMAT = 'rustmoku-mixlite-v3-d4'
+
+def symmetric_keys(board, side):
+    return [min(k, sum(((k >> (2*i)) & 3) << (2*(7-i)) for i in range(8)))
+            for k in feature_keys(board, side)]
 
 
 def ste_integer(x, low, high):
@@ -43,7 +47,7 @@ def ste_trunc(x):
 
 
 def features(board, side):
-    keys = torch.tensor(feature_keys(board, side)).reshape(225, 4)
+    keys = torch.tensor(symmetric_keys(board, side)).reshape(225, 4)
     centers = torch.tensor([0 if c == 0 else 1 if c == side + 1 else 2 for c in board])
     return keys, centers
 
@@ -85,7 +89,7 @@ class MixLite(nn.Module):
                    (self.mixing, 'b', -128, 127), (self.bias, 'i', -1048576, 1048576),
                    (self.wdl_head, 'h', -32768, 32767), (self.policy_head, 'h', -32768, 32767),
                    (self.policy_context, 'h', -32768, 32767))
-        payload = bytearray(HEADER.pack(b'RMLPV003', 3, 3, FEATURES, WIDTH, 2, self.value_divisor, self.policy_divisor, self.score_scale))
+        payload = bytearray(HEADER.pack(b'RMLPV003', 3, 4, FEATURES, WIDTH, 2, self.value_divisor, self.policy_divisor, self.score_scale))
         for tensor, code, low, high in tensors:
             if not torch.isfinite(tensor).all():
                 raise ValueError('nonfinite V3 tensor')
@@ -102,7 +106,7 @@ class IntegerMixLite:
         if len(payload) != FILE_BYTES:
             raise ValueError('invalid V3 tensor length')
         header = HEADER.unpack_from(payload)
-        if header[:6] != (b'RMLPV003', 3, 3, FEATURES, WIDTH, 2):
+        if header[:6] != (b'RMLPV003', 3, 4, FEATURES, WIDTH, 2):
             raise ValueError('invalid V3 header')
         self.value_divisor, self.policy_divisor, self.score_scale = header[6:]
         if self.value_divisor <= 0 or self.policy_divisor <= 0 or not 1 <= self.score_scale <= 10_000_000:
@@ -131,7 +135,7 @@ class IntegerMixLite:
         return self.infer(board, side)[1][at]
 
     def infer(self, board, side):
-        keys = feature_keys(board, side)
+        keys = symmetric_keys(board, side)
         local, groups = [], [[0] * WIDTH for _ in range(4)]
         for at in range(225):
             c = 0 if board[at] == 0 else 1 if board[at] == side + 1 else 2
@@ -200,24 +204,22 @@ def train(dataset_path, checkpoint_path, steps, seed=0, max_seconds=60, resume=N
         validate_split_manifest(dataset, manifest, seed)
         atomic_save(checkpoint_path, dict(format=FORMAT, model_state=model.state_dict(), optimizer_state=optimizer.state_dict(),
                     steps=completed+done, seed=seed, split_manifest=manifest, score_scale=scale,
-                    configuration=dict(architecture='mixlite-width32-context8-v3', value_contract='stm-rational-q15-v2', training='bounded-scalar-qat')))
+                    configuration=dict(architecture='mixlite-width32-context8-d4-v3', value_contract='stm-rational-q15-v2', training='bounded-scalar-qat')))
     return completed+done
 
 
 def export(checkpoint_path, dataset_path, model_path):
     from export import publish_model
-    frozen = file_hash(checkpoint_path), file_hash(dataset_path)
-    checkpoint = load_checkpoint(checkpoint_path)
-    if checkpoint.get('format') != FORMAT: raise ValueError('not a V3 checkpoint')
-    with open_dataset(Path(dataset_path)) as dataset:
-        validate_split_manifest(dataset, checkpoint['split_manifest'])
-    model = MixLite(checkpoint['score_scale']); model.load_state_dict(checkpoint['model_state'])
+    from provenance import export_identity, write_export, check_file
+    from common import load_training_model
+    identity = export_identity(checkpoint_path, dataset_path)
+    model = load_training_model(checkpoint_path, 'cpu')
+    if not isinstance(model, MixLite): raise ValueError('not a V3 checkpoint')
     payload = model.bytes(); IntegerMixLite(payload)
-    if frozen != (file_hash(checkpoint_path), file_hash(dataset_path)): raise ValueError('export inputs changed')
+    check_file(identity['checkpoint']); check_file(identity['dataset'])
     publish_model(Path(model_path), payload)
-    save_manifest(Path(str(model_path)+'.v3-export.json'), dict(model_sha256=file_hash(model_path), checkpoint_sha256=frozen[0],
-                  dataset_sha256=checkpoint['split_manifest']['dataset_sha256'], split_manifest=checkpoint['split_manifest'],
-                  architecture='mixlite-width32-context8-v3', status='scalar-research-not-promotion-evidence'))
+    write_export(model_path, identity, dict(contract='mixlite-d4-int8-int16-v1',
+        value_divisor=model.value_divisor, policy_divisor=model.policy_divisor, score_scale=model.score_scale))
 
 
 def verify(engine, model_path):
@@ -229,13 +231,13 @@ def verify(engine, model_path):
         for moves in ('', 'H8', 'H8 I8', 'H8 I8 H9', 'A1 O15 A2 O14 B1 N15'):
             record.write_text(f'RustMoku 1\nrules=freestyle\nmoves={moves}\n', encoding='utf-8')
             board, side = parse_game_record(record); value, policy, _ = integer.infer(board, side)
-            for at in ('A15','O1','G7'):
-                result = subprocess.run([str(engine),'model-check','--model',str(model_path),'--record',str(record),'--move',at], capture_output=True,text=True,check=True,timeout=10)
+            for at, backend in ((at, backend) for at in ('A15','O1','G7') for backend in ('scalar','auto')):
+                result = subprocess.run([str(engine),'model-check','--model',str(model_path),'--record',str(record),'--move',at,'--backend',backend], capture_output=True,text=True,check=True,timeout=10)
                 actual = dict(line.split('=',1) for line in result.stdout.splitlines())
                 if actual != dict(value=str(value), policy=str(policy[parse_move(at)])): raise ValueError(f'V3 integer mismatch: {moves}, {at}: {actual}')
                 checks += 1
     if before != (file_hash(model_path), file_hash(engine)): raise ValueError('verification inputs changed')
-    save_manifest(Path(str(model_path)+'.v3-integer.json'), dict(model_sha256=before[0],engine_sha256=before[1], checks=checks, status='bit-exact-scalar-only'))
+    save_manifest(Path(str(model_path)+'.v3-integer.json'), dict(model_sha256=before[0],engine_sha256=before[1], checks=checks, status='bit-exact-scalar-and-dispatch'))
     return checks
 
 

@@ -10,9 +10,15 @@ from dataset import file_hash, open_dataset, publish_shard
 SCORE_CONTRACT = 'ordinary-limit-normalized-exact-sign-v1'
 ARCHITECTURE = 'local-pattern-linear-v1'
 
+# One registry drives export/freeze/admission for every supported architecture.
+ARCHITECTURES = {
+    ARCHITECTURE: (1, 1, SCORE_CONTRACT, 'rustmoku-local-pattern-v1'),
+    'local-pattern-relu-width8-v2': (2, 2, 'stm-rational-q15-v2', 'rustmoku-nonlinear-v2'),
+    'mixlite-width32-context8-d4-v3': (3, 4, 'stm-rational-q15-v2', 'rustmoku-mixlite-v3-d4'),
+}
+
 def supported(architecture, contract):
-    return (architecture, contract) in ((ARCHITECTURE, SCORE_CONTRACT),
-        ('local-pattern-relu-width8-v2', 'stm-rational-q15-v2'))
+    return architecture in ARCHITECTURES and ARCHITECTURES[architecture][2] == contract
 
 
 def object_hash(value):
@@ -42,6 +48,9 @@ def export_identity(checkpoint_path, dataset_path, resolver=None):
     config = checkpoint.get('configuration', {})
     if not supported(config.get('architecture'), config.get('value_contract')):
         raise ValueError('checkpoint architecture/score contract is not supported for export evidence')
+    format_version, architecture_id, _, checkpoint_format = ARCHITECTURES[config['architecture']]
+    if checkpoint.get('format') != checkpoint_format:
+        raise ValueError('checkpoint format/architecture mismatch')
     split = checkpoint['split_manifest']
     dataset_id = file_identity(dataset_path)
     with open_dataset(Path(dataset_path), resolver=resolver) as dataset:
@@ -55,8 +64,8 @@ def export_identity(checkpoint_path, dataset_path, resolver=None):
     check_file(dataset_id)
     return {'checkpoint': checkpoint_id, 'dataset': {**dataset_id, 'fingerprint': split['dataset_sha256'],
             'shards': shards, **({'resolver': resolver} if resolver else {})}, 'split': {'sha256': object_hash(split), 'manifest': split},
-            'architecture': {'format_version': 1 if config['architecture'] == ARCHITECTURE else 2,
-                             'architecture_id': 1 if config['architecture'] == ARCHITECTURE else 2,
+            'architecture': {'format_version': format_version,
+                             'architecture_id': architecture_id,
                              'name': config['architecture']},
             'score_contract': config['value_contract']}
 
@@ -124,6 +133,14 @@ def read_export(model):
         raise ValueError('model/export hash mismatch')
     if not supported(receipt['architecture']['name'], receipt['score_contract']):
         raise ValueError('unsupported export architecture/score contract')
+    expected = ARCHITECTURES[receipt['architecture']['name']]
+    if (receipt['architecture']['format_version'], receipt['architecture']['architecture_id']) != expected[:2]:
+        raise ValueError('export architecture identifiers mismatch')
+    if expected[1] == 4:
+        from common import read_quantized_model
+        from mixlite import IntegerMixLite
+        if not isinstance(read_quantized_model(model), IntegerMixLite):
+            raise ValueError('V3 export/model architecture mismatch')
     if object_hash(receipt['split']['manifest']) != receipt['split']['sha256']:
         raise ValueError('split evidence hash mismatch')
     return receipt
@@ -214,12 +231,15 @@ def validate_evidence(model, supplied_dataset=None):
                     or report['policy_max_absolute_error'] > gates['max_policy_error']
                     or report['value_sign_errors_margin_001'] != 0):
                 raise ValueError('calibration did not pass its declared gates')
-            if export['architecture']['architecture_id'] == 2:
+            if export['architecture']['architecture_id'] in (2, 4):
                 if any(report[key]['agreement'] is not None and (not math.isfinite(report[key]['agreement']) or report[key]['agreement'] < .99)
                        for key in ('value_ordering', 'policy_ordering', 'policy_top1')):
                     raise ValueError('V2 rank or top1 calibration failed')
         else:
-            if check['report'].get('checks') != 15:
+            v3 = export['architecture']['architecture_id'] == 4
+            if v3 and check['report'].get('backends') != ['scalar', 'auto', 'avx2']:
+                raise ValueError('V3 requires scalar and SIMD integer evidence')
+            if check['report'].get('checks') != (45 if v3 else 15):
                 raise ValueError('integer differential fixture coverage incomplete')
             inputs[str(check_file(check['engine']))] = check['engine']['sha256']
     return {'export': export, 'evidence': evidence, 'inputs_sha256': inputs, 'dataset_path': dataset_path, 'resolver': resolver}

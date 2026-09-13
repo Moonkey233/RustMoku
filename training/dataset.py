@@ -13,7 +13,7 @@ import hashlib
 import json
 import os
 import sqlite3
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 from pathlib import Path
 from typing import Sequence
 
@@ -93,6 +93,38 @@ def game_outcome(records):
     return {"status": "terminal", "winner": winner}
 
 
+class ShardView(Sequence):
+    def __init__(self, pool, index): self.pool, self.index = pool, index
+    def __len__(self): return len(self.pool.reader(self.index))
+    def __getitem__(self, item): return self.pool.reader(self.index)[item]
+
+
+class ShardReaders:
+    """Bounded mmap/file handles; immutable records survive reader eviction."""
+    def __init__(self, capacity=32):
+        self.capacity = capacity
+        self.paths = []
+        self.views = []
+        self.readers = OrderedDict()
+    def __len__(self): return len(self.paths)
+    def append(self, path):
+        self.paths.append(Path(path))
+        self.views.append(ShardView(self,len(self.paths)-1))
+        return self.views[-1]
+    def __getitem__(self, index): return self.views[index]
+    def reader(self, index):
+        if index in self.readers:
+            self.readers.move_to_end(index)
+            return self.readers[index]
+        if len(self.readers) >= self.capacity:
+            _, old = self.readers.popitem(last=False); old.close()
+        reader = DatasetFile(self.paths[index]); self.readers[index] = reader
+        return reader
+    def close(self):
+        for reader in self.readers.values(): reader.close()
+        self.readers.clear()
+
+
 class DatasetBundle(Sequence[DataRecord]):
     """Shard IDs are namespaced by content, not concatenated local game IDs."""
 
@@ -110,7 +142,7 @@ class DatasetBundle(Sequence[DataRecord]):
                 raise ValueError('comparison sidecar identity mismatch')
             self.comparisons = sqlite3.connect(companion_path.resolve().as_uri() + '?mode=ro&immutable=1', uri=True)
             self.comparisons.execute('PRAGMA cache_size=-4096')
-        self.shards = []
+        self.shards = ShardReaders()
         self.ranges = []
         self.ends = []
         self.count = 0
@@ -129,8 +161,7 @@ class DatasetBundle(Sequence[DataRecord]):
                 if digest in seen_files:
                     raise ValueError('duplicate shard')
                 seen_files.add(digest)
-                data = DatasetFile(source)
-                self.shards.append(data)
+                data = self.shards.append(source)
                 compact = shard.get('index_version', 1) == 2
                 if shard.get('index_version', 1) not in (1, 2):
                     raise ValueError('unsupported shard index schema')
@@ -209,9 +240,7 @@ class DatasetBundle(Sequence[DataRecord]):
         if self.comparisons is not None:
             self.comparisons.close()
             self.comparisons = None
-        for shard in self.shards:
-            shard.close()
-        self.shards = []
+        self.shards.close()
 
     def __enter__(self):
         return self

@@ -610,3 +610,57 @@ fn proof_work_shares_outer_limit_but_local_exhaustion_falls_through_and_proofs_e
         );
     }
 }
+
+#[test]
+fn worker_scratch_survives_interruptions_and_matches_fresh_history() {
+    let position = fixture(&[112, 97, 128, 113]);
+    let mut engine = AlphaBetaEngine::with_config(PatternEvaluator, config());
+    let limits = SearchLimits::new(3);
+    let expected = engine.search(&position, limits);
+    let addresses = engine
+        .scratch
+        .as_ref()
+        .unwrap()
+        .heuristics
+        .as_ref()
+        .unwrap()
+        .storage_addresses();
+    engine.search(&position, SearchLimits::new(8).with_max_nodes(150));
+    engine.clear_transposition_table();
+    let actual = engine.search(&position, limits);
+    assert_eq!(
+        (actual.best_move, actual.score, actual.principal_variation),
+        (
+            expected.best_move,
+            expected.score,
+            expected.principal_variation
+        )
+    );
+    assert_eq!(
+        engine
+            .scratch
+            .as_ref()
+            .unwrap()
+            .heuristics
+            .as_ref()
+            .unwrap()
+            .storage_addresses(),
+        addresses
+    );
+    engine.reconfigure(config().with_threads(3));
+    engine.search(&position, SearchLimits::new(3).with_max_nodes(500));
+    let helpers: Vec<_> = engine
+        .helper_scratch
+        .iter()
+        .map(|s| s.heuristics.as_ref().unwrap().storage_addresses())
+        .collect();
+    engine.search(&position, SearchLimits::new(3).with_max_nodes(500));
+    assert_eq!(
+        helpers,
+        engine
+            .helper_scratch
+            .iter()
+            .map(|s| s.heuristics.as_ref().unwrap().storage_addresses())
+            .collect::<Vec<_>>()
+    );
+}

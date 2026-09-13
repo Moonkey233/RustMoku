@@ -246,7 +246,7 @@ python training/mixlite.py export --checkpoint v3.pt --dataset DATASET --model v
 python training/mixlite.py verify --engine target/debug/rustmoku-data.exe --model v3.rml
 ```
 
-V3 has independent magic/version/architecture (`RMLPV003`, 3, 3) and shares the
+V3 has independent magic/version/architecture (`RMLPV003`, 3, 4) and shares the
 rational Q15 score contract. Header `<8sHHIHHiii>` declares features=65536,
 width=32, contract=2, value divisor, policy divisor and frozen score scale.
 Tensor order: int8 embeddings, 3 occupancy rows, 8x160 mixing; eight bounded i32
@@ -259,7 +259,21 @@ rebuilds the board; Rust uses bounded incremental updates.
 V3 export and integer receipts are scalar research diagnostics. Existing formal
 promotion/calibration evidence admission deliberately remains closed for V3;
 this pipeline does not produce a trained champion or strength evidence. Main
-`train.py` V1/V2 behavior is retained; use `mixlite.py` for V3. No SIMD is added.
+`train.py` V1/V2 behavior is retained. `mixlite.py` remains the scalar/reference
+trainer and exporter. Its verification compares Python integers with Rust scalar
+and automatic dispatch over 30 outputs. The runtime AVX2 kernels preserve that
+scalar contract; architecture ID 4 uses reversal-canonical lines and D4 rings.
+
+`mixlite_production.py` adds a batched float32 QAT trainer with explicit
+`--device cpu|cuda`, `--batch-size`, `--steps`, `--epochs`, `--resume`,
+`--checkpoint-every`, and soft/ranking targets. Dataset records are loaded lazily;
+lineage splits precede deterministic augmentation. Resume preserves optimizer,
+epoch cursor and configuration. Ordinary labels retain fixed-horizon semantics;
+exact labels and outcomes have separate supervision. Mining tags identify policy,
+candidate, value and tactical misses and forced losses for batch weighting.
+CUDA and large-scale throughput are not yet validated. Formal architecture-aware
+evidence admission and production orchestration scripts remain W7 work in progress;
+do not treat research export receipts as promotion evidence.
 
 Teacher JSON v4 declares root/descendant universes, leaf policy, search domain,
 selectivity and score reference scale. Practical distillation is the default;

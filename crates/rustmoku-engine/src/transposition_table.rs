@@ -148,7 +148,9 @@ struct AtomicSlot {
     payload: AtomicU64,
 }
 
-#[repr(C)]
+// Four 16-byte slots fit exactly one cache line. Alignment avoids adjacent
+// bucket sharing without increasing ordinary bucket size or changing seqlocks.
+#[repr(C, align(64))]
 #[derive(Debug)]
 struct AtomicBucket {
     slots: [AtomicSlot; ENTRIES_PER_BUCKET],
@@ -464,6 +466,7 @@ mod tests {
         assert_eq!(size_of::<Bucket>(), 64);
         assert_eq!(size_of::<super::AtomicSlot>(), 16);
         assert_eq!(size_of::<super::AtomicBucket>(), 64);
+        assert_eq!(std::mem::align_of::<super::AtomicBucket>(), 64);
     }
 
     #[test]

@@ -48,6 +48,26 @@ impl<E: Evaluator> SearchState<E> {
         crate::tactical::ThreatDescriptor::new(&self.board, at, self.position().side_to_move())
     }
 
+    /// Independent of the move's own quiet profile: a quiet reply can occupy
+    /// another threat's critical dependency window.
+    pub(crate) fn critical_dependencies(&self) -> crate::bitboard::BitBoard256 {
+        let mut protected = crate::bitboard::BitBoard256::EMPTY;
+        for side in [Stone::Black, Stone::White] {
+            for gain in self
+                .patterns()
+                .moves_at_least(side, crate::pattern::ThreatProfile::OpenThree)
+                .iter()
+            {
+                if let Some(threat) =
+                    crate::tactical::ThreatDescriptor::new(&self.board, gain, side)
+                {
+                    protected = protected.union(threat.defenses).union(threat.dependencies);
+                }
+            }
+        }
+        protected.intersection(self.patterns().empty_cells())
+    }
+
     pub(crate) fn evaluate(&self, evaluator: &E) -> i32 {
         evaluator.evaluate(self.position(), self.patterns(), &self.evaluator_state)
     }

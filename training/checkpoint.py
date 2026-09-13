@@ -22,7 +22,7 @@ def load_checkpoint(path, device='cpu'):
         if len(entries) > 2048 or sum(entry.file_size for entry in entries) > MAX_CHECKPOINT_BYTES:
             raise ValueError('checkpoint expanded storage exceeds safety limit')
     checkpoint = torch.load(path, map_location=device, weights_only=True)
-    if not isinstance(checkpoint, dict) or checkpoint.get('format') not in ('rustmoku-local-pattern-v1', 'rustmoku-nonlinear-v2', 'rustmoku-mixlite-v3'):
+    if not isinstance(checkpoint, dict) or checkpoint.get('format') not in ('rustmoku-local-pattern-v1', 'rustmoku-nonlinear-v2', 'rustmoku-mixlite-v3-d4'):
         raise ValueError('unsupported training checkpoint')
     return checkpoint
 

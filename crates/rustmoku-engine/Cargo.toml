@@ -7,6 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 rustmoku-core.workspace = true
+rustmoku-simd.workspace = true
 sha2 = "0.10"
 
 # Only the explicit memory-model test build substitutes instrumented atomics.

@@ -5,7 +5,8 @@ Value/Policy evaluator, deterministic teacher datasets and offline PyTorch
 tooling. It also hardens V0.11 checkpoints and Proof Book verification. Classical
 recursive search and its V0.9/V0.10 TT/selectivity protocols remain intact.
 Core remains authoritative for legality and wins; Native remains an adapter.
-All first-party crates forbid unsafe code. Concurrency uses only the standard library.
+Core, Engine and applications forbid unsafe code. The small rustmoku-simd crate
+contains the audited AVX2 boundary; concurrency uses only the standard library.
 Milestone scope and future work live in [ROADMAP.md](ROADMAP.md).
 
 V1/V2 learned inference and V1.0 research mechanisms are described later in this
@@ -1196,3 +1197,43 @@ plus 8 cross terms. No leaf scans the board. The file has 2,098,720 bytes; state
 uses about 58 KiB per worker. Local/group/context arithmetic fits i32; bounded
 policy products and rational value conversion use i64. Output is clamped outside
 the mate/proof range. These are layout/operation counts, not timing evidence.
+
+### V3 scalar architecture freeze (architecture ID 4)
+
+The 32-byte header retains magic RMLPV003 and format 3, but architecture is 4.
+Parsers reject the previous quadrant architecture ID 3; its bytes and checkpoints
+must not be reinterpreted. Checkpoints use `rustmoku-mixlite-v3-d4`.
+Tensor order, dimensions, divisors, clipping and accumulator bounds are unchanged.
+Each relative eight-cell line key is replaced by min(key, reversed two-bit cells).
+The four directions share the embedding, so rotations/reflections only permute
+summands. Spatial groups use `max(abs(row-7),abs(column-7))/2`: counts 9,40,72,104.
+Global and group means are therefore D4 invariant. Value/WDL are invariant and
+candidate policy is equivariant without learned symmetry, leaf scans or board
+canonicalization. Incremental updates still touch at most 33 centers per move.
+The 65,536-row payload deliberately retains unused reversed rows for simple
+indexing; training and inference read only canonical rows.
+
+LMR V2 separates quiet/protected eligibility, the precomputed depth/index surface,
+and history/continuation adjustment. The latter is measured in half of the
+versioned strong-history threshold and capped by lmr_cut_bonus; policy lower-half
+ranking can add one bounded reduction. Legacy LMR remains unchanged when V2 is
+off. TimeManager pressure persists across one stable iteration and decays over
+four subsequent stable iterations; the algorithm identity records hard90.
+
+### W6 evaluator backends
+
+`EvaluatorBackend::SCALAR` is the oracle. Runtime detection chooses AVX2 only on
+supporting x86 CPUs; all other targets use Scalar. Only 32-lane embedding deltas
+and 160-element context dots use manual AVX2. Group clipping, cached value and
+policy remain compiler-optimized scalar. The dedicated rustmoku-simd crate uses
+fixed array bounds and unaligned loads; CPU admission is a private checked flag.
+Engine/core unsafe prohibitions remain intact. No AVX512/VNNI backend is implied.
+
+Run the bounded microbenchmark explicitly with
+`cargo test -p rustmoku-engine --release v3_micro_smoke -- --ignored --nocapture`.
+This measures evaluator-only reversible updates and cached heads, not game search.
+One Windows release smoke measured Scalar/AVX2 at 1913/1440 ns per update,
+19/19 ns per policy, and 58,720 bytes/state. Cached value was below the original
+integer-nanosecond reporting resolution. These are diagnostics, not strength or
+broad performance evidence. `model-check --backend scalar|auto|avx2` provides an
+explicit cross-language verification path; unsupported explicit AVX2 fails.

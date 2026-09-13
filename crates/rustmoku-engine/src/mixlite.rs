@@ -15,9 +15,17 @@ const MIX_INPUT: usize = 5 * WIDTH;
 const BYTE_WEIGHTS: usize = (FEATURES + 3) * WIDTH + CONTEXT * MIX_INPUT;
 const SHORT_WEIGHTS: usize = 3 * CONTEXT + WIDTH + CONTEXT;
 const FILE_BYTES: usize = HEADER + BYTE_WEIGHTS + CONTEXT * 4 + SHORT_WEIGHTS * 2;
-const GROUP_COUNTS: [i32; 4] = [64, 56, 56, 49];
+const GROUP_COUNTS: [i32; 4] = [9, 40, 72, 104];
 fn group(at: Move) -> usize {
-    usize::from(at.row() >= 8) * 2 + usize::from(at.column() >= 8)
+    at.row().abs_diff(7).max(at.column().abs_diff(7)) / 2
+}
+// A D4 transform permutes directions and may reverse each eight-cell line.
+// Canonicalize that reversal only; no board canonicalization in the hot path.
+fn feature(key: crate::pattern::LineKey, side: Stone) -> usize {
+    let key = relative_key(key, side).0;
+    let reverse = key.reverse_bits();
+    let reverse = ((reverse & 0xaaaa) >> 1) | ((reverse & 0x5555) << 1);
+    usize::from(key.min(reverse))
 }
 fn activation(value: i32) -> i32 {
     value.clamp(0, 255)
@@ -48,7 +56,7 @@ impl MixLiteModel {
             .map_err(LearnedModelError::Io)?;
         if bytes.len() != FILE_BYTES
             || &bytes[..8] != b"RMLPV003"
-            || bytes[8..20] != [3, 0, 3, 0, 0, 0, 1, 0, 32, 0, 2, 0]
+            || bytes[8..20] != [3, 0, 4, 0, 0, 0, 1, 0, 32, 0, 2, 0]
         {
             return Err(LearnedModelError::Invalid(
                 "invalid V3 header or tensor length",
@@ -120,7 +128,7 @@ impl MixLiteModel {
     pub fn metadata(&self) -> crate::LearnedModelMetadata {
         crate::LearnedModelMetadata {
             format_version: 3,
-            architecture_id: 3,
+            architecture_id: 4,
             feature_count: FEATURES,
             hidden: WIDTH,
             value_scale: self.value_divisor,
@@ -130,7 +138,7 @@ impl MixLiteModel {
     pub const fn score_scale(&self) -> i32 {
         self.score_scale
     }
-    fn refresh(&self, state: &mut MixLiteState, side: usize) {
+    fn refresh(&self, state: &mut MixLiteState, side: usize, backend: rustmoku_simd::Backend) {
         let mut input = [0; MIX_INPUT];
         for lane in 0..WIDTH {
             let total: i32 = (0..4).map(|g| state.groups[side][g][lane]).sum();
@@ -141,11 +149,7 @@ impl MixLiteModel {
         }
         // 160 * 255 * 128 + bounded bias < 2^23; signed i32 is sufficient.
         for (lane, context) in state.context[side].iter_mut().enumerate() {
-            let dot: i32 = input
-                .iter()
-                .zip(self.mixing[lane])
-                .map(|(&a, b)| a * i32::from(b))
-                .sum();
+            let dot = backend.dot160(&input, &self.mixing[lane]);
             *context = activation((dot + self.bias[lane]) / 256);
         }
         // WDL evidence is positive and bounded; no exp or lookup in inference.
@@ -184,10 +188,18 @@ fn adjust_group(state: &mut MixLiteState, side: usize, at: Move, sign: i32) {
 #[derive(Clone, Debug)]
 pub struct MixLiteEvaluator {
     model: Arc<MixLiteModel>,
+    backend: rustmoku_simd::Backend,
 }
 impl MixLiteEvaluator {
-    pub const fn new(model: Arc<MixLiteModel>) -> Self {
-        Self { model }
+    pub fn new(model: Arc<MixLiteModel>) -> Self {
+        Self {
+            model,
+            backend: rustmoku_simd::Backend::detect(),
+        }
+    }
+    pub fn with_backend(mut self, backend: rustmoku_simd::Backend) -> Self {
+        self.backend = backend;
+        self
     }
     pub fn model(&self) -> &Arc<MixLiteModel> {
         &self.model
@@ -223,14 +235,13 @@ impl MixLiteEvaluator {
             }
             for (influence, (old, new)) in LINE_INFLUENCES[at.index()].iter().zip(delta.changes()) {
                 let (old, new) = if reverse { (new, old) } else { (old, new) };
-                let old = self.model.embeddings[usize::from(relative_key(old, side).0)];
-                let new = self.model.embeddings[usize::from(relative_key(new, side).0)];
-                for (d, sum) in state.preactivation[s][influence.center.index()]
-                    .iter_mut()
-                    .enumerate()
-                {
-                    *sum += i32::from(new[d]) - i32::from(old[d]);
-                }
+                let old = self.model.embeddings[feature(old, side)];
+                let new = self.model.embeddings[feature(new, side)];
+                self.backend.delta32(
+                    &mut state.preactivation[s][influence.center.index()],
+                    &old,
+                    &new,
+                );
             }
             let occupied = if delta.played_stone() == side { 1 } else { 2 };
             let (old, new) = if reverse {
@@ -238,14 +249,15 @@ impl MixLiteEvaluator {
             } else {
                 (0, occupied)
             };
-            for (d, sum) in state.preactivation[s][at.index()].iter_mut().enumerate() {
-                *sum +=
-                    i32::from(self.model.centers[new][d]) - i32::from(self.model.centers[old][d]);
-            }
+            self.backend.delta32(
+                &mut state.preactivation[s][at.index()],
+                &self.model.centers[old],
+                &self.model.centers[new],
+            );
             for center in dirty.iter() {
                 adjust_group(state, s, center, 1);
             }
-            self.model.refresh(state, s);
+            self.model.refresh(state, s, self.backend);
         }
     }
 }
@@ -281,7 +293,7 @@ impl Evaluator for MixLiteEvaluator {
                 for key in patterns.line_keys(at) {
                     for (sum, weight) in local
                         .iter_mut()
-                        .zip(self.model.embeddings[usize::from(relative_key(key, side).0)])
+                        .zip(self.model.embeddings[feature(key, side)])
                     {
                         *sum += i32::from(weight);
                     }
@@ -289,7 +301,7 @@ impl Evaluator for MixLiteEvaluator {
                 state.preactivation[s][at.index()] = local;
                 adjust_group(&mut state, s, at, 1);
             }
-            self.model.refresh(&mut state, s);
+            self.model.refresh(&mut state, s, self.backend);
         }
         state
     }
@@ -337,7 +349,7 @@ mod tests {
     fn fixture() -> (MixLiteEvaluator, Vec<u8>) {
         let mut bytes = vec![0; FILE_BYTES];
         bytes[..8].copy_from_slice(b"RMLPV003");
-        bytes[8..20].copy_from_slice(&[3, 0, 3, 0, 0, 0, 1, 0, 32, 0, 2, 0]);
+        bytes[8..20].copy_from_slice(&[3, 0, 4, 0, 0, 0, 1, 0, 32, 0, 2, 0]);
         for (at, value) in [(20, 16i32), (24, 64), (28, 500)] {
             bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
         }
@@ -361,6 +373,153 @@ mod tests {
             MixLiteEvaluator::new(Arc::new(MixLiteModel::read_from(&mut &bytes[..]).unwrap())),
             bytes,
         )
+    }
+    #[test]
+    fn v3_simd_matches_scalar_initialization_make_unmake_and_heads() {
+        let Some(avx) = rustmoku_simd::Backend::avx2() else {
+            return;
+        };
+        let (fixture, original) = fixture();
+        for extreme in [false, true] {
+            let mut bytes = original.clone();
+            if extreme {
+                for (i, byte) in bytes[HEADER..HEADER + BYTE_WEIGHTS].iter_mut().enumerate() {
+                    *byte = if i % 3 == 0 { 128 } else { 127 };
+                }
+                for (i, pair) in bytes[HEADER + BYTE_WEIGHTS + CONTEXT * 4..]
+                    .as_chunks_mut::<2>()
+                    .0
+                    .iter_mut()
+                    .enumerate()
+                {
+                    *pair = if i % 2 == 0 { i16::MIN } else { i16::MAX }.to_le_bytes();
+                }
+            }
+            let model = if extreme {
+                Arc::new(MixLiteModel::read_from(&mut &bytes[..]).unwrap())
+            } else {
+                fixture.model.clone()
+            };
+            let scalar =
+                MixLiteEvaluator::new(model.clone()).with_backend(rustmoku_simd::Backend::SCALAR);
+            let vector = MixLiteEvaluator::new(model).with_backend(avx);
+            let mut board = crate::board_state::BoardState::new(&Position::default());
+            let mut a = scalar.initialize(board.position(), board.patterns());
+            let mut b = vector.initialize(board.position(), board.patterns());
+            assert_eq!(a, b);
+            let mut undos = Vec::new();
+            for i in [0, 224, 14, 210, 112, 113, 96, 128] {
+                let undo = board.make_move(Move::from_index(i).unwrap()).unwrap();
+                scalar.make_move(&mut a, &undo.pattern_delta());
+                vector.make_move(&mut b, &undo.pattern_delta());
+                assert_eq!(a, b);
+                for at in [1, 13, 111, 223] {
+                    let at = Move::from_index(at).unwrap();
+                    assert_eq!(
+                        scalar.policy_score(board.position(), board.patterns(), &a, at),
+                        vector.policy_score(board.position(), board.patterns(), &b, at)
+                    );
+                }
+                undos.push(undo);
+            }
+            while let Some(undo) = undos.pop() {
+                scalar.unmake_move(&mut a, &undo.pattern_delta(), ());
+                vector.unmake_move(&mut b, &undo.pattern_delta(), ());
+                board.unmake_move(undo);
+                assert_eq!(a, b);
+            }
+            assert_eq!(a, scalar.initialize(board.position(), board.patterns()));
+        }
+    }
+
+    #[test]
+    #[ignore = "explicit short release microbenchmark only"]
+    fn v3_micro_smoke() {
+        use std::{hint::black_box, time::Instant};
+        let (base, _) = fixture();
+        let position = Position::default();
+        let patterns = PatternState::new(&position);
+        let mut board = crate::board_state::BoardState::new(&position);
+        let delta = board.make_move(Move::CENTER).unwrap().pattern_delta();
+        for backend in [
+            rustmoku_simd::Backend::SCALAR,
+            rustmoku_simd::Backend::detect(),
+        ] {
+            let evaluator = base.clone().with_backend(backend);
+            let mut state = evaluator.initialize(&position, &patterns);
+            let start = Instant::now();
+            for _ in 0..1000 {
+                evaluator.make_move(black_box(&mut state), black_box(&delta));
+                evaluator.unmake_move(black_box(&mut state), black_box(&delta), ());
+            }
+            let update = start.elapsed().as_nanos() / 2000;
+            let start = Instant::now();
+            for _ in 0..10000 {
+                black_box(evaluator.evaluate(black_box(&position), &patterns, black_box(&state)));
+            }
+            let value = start.elapsed().as_nanos() / 10000;
+            let start = Instant::now();
+            for _ in 0..10000 {
+                black_box(evaluator.policy_score(
+                    black_box(&position),
+                    &patterns,
+                    black_box(&state),
+                    Move::CENTER,
+                ));
+            }
+            let policy = start.elapsed().as_nanos() / 10000;
+            println!(
+                "{} ns/update={} ns/value={} ns/policy={} bytes/state={}",
+                backend.name(),
+                update,
+                value,
+                policy,
+                std::mem::size_of::<MixLiteState>()
+                    + std::mem::size_of_val(state.preactivation.as_ref())
+            );
+        }
+    }
+
+    #[test]
+    fn v3_d4_value_and_policy_are_structurally_symmetric() {
+        let (evaluator, mut bytes) = fixture();
+        bytes[10] = 3;
+        assert!(MixLiteModel::read_from(&mut &bytes[..]).is_err());
+        let transform = |at: Move, symmetry: usize| {
+            let (mut r, mut c) = (at.row(), at.column());
+            if symmetry >= 4 {
+                c = 14 - c;
+            }
+            for _ in 0..symmetry % 4 {
+                (r, c) = (c, 14 - r);
+            }
+            Move::from_index(r * 15 + c).unwrap()
+        };
+        let sequence = [0, 14, 17, 95, 111, 167, 224];
+        let mut original = Position::default();
+        for i in sequence {
+            original.make_move(Move::from_index(i).unwrap()).unwrap();
+        }
+        for symmetry in 0..8 {
+            let mut position = Position::default();
+            for i in sequence {
+                position
+                    .make_move(transform(Move::from_index(i).unwrap(), symmetry))
+                    .unwrap();
+            }
+            assert_eq!(
+                evaluator.evaluate_position(&original),
+                evaluator.evaluate_position(&position)
+            );
+            assert_eq!(evaluator.wdl_for(&original), evaluator.wdl_for(&position));
+            for i in [1, 13, 16, 112, 223] {
+                let at = Move::from_index(i).unwrap();
+                assert_eq!(
+                    evaluator.policy_for(&original, at),
+                    evaluator.policy_for(&position, transform(at, symmetry))
+                );
+            }
+        }
     }
     #[test]
     fn v3_incremental_scalar_matches_rebuild_and_null_restores() {

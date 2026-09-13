@@ -284,10 +284,15 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
         let mut best_score = -SEARCH_INFINITY;
         let (previous, two_back) = resources.heuristics.previous_moves(ply);
         let policy_ranks = (PVS
-            && (self.profile.policy_lmr() || research.policy_pruning)
+            && (self.profile.policy_lmr() || research.policy_pruning || research.lmr_v2)
             && scout_node
             && forced_block.is_none())
         .then(|| PolicyRanks::new(state, self.evaluator, &moves));
+        let policy_protected = if research.policy_pruning {
+            state.critical_dependencies()
+        } else {
+            crate::bitboard::BitBoard256::EMPTY
+        };
         let mut searched_quiets = MoveList::new();
         for (index, at) in moves.iter().enumerate() {
             let quiet = SearchHeuristics::is_quiet(state.patterns(), side, at);
@@ -303,6 +308,7 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
                 && quiet_for_experiments
                 && self.domain == SearchDomain::Normal
                 && late_quiet
+                && super::selectivity::policy_candidate_unprotected(at, policy_protected)
                 && proof_hint != Some(at)
                 && searched_depth <= research.policy_max_depth
                 && policy_ranks.as_ref().is_some_and(|ranks| {
@@ -370,31 +376,53 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
                 && proof_hint != Some(at)
                 && extension == 0
             {
-                resources.heuristics.adaptive_lmr_reduction(
-                    searched_depth,
-                    index,
-                    side,
-                    at,
-                    ply,
-                    previous,
-                    two_back,
-                    state.patterns(),
-                )
+                if research.lmr_v2 {
+                    if resources.heuristics.lmr_eligible(
+                        searched_depth,
+                        index,
+                        side,
+                        at,
+                        ply,
+                        previous,
+                        two_back,
+                        state.patterns(),
+                    ) {
+                        let base = super::selectivity::lmr_v2(
+                            searched_depth,
+                            index,
+                            resources.heuristics.cut_node(ply),
+                            improving,
+                            research,
+                        );
+                        let history = resources
+                            .heuristics
+                            .contextual_score(side, at, previous, two_back);
+                        let adjustment = resources
+                            .heuristics
+                            .lmr_history_adjustment(history, research.lmr_cut_bonus);
+                        (i16::from(base) - adjustment).clamp(0, i16::from(child_depth)) as u8
+                    } else {
+                        0
+                    }
+                } else {
+                    resources.heuristics.adaptive_lmr_reduction(
+                        searched_depth,
+                        index,
+                        side,
+                        at,
+                        ply,
+                        previous,
+                        two_back,
+                        state.patterns(),
+                    )
+                }
             } else {
                 0
             };
-            if reduction > 0 && research.lmr_v2 {
-                reduction = super::selectivity::lmr_v2(
-                    searched_depth,
-                    index,
-                    resources.heuristics.cut_node(ply),
-                    improving,
-                    research,
-                );
-            } else if reduction > 0 && improving {
+            if !research.lmr_v2 && reduction > 0 && improving {
                 reduction = reduction.saturating_sub(research.improving_lmr_discount);
             }
-            let policy_reduced = self.profile.policy_lmr()
+            let policy_reduced = (self.profile.policy_lmr() || research.lmr_v2)
                 && reduction > 0
                 && reduction < child_depth
                 && policy_ranks
@@ -404,6 +432,8 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
                 reduction += 1;
                 resources.statistics.policy_lmr_reductions += 1;
             }
+
+            reduction = reduction.min(child_depth);
 
             resources.heuristics.set_child(
                 ply + 1,
