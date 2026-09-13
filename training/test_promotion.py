@@ -171,7 +171,7 @@ class PromotionEvidence(unittest.TestCase):
     def test_actual_champion_profile_must_be_player_b_and_failure_keeps_pointer(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            self.fixture(root)
+            self.fixture(root, kind='engine-model-profile')
             champion = root / 'champion'
             champion.mkdir()
             pointer = champion / 'champion.json'

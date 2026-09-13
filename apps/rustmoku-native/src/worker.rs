@@ -70,6 +70,10 @@ impl SearchWorker {
                                     None,
                                     Duration::ZERO,
                                     request.limits.move_time,
+                                )
+                                .with_profile(
+                                    engine.effective_search_profile(),
+                                    request.position.move_count(),
                                 ),
                                 |info| {
                                     let _ = outgoing.send(SearchEvent::Info { id, info });

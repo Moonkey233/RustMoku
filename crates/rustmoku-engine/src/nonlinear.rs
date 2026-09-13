@@ -228,6 +228,9 @@ impl NonlinearEvaluator {
 }
 
 impl Evaluator for NonlinearEvaluator {
+    fn supports_analysis_turn(&self) -> bool {
+        true
+    }
     fn model_fingerprint(&self) -> Option<[u8; 32]> {
         Some(self.model.fingerprint)
     }

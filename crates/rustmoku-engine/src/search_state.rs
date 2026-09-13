@@ -99,6 +99,16 @@ impl<E: Evaluator> SearchState<E> {
         solver.ordering_hint(&mut self.board, depth, work, budget, pv)
     }
 
+    pub(crate) fn begin_null(&mut self, evaluator: &E) -> Option<rustmoku_core::AnalysisTurnUndo> {
+        evaluator
+            .supports_analysis_turn()
+            .then(|| self.board.begin_analysis_turn().ok())
+            .flatten()
+    }
+    pub(crate) fn end_null(&mut self, undo: rustmoku_core::AnalysisTurnUndo) {
+        self.board.end_analysis_turn(undo);
+    }
+
     pub(crate) fn make_move(
         &mut self,
         at: Move,

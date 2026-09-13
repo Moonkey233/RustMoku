@@ -16,9 +16,11 @@ mod learned;
 #[cfg(test)]
 mod line_classifier;
 mod line_geometry;
+mod mixlite;
 mod move_generation;
 mod move_ordering;
 mod nonlinear;
+pub use mixlite::{MixLiteEvaluator, MixLiteModel, MixLiteState};
 /// Offline float architecture oracle; never a runtime evaluator default.
 #[cfg(feature = "experimental-v2")]
 pub mod nonlinear_reference;
@@ -69,5 +71,5 @@ pub use search::{
     SearchInfo, SearchLimits, SearchObserver, SearchOrigin, SearchResult, SearchStatistics,
 };
 pub use search_control::{CancellationToken, SearchTermination};
-pub use search_profile::{ScoreContract, SearchParameters, SearchProfile};
+pub use search_profile::{ResearchParameters, ScoreContract, SearchParameters, SearchProfile};
 pub use transposition_table::TranspositionTableStatistics;

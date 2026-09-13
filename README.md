@@ -17,11 +17,14 @@ For a bounded candidate-recall analysis in PowerShell:
 cargo run --release -p rustmoku-data -- analyze --record .\position.rmk --depth 2 --nodes 20000 --top-k 8 --candidates all-legal
 ```
 
-Analysis JSON v3 reports all legal root candidates at a common completed depth,
+Analysis JSON v4 reports all legal root candidates at a common completed depth,
 their production-radius membership, best-score recall (including ties), and
-canonical top-k recall. An unfinished first depth reports no recall. AllLegal also enumerates every legal nominal descendant; its leaf policy is
-fixed bounded Four-class quiescence. Exact means exact for that horizon/leaf
-policy, not a game-theoretic solution. These teacher scores are not proofs.
+canonical top-k recall. An unfinished first depth reports no recall. The default practical teacher compares all legal roots with production-radius-two
+nominal descendants. `--candidates reference-oracle` (legacy alias `all-legal`)
+also enumerates every nominal descendant and is for shallow oracle checks.
+`DomainExact` means exact within the declared horizon/candidate domain/leaf policy,
+not a game-theoretic solution. JSON v4 names both universes, leaf policy,
+search domain, selectivity and score reference scale.
 `--candidates production-top-k` retains the restricted ablation. Arena exposes
 `--a-root-resistance true|false` and experimental/default-off
 `--a-adaptive-root-candidates true|false` (also `--b-`); descriptions bind these
@@ -438,3 +441,17 @@ saturate safely; practical node limits are far below that numerical ceiling.
 Evaluator stays replaceable; production learned-model details are documented in
 [`docs/LEARNED_MODEL.md`](docs/LEARNED_MODEL.md), and future milestones remain in
 [`docs/ROADMAP.md`](docs/ROADMAP.md).
+
+### Current scalar research interfaces
+
+Search internals are separated under `crates/rustmoku-engine/src/search/`.
+`RMPROFILE3` adds validated named experimental parameters while retaining V1/V2
+parsers. LMR V2, improving, IID, verified guarded Null Move, policy pruning,
+Competitive TT and extended Three qsearch remain opt-in. Stronger singular
+variants are deferred; statistical ProbCut needs independent qualified buckets.
+
+MixLite V3 (`RMLPV003`) is supported by RuntimeEvaluator, Native, Data and Arena
+model loading. Its scalar 32-lane local mapping feeds cached coarse/global
+context, WDL/value and contextual policy. V1/V2 remain readable. The bounded
+standalone pipeline is documented in [training/README.md](training/README.md).
+No playing-strength result or default evaluator change follows from its smoke tests.

@@ -21,6 +21,12 @@ pub(crate) const EVALUATION_LIMIT: i32 = 10_000_000;
 /// associated `State`; both associated values must therefore be movable into a
 /// worker thread.
 pub trait Evaluator: Sync {
+    /// Opt-in contract: state is independent of side-to-move and evaluation
+    /// selects the current view from Position. Custom evaluators fail closed.
+    fn supports_analysis_turn(&self) -> bool {
+        false
+    }
+
     fn score_contract(&self) -> crate::ScoreContract {
         crate::ScoreContract::Pattern
     }
@@ -59,6 +65,9 @@ pub trait Evaluator: Sync {
 pub struct ClassicalEvaluator;
 
 impl Evaluator for ClassicalEvaluator {
+    fn supports_analysis_turn(&self) -> bool {
+        true
+    }
     type State = ();
     type Undo = ();
 
@@ -84,6 +93,9 @@ const PATTERN_WEIGHTS: [i32; ThreatProfile::COUNT] = [
 ];
 
 impl Evaluator for PatternEvaluator {
+    fn supports_analysis_turn(&self) -> bool {
+        true
+    }
     fn model_fingerprint(&self) -> Option<[u8; 32]> {
         Some(*b"RustMoku-Pattern-weights-v1.....")
     }

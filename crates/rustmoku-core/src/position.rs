@@ -22,6 +22,15 @@ pub struct MoveUndo {
     previous_winner: Option<Stone>,
 }
 
+/// Opaque undo for an analysis-only turn change. This is not a played Move,
+/// is never recorded by Game, and must be restored after all child moves.
+#[derive(Debug)]
+pub struct AnalysisTurnUndo {
+    side: Stone,
+    count: usize,
+    last: Option<Move>,
+}
+
 impl Position {
     #[must_use]
     pub const fn new(rules: RuleSet) -> Self {
@@ -68,6 +77,40 @@ impl Position {
     #[must_use]
     pub const fn is_full(&self) -> bool {
         self.move_count == CELL_COUNT
+    }
+
+    /// Temporarily selects the opponent for hypothetical analysis, without a
+    /// stone, history entry or change to terminal status. This state is not a
+    /// reachable game record. Callers must isolate all derived evidence and
+    /// restore in strict LIFO order. Game deliberately exposes no such operation.
+    pub fn begin_analysis_opponent_turn(&mut self) -> Result<AnalysisTurnUndo, MoveError> {
+        if self.winner.is_some() || self.is_full() {
+            return Err(MoveError::GameOver);
+        }
+        let undo = AnalysisTurnUndo {
+            side: self.side_to_move,
+            count: self.move_count,
+            last: self.last_move,
+        };
+        self.side_to_move = self.side_to_move.opponent();
+        Ok(undo)
+    }
+    /// Restores a hypothetical turn after every child has been unmade.
+    pub fn end_analysis_opponent_turn(&mut self, undo: AnalysisTurnUndo) {
+        assert_eq!(
+            self.move_count, undo.count,
+            "analysis children must be unmade"
+        );
+        assert_eq!(
+            self.last_move, undo.last,
+            "analysis children must be unmade"
+        );
+        assert_eq!(
+            self.side_to_move,
+            undo.side.opponent(),
+            "analysis turn LIFO"
+        );
+        self.side_to_move = undo.side;
     }
 
     /// Applies one legal move and returns the only token that can restore it.
@@ -201,5 +244,25 @@ impl Position {
 impl Default for Position {
     fn default() -> Self {
         Self::new(RuleSet::Freestyle)
+    }
+}
+
+#[cfg(test)]
+mod analysis_turn_tests {
+    use super::*;
+    #[test]
+    fn hypothetical_turn_is_not_a_move_and_real_children_restore() {
+        let mut p = Position::default();
+        p.make_move(Move::CENTER).unwrap();
+        let original = p.clone();
+        let turn = p.begin_analysis_opponent_turn().unwrap();
+        assert_eq!(p.move_count(), original.move_count());
+        assert_eq!(p.last_move(), original.last_move());
+        let at = Move::from_index(0).unwrap();
+        let child = p.make_move(at).unwrap();
+        assert_eq!(p.cell(at), Some(Stone::Black));
+        p.unmake_move(child);
+        p.end_analysis_opponent_turn(turn);
+        assert_eq!(p, original);
     }
 }

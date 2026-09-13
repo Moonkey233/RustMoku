@@ -324,8 +324,8 @@ fn public_probcut_is_bound_to_model_and_profile() {
         max_shallow: 10_000_000,
         intercept: 1000,
         tail: 0,
-        training_samples: 64,
-        heldout_samples: 32,
+        training_samples: 512,
+        heldout_samples: 2995,
         heldout_false_cuts: 0,
     };
     // A deliberately biased fixture stresses the TT firewall; it is not an
@@ -464,4 +464,282 @@ fn public_singular_extension_has_a_verified_alternative_search() {
     }
     assert!(attempts > 0);
     assert!(extensions > 0);
+}
+
+#[test]
+fn practical_teacher_and_oracle_declare_distinct_descendant_domains() {
+    let p = position(&[112, 113]);
+    let engine = AlphaBetaEngine::with_config(Ranked, base());
+    let before = engine.transposition_table_statistics();
+    for universe in [
+        crate::TeacherCandidates::Practical,
+        crate::TeacherCandidates::AllLegal,
+    ] {
+        let result = engine
+            .analyze_root_with_candidates(
+                &p,
+                SearchLimits::new(2).with_max_nodes(200_000),
+                2,
+                universe,
+                CancellationToken::new(),
+            )
+            .unwrap();
+        assert_eq!(result.candidates.len(), 223);
+        assert_eq!(result.completed_depth, 2);
+        assert!(
+            result
+                .candidates
+                .iter()
+                .all(|c| c.bound == CandidateBound::DomainExact)
+        );
+        assert_eq!(result.universe.root_universe(), "all-legal");
+        assert_eq!(
+            result.universe.descendant_universe(),
+            if universe == crate::TeacherCandidates::Practical {
+                "production-radius-two"
+            } else {
+                "all-legal"
+            }
+        );
+    }
+    assert_eq!(before, engine.transposition_table_statistics());
+    assert_eq!(
+        engine
+            .analyze_root(
+                &p,
+                SearchLimits::new(1).with_max_nodes(1000),
+                2,
+                CancellationToken::new()
+            )
+            .unwrap()
+            .universe,
+        crate::TeacherCandidates::Practical
+    );
+}
+
+#[test]
+fn iid_is_ordering_only_and_restores_state_on_budget_stop() {
+    let p = position(&[112, 97, 128, 113]);
+    let engine = AlphaBetaEngine::with_config(Ranked, base());
+    let mut context = engine.ab_context();
+    context.profile = context
+        .profile
+        .with_research(crate::ResearchParameters {
+            iid: true,
+            ..crate::ResearchParameters::OFF
+        })
+        .unwrap();
+    for cap in [1, 10_000] {
+        let mut state = SearchState::new(&p, &Ranked);
+        let mut stats = SearchStatistics::default();
+        let mut pv = PvTable::new();
+        pv.update(0, Move::CENTER);
+        let before_pv = pv.root_line().to_vec();
+        let mut resources = SearchResources {
+            seldepth: &mut 0,
+            pv: &mut pv,
+            statistics: &mut stats,
+            heuristics: SearchHeuristics::default(),
+            interior_proof: None,
+            analysis: Some(AnalysisScratch::new()),
+            budget: &mut SearchBudget::new(
+                SearchLimits::new(6).with_max_nodes(cap),
+                CancellationToken::new(),
+            ),
+        };
+        let result = context.iid_move(&mut state, 6, 1, &mut resources);
+        assert!(resources.analysis.is_some());
+        assert_eq!(resources.pv.root_line(), before_pv);
+        if cap == 1 {
+            assert!(result.is_err());
+        } else {
+            assert!(p.is_legal(result.unwrap().unwrap()));
+        }
+        assert_eq!(stats.tt_probes + stats.tt_stores, 0);
+        state.assert_consistent(&Ranked);
+        assert_eq!(state.position(), &p);
+    }
+}
+
+#[test]
+fn lmr_v2_surface_is_bounded_and_improving_uses_same_side_history() {
+    let p = crate::ResearchParameters {
+        lmr_v2: true,
+        improving: true,
+        ..crate::ResearchParameters::OFF
+    };
+    for depth in 1..=40 {
+        let mut previous = 0;
+        for index in 0..225 {
+            let r = super::selectivity::lmr_v2(depth, index, false, false, p);
+            assert!(r < depth && r >= previous);
+            assert!(super::selectivity::lmr_v2(depth, index, false, true, p) <= r);
+            previous = r;
+        }
+    }
+    let mut h = SearchHeuristics::default();
+    h.set_static_eval(0, 10);
+    h.set_static_eval(1, 500);
+    h.set_static_eval(2, 20);
+    assert!(h.improving(2));
+    h.begin_node(2);
+    assert!(!h.improving(2));
+    h.set_static_eval(2, MATE_SCORE);
+    assert!(!h.improving(2));
+}
+
+#[test]
+fn guarded_null_verifies_real_position_and_never_publishes_authority() {
+    struct BlackScore;
+    impl Evaluator for BlackScore {
+        type State = ();
+        type Undo = ();
+        fn supports_analysis_turn(&self) -> bool {
+            true
+        }
+        fn initialize(&self, _: &Position, _: &PatternState) {}
+        fn make_move(&self, _: &mut (), _: &PatternDelta) {}
+        fn unmake_move(&self, _: &mut (), _: &PatternDelta, _: ()) {}
+        fn evaluate(&self, p: &Position, _: &PatternState, _: &()) -> i32 {
+            if p.side_to_move() == rustmoku_core::Stone::Black {
+                90000
+            } else {
+                -90000
+            }
+        }
+    }
+    let p = position(&[112, 113]);
+    let engine = AlphaBetaEngine::with_config(BlackScore, base());
+    for (enabled, cap) in [(true, 1), (true, 20000), (false, 20000)] {
+        let mut context = engine.ab_context();
+        context.selectivity = SelectivityConfig::OFF;
+        context.profile = context
+            .profile
+            .with_research(crate::ResearchParameters {
+                null_move: enabled,
+                null_min_depth: 4,
+                null_reduction: 2,
+                ..crate::ResearchParameters::OFF
+            })
+            .unwrap();
+        let mut state = SearchState::new(&p, &BlackScore);
+        let mut stats = SearchStatistics::default();
+        let result = context.negamax::<true>(
+            &mut state,
+            4,
+            999,
+            1000,
+            0,
+            &mut SearchResources {
+                seldepth: &mut 0,
+                pv: &mut PvTable::new(),
+                statistics: &mut stats,
+                heuristics: SearchHeuristics::default(),
+                interior_proof: None,
+                analysis: Some(AnalysisScratch::new()),
+                budget: &mut SearchBudget::new(
+                    SearchLimits::new(4).with_max_nodes(cap),
+                    CancellationToken::new(),
+                ),
+            },
+        );
+        state.assert_consistent(&BlackScore);
+        assert_eq!(state.position(), &p);
+        if cap == 1 {
+            assert!(result.is_err());
+        } else if enabled {
+            let value = result.unwrap();
+            assert_eq!(value.validity, BoundValidity::UNVERIFIED);
+            assert!(
+                stats.null_attempts > 0 && stats.null_verifications > 0 && stats.null_cutoffs > 0
+            );
+            assert_eq!(stats.tt_stores, 0);
+        } else {
+            assert_eq!(stats.null_attempts, 0);
+        }
+    }
+}
+
+#[test]
+fn research_pruning_and_competitive_tt_keep_separate_authority_domains() {
+    let p = position(&[112, 113]);
+    let engine = AlphaBetaEngine::with_config(Ranked, base());
+    for depth in [2, 4] {
+        let mut context = engine.ab_context();
+        context.selectivity = SelectivityConfig {
+            lmr: depth == 4,
+            ..SelectivityConfig::OFF
+        };
+        context.profile = context
+            .profile
+            .with_research(crate::ResearchParameters {
+                policy_pruning: depth == 2,
+                lmr_v2: depth == 4,
+                ..crate::ResearchParameters::OFF
+            })
+            .unwrap();
+        let mut state = SearchState::new(&p, &Ranked);
+        let mut stats = SearchStatistics::default();
+        let result = context
+            .negamax::<true>(
+                &mut state,
+                depth,
+                0,
+                1,
+                0,
+                &mut SearchResources {
+                    seldepth: &mut 0,
+                    pv: &mut PvTable::new(),
+                    statistics: &mut stats,
+                    heuristics: SearchHeuristics::default(),
+                    interior_proof: None,
+                    analysis: None,
+                    budget: &mut SearchBudget::default(),
+                },
+            )
+            .unwrap();
+        assert!(!result.validity.supports(Bound::Upper));
+        if depth == 2 {
+            assert!(stats.policy_pruned_moves > 0);
+        } else {
+            assert!(stats.lmr_reductions > 0);
+        }
+        state.assert_consistent(&Ranked);
+    }
+    let state = SearchState::new(&p, &Ranked);
+    engine.table.store_with_outcome(TtEntry::new(
+        state.key().value(),
+        123,
+        Some(Move::from_index(0).unwrap()),
+        5,
+        Bound::Exact,
+        0,
+    ));
+    let mut context = engine.ab_context();
+    assert_eq!(
+        context
+            .probe_tt(&state, 3, -500, 500, 0, &mut SearchStatistics::default())
+            .cutoff_score,
+        None
+    );
+    context.profile = context
+        .profile
+        .with_research(crate::ResearchParameters {
+            competitive_tt: true,
+            ..crate::ResearchParameters::OFF
+        })
+        .unwrap();
+    assert_eq!(
+        context
+            .probe_tt(&state, 3, -500, 500, 0, &mut SearchStatistics::default())
+            .cutoff_score,
+        Some(123)
+    );
+    context.domain = SearchDomain::Analysis;
+    assert_eq!(
+        context
+            .probe_tt(&state, 3, -500, 500, 0, &mut SearchStatistics::default())
+            .cutoff_score,
+        None
+    );
 }

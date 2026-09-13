@@ -4,12 +4,12 @@ from probcut import fit_bucket
 
 class ProbCutTests(unittest.TestCase):
     def test_empirical_fit_and_heldout_failure_are_separate(self):
-        training = [dict(shallow=i, deep=2*i+7) for i in range(-40, 40)]
-        heldout = [dict(shallow=i, deep=2*i+7) for i in range(-16, 16)]
+        training = [dict(shallow=i, deep=2*i+7) for i in range(-2048, 2048)]
+        heldout = [dict(shallow=i, deep=2*i+7) for i in range(-1500, 1500)]
         bucket, report = fit_bucket(training, heldout, 3, 1, 0)
         self.assertEqual(report['status'], 'accepted')
         self.assertEqual(bucket[3:5], [131072, 7])
-        self.assertGreater(report['zero_failure_rate_95pct_upper'], .08)
+        self.assertLess(report['zero_failure_rate_95pct_upper'], .001)
         heldout[0]['deep'] -= 100
         rejected, report = fit_bucket(training, heldout, 3, 1, 0)
         self.assertIsNone(rejected)

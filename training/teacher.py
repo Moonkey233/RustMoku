@@ -8,6 +8,26 @@ def comparison(analysis, temperature):
         raise ValueError('temperature must be finite and positive')
     if analysis.get('perspective') != 'root-side-to-move':
         raise ValueError('unsupported score perspective')
+    version = analysis.get('version', 0)
+    if version not in (0, 1, 2, 3, 4):
+        raise ValueError('unsupported teacher version')
+    if version == 4:
+        if (analysis.get('root_universe') not in ('all-legal', 'production-top-k')
+                or analysis.get('descendant_universe') not in ('all-legal', 'production-radius-two')
+                or analysis.get('leaf_policy') != 'four-q6-immediate-v1'
+                or analysis.get('search_domain') not in ('distillation', 'reference-oracle', 'production-ablation')
+                or analysis.get('selectivity') != 'candidate-domain-only-no-depth-pruning'):
+            raise ValueError('unsupported teacher search domain')
+        expected = {'distillation': ('all-legal', 'production-radius-two'),
+                    'reference-oracle': ('all-legal', 'all-legal'),
+                    'production-ablation': ('production-top-k', 'production-radius-two')}
+        if (analysis['root_universe'], analysis['descendant_universe']) != expected[analysis['search_domain']]:
+            raise ValueError('inconsistent teacher search domain')
+    reference_temperature = temperature
+    scale = analysis.get('score_reference_scale', 10000)
+    if type(scale) is not int or not 1 <= scale <= 10_000_000:
+        raise ValueError('invalid teacher score scale')
+    temperature *= scale / 10000
     depth = analysis['completed_depth']
     accepted = []
     seen = set()
@@ -18,7 +38,7 @@ def comparison(analysis, temperature):
         seen.add(at)
         if (depth > 0 and candidate['completed_depth'] == depth
                 and candidate['nominal_depth_valid'] is True
-                and candidate['bound'] == 'Exact'
+                and candidate['bound'] == ('DomainExact' if version == 4 else 'Exact')
                 and candidate['source'] == 'AlphaBeta'
                 and type(candidate['score']) is int
                 and abs(candidate['score']) <= 10_000_000):
@@ -28,7 +48,9 @@ def comparison(analysis, temperature):
     maximum = max(score for _, score in accepted)
     weights = [math.exp((score - maximum) / temperature) for _, score in accepted]
     total = sum(weights)
-    return {'version': 1, 'depth': depth, 'temperature': temperature,
+    return {'search_metadata': {key: analysis.get(key, 'legacy-unspecified') for key in
+            ('root_universe', 'descendant_universe', 'leaf_policy', 'search_domain', 'selectivity')},
+            'version': 1, 'depth': depth, 'temperature': temperature, 'reference_temperature': reference_temperature,
             'moves': [at for at, _ in accepted], 'scores': [score for _, score in accepted],
             'probabilities': [weight / total for weight in weights]}
 

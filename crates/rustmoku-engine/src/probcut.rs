@@ -29,8 +29,8 @@ impl ProbCutBucket {
             && self.min_shallow >= -10_000_000
             && self.max_shallow <= 10_000_000
             && self.min_shallow < self.max_shallow
-            && self.training_samples >= 64
-            && self.heldout_samples >= 32
+            && self.training_samples >= 512
+            && self.heldout_samples >= 2995
             && self.heldout_false_cuts == 0
     }
     pub(crate) fn lower_prediction(self, shallow_score: i32) -> i64 {
@@ -56,7 +56,7 @@ impl ProbCutCalibration {
     ) -> Result<Self, &'static str> {
         if buckets.is_empty() || buckets.len() > 16 || buckets.iter().any(|b| !b.valid()) {
             return Err(
-                "ProbCut requires 1..16 validated buckets with >=64 training and >=32 heldout samples and zero heldout false cuts",
+                "ProbCut requires 1..16 validated buckets with >=512 training and >=2995 independent heldout samples and zero false cuts (one-sided 95% upper <0.001)",
             );
         }
         let mut result = Self {
@@ -111,7 +111,7 @@ impl std::str::FromStr for ProbCutCalibration {
             return Err("ProbCut calibration exceeds 8192 bytes");
         }
         let mut lines = text.lines();
-        if lines.next() != Some("RMPROBCUT1") {
+        if !matches!(lines.next(), Some("RMPROBCUT1" | "RMPROBCUT2")) {
             return Err("unsupported ProbCut calibration version");
         }
         let hex = lines.next().ok_or("missing model fingerprint")?;
@@ -178,7 +178,7 @@ impl std::str::FromStr for ProbCutCalibration {
 
 impl std::fmt::Display for ProbCutCalibration {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "RMPROBCUT1")?;
+        writeln!(f, "RMPROBCUT2")?;
         for byte in self.model {
             write!(f, "{byte:02x}")?;
         }

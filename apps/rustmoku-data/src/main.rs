@@ -149,11 +149,17 @@ fn analyze_record(mut args: Arguments) -> Result<(), Box<dyn Error>> {
     let universe = match args
         .optional::<String>("--candidates")?
         .as_deref()
-        .unwrap_or("all-legal")
+        .unwrap_or("practical")
     {
-        "all-legal" => rustmoku_engine::TeacherCandidates::AllLegal,
+        "practical" => rustmoku_engine::TeacherCandidates::Practical,
+        "all-legal" | "reference-oracle" => rustmoku_engine::TeacherCandidates::AllLegal,
         "production-top-k" => rustmoku_engine::TeacherCandidates::ProductionTopK,
-        _ => return Err("candidates must be all-legal or production-top-k".into()),
+        _ => {
+            return Err(
+                "candidates must be practical, reference-oracle, all-legal or production-top-k"
+                    .into(),
+            );
+        }
     };
     let model: Option<PathBuf> = args.optional("--model")?;
     let profile: Option<rustmoku_engine::SearchProfile> = args
@@ -222,7 +228,7 @@ fn analysis_json(
         .map(|b| format!("{b:02x}"))
         .collect::<String>();
     let production = rustmoku_engine::ProductionCandidateUniverse::new(game.position());
-    let recall = if result.universe == rustmoku_engine::TeacherCandidates::AllLegal
+    let recall = if result.universe != rustmoku_engine::TeacherCandidates::ProductionTopK
         && result.completed_depth > 0
     {
         let mut ranked: Vec<_> = result.candidates.iter().collect();
@@ -256,7 +262,7 @@ fn analysis_json(
             candidate.nominal_depth_valid, candidate.source, candidate.termination, candidate.work, production.contains(candidate.at))
     }).collect::<Vec<_>>().join(",");
     format!(
-        r#"{{"version":3,"position_key":"{}","perspective":"root-side-to-move","requested_depth":{},"completed_depth":{},"termination":"{:?}","work":{},"budget":{},"candidates":[{}],"candidate_universe":"{:?}","leaf_policy":"four-q6-immediate-v1","production_recall":{}}}"#,
+        r#"{{"version":4,"position_key":"{}","perspective":"root-side-to-move","requested_depth":{},"completed_depth":{},"termination":"{:?}","work":{},"budget":{},"candidates":[{}],"candidate_universe":"{:?}","root_universe":"{}","descendant_universe":"{}","leaf_policy":"four-q6-immediate-v1","search_domain":"{}","selectivity":"candidate-domain-only-no-depth-pruning","score_reference_scale":{},"production_recall":{}}}"#,
         key,
         depth,
         result.completed_depth,
@@ -265,6 +271,10 @@ fn analysis_json(
         nodes,
         candidates,
         result.universe,
+        result.universe.root_universe(),
+        result.universe.descendant_universe(),
+        result.universe.search_domain(),
+        result.score_contract.reference_scale(),
         recall
     )
 }
@@ -560,7 +570,7 @@ fn near_optimal_move(
         .candidates
         .iter()
         .filter(|candidate| {
-            candidate.bound == rustmoku_engine::CandidateBound::Exact
+            candidate.bound == rustmoku_engine::CandidateBound::DomainExact
                 && candidate.nominal_depth_valid
                 && candidate.completed_depth == analysis.completed_depth
                 && candidate.completed_depth > 0
@@ -578,6 +588,7 @@ fn near_optimal_move(
     else {
         return fallback;
     };
+    let temperature = temperature * f64::from(analysis.score_contract.reference_scale()) / 10_000.0;
     let weights: Vec<_> = candidates
         .iter()
         .map(|candidate| {

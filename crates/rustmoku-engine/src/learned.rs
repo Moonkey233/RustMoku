@@ -330,6 +330,9 @@ impl LearnedEvaluator {
 }
 
 impl Evaluator for LearnedEvaluator {
+    fn supports_analysis_turn(&self) -> bool {
+        true
+    }
     fn model_fingerprint(&self) -> Option<[u8; 32]> {
         Some(self.model.fingerprint)
     }
@@ -384,6 +387,7 @@ pub enum RuntimeEvaluator {
     Pattern,
     Learned(LearnedEvaluator),
     Nonlinear(crate::NonlinearEvaluator),
+    MixLite(crate::MixLiteEvaluator),
 }
 
 impl RuntimeEvaluator {
@@ -394,6 +398,7 @@ impl RuntimeEvaluator {
             Self::Pattern => "pattern",
             Self::Learned(_) => "line-value-policy-v1",
             Self::Nonlinear(_) => "local-nonlinear-v2",
+            Self::MixLite(_) => "mixlite-v3",
         }
     }
 
@@ -403,6 +408,7 @@ impl RuntimeEvaluator {
             Self::Pattern => None,
             Self::Learned(_) => Some(1),
             Self::Nonlinear(_) => Some(2),
+            Self::MixLite(_) => Some(3),
         }
     }
 
@@ -421,6 +427,9 @@ impl RuntimeEvaluator {
         match bytes.get(..8) {
             Some(b"RMLPV001") => Ok(Self::Learned(LearnedEvaluator::new(Arc::new(
                 LearnedModel::read_from(&mut &*bytes)?,
+            )))),
+            Some(b"RMLPV003") => Ok(Self::MixLite(crate::MixLiteEvaluator::new(Arc::new(
+                crate::MixLiteModel::read_from(&mut &*bytes)?,
             )))),
             Some(b"RMLPV002") => Ok(Self::Nonlinear(crate::NonlinearEvaluator::new(Arc::new(
                 crate::NonlinearModel::read_from(&mut &*bytes)?,
@@ -451,20 +460,26 @@ pub enum RuntimeEvaluatorState {
     Pattern,
     Learned(LearnedState),
     Nonlinear(crate::NonlinearState),
+    MixLite(Box<crate::MixLiteState>),
 }
 
 pub enum RuntimeEvaluatorUndo {
     Pattern,
     Learned,
     Nonlinear,
+    MixLite,
 }
 
 impl Evaluator for RuntimeEvaluator {
+    fn supports_analysis_turn(&self) -> bool {
+        true
+    }
     fn model_fingerprint(&self) -> Option<[u8; 32]> {
         match self {
             Self::Pattern => crate::PatternEvaluator.model_fingerprint(),
             Self::Learned(evaluator) => evaluator.model_fingerprint(),
             Self::Nonlinear(evaluator) => evaluator.model_fingerprint(),
+            Self::MixLite(evaluator) => evaluator.model_fingerprint(),
         }
     }
     fn score_contract(&self) -> crate::ScoreContract {
@@ -472,6 +487,7 @@ impl Evaluator for RuntimeEvaluator {
             Self::Pattern => crate::ScoreContract::Pattern,
             Self::Learned(evaluator) => evaluator.score_contract(),
             Self::Nonlinear(evaluator) => evaluator.score_contract(),
+            Self::MixLite(evaluator) => evaluator.score_contract(),
         }
     }
     type State = RuntimeEvaluatorState;
@@ -486,6 +502,9 @@ impl Evaluator for RuntimeEvaluator {
             Self::Nonlinear(evaluator) => {
                 RuntimeEvaluatorState::Nonlinear(evaluator.initialize(position, patterns))
             }
+            Self::MixLite(evaluator) => {
+                RuntimeEvaluatorState::MixLite(Box::new(evaluator.initialize(position, patterns)))
+            }
         }
     }
 
@@ -499,6 +518,10 @@ impl Evaluator for RuntimeEvaluator {
             (Self::Nonlinear(evaluator), RuntimeEvaluatorState::Nonlinear(state)) => {
                 evaluator.make_move(state, delta);
                 RuntimeEvaluatorUndo::Nonlinear
+            }
+            (Self::MixLite(evaluator), RuntimeEvaluatorState::MixLite(state)) => {
+                evaluator.make_move(state, delta);
+                RuntimeEvaluatorUndo::MixLite
             }
             _ => panic!("runtime evaluator state must match its immutable definition"),
         }
@@ -517,6 +540,11 @@ impl Evaluator for RuntimeEvaluator {
                 RuntimeEvaluatorState::Nonlinear(state),
                 RuntimeEvaluatorUndo::Nonlinear,
             ) => evaluator.unmake_move(state, delta, ()),
+            (
+                Self::MixLite(evaluator),
+                RuntimeEvaluatorState::MixLite(state),
+                RuntimeEvaluatorUndo::MixLite,
+            ) => evaluator.unmake_move(state, delta, ()),
             _ => panic!("runtime evaluator undo must match its immutable definition"),
         }
     }
@@ -530,6 +558,9 @@ impl Evaluator for RuntimeEvaluator {
                 evaluator.evaluate(position, patterns, state)
             }
             (Self::Nonlinear(evaluator), RuntimeEvaluatorState::Nonlinear(state)) => {
+                evaluator.evaluate(position, patterns, state)
+            }
+            (Self::MixLite(evaluator), RuntimeEvaluatorState::MixLite(state)) => {
                 evaluator.evaluate(position, patterns, state)
             }
             _ => panic!("runtime evaluator state must match its immutable definition"),
@@ -549,6 +580,9 @@ impl Evaluator for RuntimeEvaluator {
                 evaluator.policy_score(position, patterns, state, at)
             }
             (Self::Nonlinear(evaluator), RuntimeEvaluatorState::Nonlinear(state)) => {
+                evaluator.policy_score(position, patterns, state, at)
+            }
+            (Self::MixLite(evaluator), RuntimeEvaluatorState::MixLite(state)) => {
                 evaluator.policy_score(position, patterns, state, at)
             }
             _ => panic!("runtime evaluator state must match its immutable definition"),

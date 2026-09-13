@@ -489,6 +489,9 @@ def read_quantized_model(path: str | os.PathLike[str]) -> QuantizedModel:
     if size > MAX_MODEL_BYTES:
         raise ValueError("model file exceeds safety limit")
     data = model_path.read_bytes()
+    if data[:8] == b'RMLPV003':
+        from mixlite import IntegerMixLite
+        return IntegerMixLite(data)
     if data[:8] == b'RMLPV002':
         from nonlinear_model import read_integer
         return read_integer(data)

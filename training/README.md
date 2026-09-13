@@ -232,3 +232,37 @@ python -X utf8 -m unittest discover -s apps/rustmoku-arena -p 'test_*.py'
 
 Synthetic promotion outcomes in these tests validate rejection and publication
 mechanics only. They are never included in Arena statistics or strength claims.
+
+## MixLite V3 scalar research pipeline
+
+The dedicated CPU/QAT pipeline uses whole-trajectory splits, train-only scale
+selection, deterministic post-split D4 augmentation, WDL/value and contextual
+policy loss (including observed comparison masks), bounded steps/time, resumable
+optimizer state, and dataset/split validation on resume and export.
+
+```powershell
+python training/mixlite.py train --dataset DATASET --checkpoint v3.pt --steps 8 --max-seconds 60
+python training/mixlite.py export --checkpoint v3.pt --dataset DATASET --model v3.rml
+python training/mixlite.py verify --engine target/debug/rustmoku-data.exe --model v3.rml
+```
+
+V3 has independent magic/version/architecture (`RMLPV003`, 3, 3) and shares the
+rational Q15 score contract. Header `<8sHHIHHiii>` declares features=65536,
+width=32, contract=2, value divisor, policy divisor and frozen score scale.
+Tensor order: int8 embeddings, 3 occupancy rows, 8x160 mixing; eight bounded i32
+biases; int16 3x8 WDL, 32 policy and eight contextual policy weights. Local and
+context activations clip to [0,255]; all signed divisions truncate toward zero.
+WDL evidence is `max(0, dot/value_divisor)+1`. Q15 win-minus-loss is converted
+through the bounded rational value contract. The independent integer reference
+rebuilds the board; Rust uses bounded incremental updates.
+
+V3 export and integer receipts are scalar research diagnostics. Existing formal
+promotion/calibration evidence admission deliberately remains closed for V3;
+this pipeline does not produce a trained champion or strength evidence. Main
+`train.py` V1/V2 behavior is retained; use `mixlite.py` for V3. No SIMD is added.
+
+Teacher JSON v4 declares root/descendant universes, leaf policy, search domain,
+selectivity and score reference scale. Practical distillation is the default;
+all-descendant oracle analysis is explicit. `DomainExact` never means solved
+Gomoku. Exploration temperatures use reference units and comparisons retain the
+actual raw-unit temperature for exact distribution validation.

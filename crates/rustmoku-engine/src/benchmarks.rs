@@ -101,6 +101,7 @@ pub fn run_learned_hotpath(
     match RuntimeEvaluator::read_from_path(model_path)? {
         RuntimeEvaluator::Learned(evaluator) => learned_hotpath(iterations, evaluator),
         RuntimeEvaluator::Nonlinear(evaluator) => learned_hotpath(iterations, evaluator),
+        RuntimeEvaluator::MixLite(evaluator) => learned_hotpath(iterations, evaluator),
         RuntimeEvaluator::Pattern => unreachable!("model reader does not return Pattern"),
     }
     Ok(())

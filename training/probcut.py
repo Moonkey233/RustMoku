@@ -64,7 +64,7 @@ def collect(args):
 
 
 def fit_bucket(training, heldout, deep, shallow, phase):
-    if len(training) < 64 or len(heldout) < 32:
+    if len(training) < 512 or len(heldout) < 2995:
         return None, {'status': 'insufficient-independent-samples', 'training': len(training), 'heldout': len(heldout)}
     xmean = statistics.mean(row['shallow'] for row in training)
     ymean = statistics.mean(row['deep'] for row in training)
@@ -82,7 +82,7 @@ def fit_bucket(training, heldout, deep, shallow, phase):
         return None, {'status': 'unsupported-numeric-range'}
     qualified = [row for row in heldout if low <= row['shallow'] <= high]
     false = sum(predicted(row) - tail > row['deep'] for row in qualified)
-    report = {'status': 'accepted' if len(qualified) >= 32 and false == 0 else 'rejected-heldout',
+    report = {'status': 'accepted' if len(qualified) >= 2995 and false == 0 and 1 - .05**(1 / len(qualified)) <= .001 else 'rejected-heldout',
               'training': len(training), 'heldout': len(qualified), 'heldout_out_of_distribution': len(heldout) - len(qualified),
               'false_lower_predictions': false,
               'zero_failure_rate_95pct_upper': 1 - .05**(1 / len(qualified)) if qualified and false == 0 else None}
@@ -109,7 +109,7 @@ def fit(args):
                                                     'status': 'experimental-default-off' if buckets else 'inconclusive-disabled'})
     if buckets:
         from export import publish_model
-        content = '\n'.join(['RMPROBCUT1', identity['model_sha256'], identity['profile'], identity['selectivity']]
+        content = '\n'.join(['RMPROBCUT2', identity['model_sha256'], identity['profile'], identity['selectivity']]
                             + [','.join(map(str, bucket)) for bucket in buckets]) + '\n'
         publish_model(args.output, content.encode())
 

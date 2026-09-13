@@ -89,6 +89,20 @@ impl SearchHeuristics {
         self.stack[usize::from(ply)].static_eval = Some(score);
     }
 
+    pub(crate) fn improving(&self, ply: u8) -> bool {
+        let Some(prior) = ply.checked_sub(2) else {
+            return false;
+        };
+        match (self.static_eval(ply), self.static_eval(prior)) {
+            (Some(now), Some(before)) => {
+                now.abs() < crate::score::MATE_THRESHOLD
+                    && before.abs() < crate::score::MATE_THRESHOLD
+                    && now > before
+            }
+            _ => false,
+        }
+    }
+
     pub(crate) fn history(&self, side: Stone, at: Move) -> i16 {
         self.history[stone_index(side)][at.index()]
     }

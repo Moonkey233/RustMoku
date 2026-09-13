@@ -59,3 +59,15 @@ class TeacherTests(unittest.TestCase):
             sidecar.write_bytes(b'corrupt')
             with self.assertRaisesRegex(ValueError, 'identity mismatch'):
                 DatasetBundle(bundle)
+
+    def test_declared_domain_is_preserved_and_unknown_leaf_rejected(self):
+        metadata = dict(version=4, root_universe='all-legal', descendant_universe='production-radius-two',
+                        leaf_policy='four-q6-immediate-v1', search_domain='distillation',
+                        selectivity='candidate-domain-only-no-depth-pruning')
+        analysis = dict(metadata, perspective='root-side-to-move', completed_depth=1,
+                        candidates=[dict(move=i, score=i, bound='DomainExact', completed_depth=1,
+                                         nominal_depth_valid=True, source='AlphaBeta') for i in range(2)])
+        self.assertEqual(comparison(analysis, 1)['search_metadata']['search_domain'], 'distillation')
+        analysis['leaf_policy'] = 'unknown'
+        with self.assertRaisesRegex(ValueError, 'search domain'):
+            comparison(analysis, 1)

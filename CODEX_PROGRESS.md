@@ -1,7 +1,7 @@
 # RustMoku progress
 
-- Current HEAD: `746e0a0f813c5044690b52b6b2b47e93a841bcbe`; this continuation's changes are uncommitted.
-- W0/W1 and initial W2 are in HEAD. Current scope: finish W2, then W3.1-W3.4; do not enter W5. W3.5 is optional only with sufficient budget.
+- Current HEAD: `623542684d8f4ed8e6a10f85d8634ff7c78cc298`; clean at continuation start; prior W2 changes are committed.
+- W0/W1 and initial W2 are in HEAD. Current scope: finish W2, W3, W4, then W5 scalar/reference/training pipeline; W6 remains outside normal scope.
 - CI regression repaired: resistance formerly applied to all negative heuristic scores and broke `pvs_and_aspiration_match_full_window_alpha_beta` (-840, moves 97 vs 80). It now applies only to verified equal mate-domain losses; ordinary heuristic ties remain canonical. Original differential assertion retained; real mate-loss regression checks unchanged distance and tie-only preference.
 - Teacher correction: AllLegal now covers every nominal descendant, with analysis TT isolation. Exact means the fixed horizon plus bounded Four-class qsearch leaf policy, not solved minimax. Experimental Three hints are disabled for teacher analysis. Analysis JSON is v3 with explicit leaf policy.
 - W2 implementation added: shared tactical ThreatDescriptor (moved from vct/threat.rs to tactical/threat.rs), defense/dependency hints, and default-off bounded Three qsearch continuation. Hint-derived results cannot authorize ordinary TT bounds; interruption restores reversible state. RMPROFILE1 remains unchanged by default; enabled Three continuation uses RMPROFILE2.

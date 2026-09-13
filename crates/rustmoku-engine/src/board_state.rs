@@ -69,6 +69,18 @@ impl BoardState {
         }
     }
 
+    pub(crate) fn begin_analysis_turn(
+        &mut self,
+    ) -> Result<rustmoku_core::AnalysisTurnUndo, MoveError> {
+        let undo = self.position.begin_analysis_opponent_turn()?;
+        self.key = self.key.toggle_analysis_turn();
+        Ok(undo)
+    }
+    pub(crate) fn end_analysis_turn(&mut self, undo: rustmoku_core::AnalysisTurnUndo) {
+        self.position.end_analysis_opponent_turn(undo);
+        self.key = self.key.toggle_analysis_turn();
+    }
+
     pub(crate) fn make_move(&mut self, at: Move) -> Result<BoardUndo, MoveError> {
         let stone = self.position.side_to_move();
         let position = self.position.make_move(at)?;

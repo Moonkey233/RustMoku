@@ -27,6 +27,9 @@ impl PositionKey {
         self.0
     }
 
+    pub(crate) fn toggle_analysis_turn(self) -> Self {
+        Self(self.0 ^ BLACK_TO_MOVE_KEY ^ WHITE_TO_MOVE_KEY)
+    }
     pub(crate) fn toggle_move(self, at: Move, stone: Stone) -> Self {
         Self(self.0 ^ piece_key(stone, at) ^ side_key(stone) ^ side_key(stone.opponent()))
     }

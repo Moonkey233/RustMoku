@@ -263,6 +263,7 @@ enum Player {
     Classical(AlphaBetaEngine<ClassicalEvaluator>),
     Learned(AlphaBetaEngine<LearnedEvaluator>),
     Nonlinear(AlphaBetaEngine<NonlinearEvaluator>),
+    MixLite(AlphaBetaEngine<rustmoku_engine::MixLiteEvaluator>),
     External(external::ExternalPlayer),
 }
 
@@ -296,6 +297,9 @@ impl Player {
                     RuntimeEvaluator::Nonlinear(model) => {
                         Self::Nonlinear(AlphaBetaEngine::with_config(model, config.engine))
                     }
+                    RuntimeEvaluator::MixLite(model) => {
+                        Self::MixLite(AlphaBetaEngine::with_config(model, config.engine))
+                    }
                     RuntimeEvaluator::Pattern => unreachable!("model reader cannot select Pattern"),
                 }
             }
@@ -307,7 +311,18 @@ impl Player {
         limits: SearchLimits,
         manager: time_manager::TimeManager,
     ) -> SearchResult {
-        let mut observer = time_manager::ManagedObserver::new(manager, |_| {});
+        let profile = match self {
+            Self::Pattern(e) => e.effective_search_profile(),
+            Self::Classical(e) => e.effective_search_profile(),
+            Self::Learned(e) => e.effective_search_profile(),
+            Self::Nonlinear(e) => e.effective_search_profile(),
+            Self::MixLite(e) => e.effective_search_profile(),
+            Self::External(_) => unreachable!("external clock policy belongs to protocol adapter"),
+        };
+        let mut observer = time_manager::ManagedObserver::new(
+            manager.with_profile(profile, game.position().move_count()),
+            |_| {},
+        );
         let cancellation = rustmoku_engine::CancellationToken::new();
         match self {
             Self::Pattern(engine) => {
@@ -320,6 +335,9 @@ impl Player {
                 engine.search_controlled(game.position(), limits, cancellation, &mut observer)
             }
             Self::Nonlinear(engine) => {
+                engine.search_controlled(game.position(), limits, cancellation, &mut observer)
+            }
+            Self::MixLite(engine) => {
                 engine.search_controlled(game.position(), limits, cancellation, &mut observer)
             }
             Self::External(_) => unreachable!("external moves use the protocol adapter"),

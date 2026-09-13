@@ -1096,22 +1096,16 @@ Interior VCF/tiny VCT share bounded single-worker scheduling and global admissio
 verified certificates initially supply ordering only. Excluded-move verification
 has a distinct search context with ordinary TT cutoffs/stores and heuristic/PV
 side effects disabled; incomplete alternatives cannot establish singularity.
-Extensions are bounded per path. Guarded Null Move is **rejected-with-evidence**
-for this implementation. `Position::side_to_move` is private; `make_move(at)`
-always places the real side's stone, advances the count/history-facing state and
-returns an opaque undo token. `would_win(at, stone)` is a read-only one-move query,
-not an alternate-side transition API. `SearchState::make_move` derives its hash,
-PatternDelta stone, frontier and evaluator update from that real transition.
-Consequently, flipping only a search hash makes the hash name the opponent's turn
-while `Position`, subsequent moves and both tactical/evaluator dispatch still see
-the original turn. For example, after `H8 A1 I8 A2 J8 B1 K8 B2`, a hypothetical
-white continuation cannot be applied with `Position::make_move`: the actual side
-is Black and the move places Black. A wrapper with an overridden getter cannot
-change this transition. Building a second transition/win engine or copying a
-Position at every hypothetical node violates this milestone's constraints. No
-null flag, Core pass move, forged undo token, TT entry or teacher label is emitted.
-This is an interface-based rejection of this implementation route, not a claim
-that null-move heuristics are impossible in every Gomoku architecture. ProbCut requires frozen
+Extensions are bounded per path. Guarded Null Move is now an opt-in research path. Core provides an opaque
+analysis-turn undo, separate from played moves and Game history. BoardState
+updates the real analysis side and side hash together; PatternState remains
+unchanged. Only evaluators explicitly declaring side-independent dual-view state
+may enter it. The hypothetical subtree disables TT/proof/recursive experiments.
+The original position is restored before a full nominal-depth verification,
+and even a successful result remains UNVERIFIED. Quiet, non-mate, NonPV,
+minimum-depth, static-margin and stack-capacity gates protect entry.
+This replaces the formerly rejected hash-only route; no fake Move is introduced.
+ProbCut requires frozen
 model/profile calibration and sufficient heldout buckets; unverified statistical
 cutoffs never acquire ordinary nominal-depth TT bounds. Each accepted experiment
 needs a public-entry trigger regression, negative case, cancellation and on/off
@@ -1132,7 +1126,7 @@ change follows from a smoke run.
 
 ## Remaining research non-goals
 
-No Null Move, qsearch TT, policy hard pruning, explicit SIMD optimization, unsafe code, MCTS, AlphaZero,
+No qsearch TT, explicit SIMD optimization, unsafe code, MCTS, AlphaZero,
 Transformer evaluation, GPU compute, opening database, server/protocol layer,
 Renju, Swap/Swap2, or a generic persistent
 thread pool. Core's backing storage remains 225 cells. Future scope is in
@@ -1159,3 +1153,46 @@ metadata. A persistent SMP pool is also deferred until measurements separate
 thread creation from evaluator initialization and actual search work. Portable
 safe Rust remains the baseline; NUMA and unsafe SIMD have no selected workload
 or profiling evidence in this milestone.
+
+### W2-W5 search and scalar contracts
+
+Root resistance applies only to verified equal mate-domain losses. Experimental
+Three/dependency qsearch cannot establish ordinary nominal-depth bounds.
+Practical teachers use all legal roots and radius-two descendants; reference
+oracles use all legal nominal descendants. Both declare Four qsearch leaves,
+common completed depth and candidate-domain-only selectivity. Neither reads or
+writes ordinary TT. `CandidateBound::DomainExact` is limited to that domain.
+
+`search/bounds.rs` owns directional validity; root, ordinary AB, qsearch and
+experimental probes are separate modules. LMR V2 uses a const Q8 log-product
+surface, tactical/context protection and nominal retry before alpha/PV changes.
+Improving compares same-side static evaluations two plies apart only in safe
+ordinary contexts. IID returns only a legal ordering move from isolated scratch.
+Competitive TT explicitly changes heuristic horizon reuse; strict mode and all
+analysis paths retain old isolation. Reconfiguring a profile clears ordinary TT.
+Single singular extensions retain their trusted premise and complete excluded
+verification; double/negative singular variants remain deferred.
+
+Profile V3 names every added flag/parameter and embeds a legacy base. Unknown,
+duplicate, missing or invalid fields fail closed. Legacy profiles keep raw
+threshold behavior. New rational-model defaults declare normalization: one
+model scale corresponds to 10,000 Pattern/V1 reference units. Search margins,
+aspiration and application stability/drop checks use this contract. Policy
+pruning uses ranks, not raw logits. ProbCut coefficients remain model/profile
+bound and OOD checked; each admitted bucket needs 512 training and 2995 independent
+heldout samples, zero false predictions and a one-sided 95% bound below 0.001.
+
+TimeManager uses remaining/increment/turn ceilings, completed iteration costs,
+bounded Q8 empirical growth EMA, best-move/PV stability, normalized score changes,
+phase and mate transitions. There is no minimum growth of two. Named profile
+values expose a tuning interface; no tuning or strength experiment was run.
+
+MixLite V3 uses shared 65,536-by-32 int8 embeddings plus occupancy, four-line local
+aggregation and clipped activations. Four spatial groups and a global mean feed
+an 8-lane nonlinear context, positive WDL evidence and a bilinear contextual
+policy. One move touches at most 33 centers; both views update reversible group
+sums and refresh context once. Evaluation is cached and policy takes 32 local
+plus 8 cross terms. No leaf scans the board. The file has 2,098,720 bytes; state
+uses about 58 KiB per worker. Local/group/context arithmetic fits i32; bounded
+policy products and rational value conversion use i64. Output is clamped outside
+the mate/proof range. These are layout/operation counts, not timing evidence.

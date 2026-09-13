@@ -81,6 +81,9 @@ fn player(
                 RuntimeEvaluator::Nonlinear(model) => {
                     (model.model().metadata(), Some(model.model().score_scale()))
                 }
+                RuntimeEvaluator::MixLite(model) => {
+                    (model.model().metadata(), Some(model.model().score_scale()))
+                }
                 RuntimeEvaluator::Pattern => unreachable!("model reader cannot select Pattern"),
             };
             inputs.insert(path.clone(), hash.clone());

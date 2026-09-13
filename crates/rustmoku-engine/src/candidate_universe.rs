@@ -51,12 +51,37 @@ impl ProofCandidateUniverse {
     }
 }
 
-/// Explicit root analysis policy. ProductionTopK exists for controlled ablations.
+/// Declared fixed-horizon search domains. Candidate omission is not a proof rule.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum TeacherCandidates {
+    /// All legal roots, radius-two descendants, fixed Four qsearch.
     #[default]
+    Practical,
+    /// Shallow oracle: all legal roots and nominal descendants.
     AllLegal,
     ProductionTopK,
+}
+
+impl TeacherCandidates {
+    pub const fn root_universe(self) -> &'static str {
+        match self {
+            Self::Practical | Self::AllLegal => "all-legal",
+            Self::ProductionTopK => "production-top-k",
+        }
+    }
+    pub const fn descendant_universe(self) -> &'static str {
+        match self {
+            Self::AllLegal => "all-legal",
+            _ => "production-radius-two",
+        }
+    }
+    pub const fn search_domain(self) -> &'static str {
+        match self {
+            Self::Practical => "distillation",
+            Self::AllLegal => "reference-oracle",
+            Self::ProductionTopK => "production-ablation",
+        }
+    }
 }
 
 #[cfg(test)]

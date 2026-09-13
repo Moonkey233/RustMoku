@@ -150,7 +150,7 @@ The table below records implementation availability, not validated strength.
 | Root teacher, exploration, calibrated labels | implemented; broader candidate universe pending |
 | Width-8 integer V2, trainer and evidence | implemented |
 | Search profiles, policy LMR, proof scheduling, singular, ProbCut | implemented, experimental gates retained |
-| Guarded Null Move | rejected-with-evidence: immutable Position transition and side/hash/evaluator consistency conflict; see Architecture |
+| Guarded Null Move | experimental/default-off, isolated analysis turn plus real full-depth verification; see Architecture |
 | Application time management and bounded experiments | implemented; clock and budget refinements ongoing |
 | Integrated validation and adversarial review | pending after implementation |
 | Independent strength, hosted Windows/Linux CI, release | external-gate-pending |
