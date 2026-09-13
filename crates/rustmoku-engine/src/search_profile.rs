@@ -464,34 +464,59 @@ impl ResearchParameters {
         ]
     }
     fn from_fields(values: [(&str, i32); 24]) -> Result<Self, &'static str> {
-        let value = |name: &str| values.iter().find(|(key, _)| *key == name)
-            .map(|(_, value)| *value).ok_or("missing named parameter");
-        let flag = |name| match value(name)? { 0 => Ok(false), 1 => Ok(true), _ => Err("invalid research flag") };
+        let value = |name: &str| {
+            values
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| *value)
+                .ok_or("missing named parameter")
+        };
+        let flag = |name| match value(name)? {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err("invalid research flag"),
+        };
         Ok(Self {
             lmr_v2: flag("lmr_v2")?,
-            lmr_divisor: u16::try_from(value("lmr_divisor")?).map_err(|_| "lmr_divisor out of range")?,
-            lmr_cut_bonus: u8::try_from(value("lmr_cut_bonus")?).map_err(|_| "lmr_cut_bonus out of range")?,
+            lmr_divisor: u16::try_from(value("lmr_divisor")?)
+                .map_err(|_| "lmr_divisor out of range")?,
+            lmr_cut_bonus: u8::try_from(value("lmr_cut_bonus")?)
+                .map_err(|_| "lmr_cut_bonus out of range")?,
             improving: flag("improving")?,
-            improving_lmr_discount: u8::try_from(value("improving_lmr_discount")?).map_err(|_| "improving_lmr_discount out of range")?,
-            improving_margin_percent: u16::try_from(value("improving_margin_percent")?).map_err(|_| "improving_margin_percent out of range")?,
-            improving_lmp_bonus: u16::try_from(value("improving_lmp_bonus")?).map_err(|_| "improving_lmp_bonus out of range")?,
+            improving_lmr_discount: u8::try_from(value("improving_lmr_discount")?)
+                .map_err(|_| "improving_lmr_discount out of range")?,
+            improving_margin_percent: u16::try_from(value("improving_margin_percent")?)
+                .map_err(|_| "improving_margin_percent out of range")?,
+            improving_lmp_bonus: u16::try_from(value("improving_lmp_bonus")?)
+                .map_err(|_| "improving_lmp_bonus out of range")?,
             iid: flag("iid")?,
-            iid_min_depth: u8::try_from(value("iid_min_depth")?).map_err(|_| "iid_min_depth out of range")?,
-            iid_reduction: u8::try_from(value("iid_reduction")?).map_err(|_| "iid_reduction out of range")?,
+            iid_min_depth: u8::try_from(value("iid_min_depth")?)
+                .map_err(|_| "iid_min_depth out of range")?,
+            iid_reduction: u8::try_from(value("iid_reduction")?)
+                .map_err(|_| "iid_reduction out of range")?,
             policy_pruning: flag("policy_pruning")?,
-            policy_max_depth: u8::try_from(value("policy_max_depth")?).map_err(|_| "policy_max_depth out of range")?,
-            policy_tail_percent: u8::try_from(value("policy_tail_percent")?).map_err(|_| "policy_tail_percent out of range")?,
+            policy_max_depth: u8::try_from(value("policy_max_depth")?)
+                .map_err(|_| "policy_max_depth out of range")?,
+            policy_tail_percent: u8::try_from(value("policy_tail_percent")?)
+                .map_err(|_| "policy_tail_percent out of range")?,
             competitive_tt: flag("competitive_tt")?,
-            time_stability: u16::try_from(value("time_stability")?).map_err(|_| "time_stability out of range")?,
+            time_stability: u16::try_from(value("time_stability")?)
+                .map_err(|_| "time_stability out of range")?,
             time_drop: u16::try_from(value("time_drop")?).map_err(|_| "time_drop out of range")?,
-            growth_min_q8: u16::try_from(value("growth_min_q8")?).map_err(|_| "growth_min_q8 out of range")?,
-            growth_max_q8: u16::try_from(value("growth_max_q8")?).map_err(|_| "growth_max_q8 out of range")?,
-            growth_initial_q8: u16::try_from(value("growth_initial_q8")?).map_err(|_| "growth_initial_q8 out of range")?,
-            growth_ema_weight: u16::try_from(value("growth_ema_weight")?).map_err(|_| "growth_ema_weight out of range")?,
+            growth_min_q8: u16::try_from(value("growth_min_q8")?)
+                .map_err(|_| "growth_min_q8 out of range")?,
+            growth_max_q8: u16::try_from(value("growth_max_q8")?)
+                .map_err(|_| "growth_max_q8 out of range")?,
+            growth_initial_q8: u16::try_from(value("growth_initial_q8")?)
+                .map_err(|_| "growth_initial_q8 out of range")?,
+            growth_ema_weight: u16::try_from(value("growth_ema_weight")?)
+                .map_err(|_| "growth_ema_weight out of range")?,
             normalized_scores: flag("normalized_scores")?,
             null_move: flag("null_move")?,
-            null_min_depth: u8::try_from(value("null_min_depth")?).map_err(|_| "null_min_depth out of range")?,
-            null_reduction: u8::try_from(value("null_reduction")?).map_err(|_| "null_reduction out of range")?,
+            null_min_depth: u8::try_from(value("null_min_depth")?)
+                .map_err(|_| "null_min_depth out of range")?,
+            null_reduction: u8::try_from(value("null_reduction")?)
+                .map_err(|_| "null_reduction out of range")?,
         })
     }
 }

@@ -401,20 +401,35 @@ mod tests {
         let (_, original) = fixture();
         for negative in [false, true] {
             let mut bytes = original.clone();
-            bytes[HEADER..HEADER+BYTE_WEIGHTS].fill(127);
-            for offset in [20, 24] { bytes[offset..offset+4].copy_from_slice(&1i32.to_le_bytes()); }
+            bytes[HEADER..HEADER + BYTE_WEIGHTS].fill(127);
+            for offset in [20, 24] {
+                bytes[offset..offset + 4].copy_from_slice(&1i32.to_le_bytes());
+            }
             bytes[28..32].copy_from_slice(&10_000_000i32.to_le_bytes());
-            let bias = HEADER+BYTE_WEIGHTS;
-            for pair in bytes[bias..bias+CONTEXT*4].as_chunks_mut::<4>().0 { *pair = 1_048_576i32.to_le_bytes(); }
-            let heads = bias+CONTEXT*4;
+            let bias = HEADER + BYTE_WEIGHTS;
+            for pair in bytes[bias..bias + CONTEXT * 4].as_chunks_mut::<4>().0 {
+                *pair = 1_048_576i32.to_le_bytes();
+            }
+            let heads = bias + CONTEXT * 4;
             for (i, pair) in bytes[heads..].as_chunks_mut::<2>().0.iter_mut().enumerate() {
-                let positive = if i < 3*CONTEXT { i / CONTEXT == if negative { 2 } else { 0 } } else { !negative };
+                let positive = if i < 3 * CONTEXT {
+                    i / CONTEXT == if negative { 2 } else { 0 }
+                } else {
+                    !negative
+                };
                 *pair = if positive { i16::MAX } else { i16::MIN }.to_le_bytes();
             }
-            let evaluator = MixLiteEvaluator::new(Arc::new(MixLiteModel::read_from(&mut &bytes[..]).unwrap()));
+            let evaluator =
+                MixLiteEvaluator::new(Arc::new(MixLiteModel::read_from(&mut &bytes[..]).unwrap()));
             let position = Position::default();
-            assert_eq!(evaluator.evaluate_position(&position), if negative { -10_000_000 } else { 10_000_000 });
-            assert_eq!(evaluator.policy_for(&position, Move::CENTER), Some(if negative { -32768 } else { 32767 }));
+            assert_eq!(
+                evaluator.evaluate_position(&position),
+                if negative { -10_000_000 } else { 10_000_000 }
+            );
+            assert_eq!(
+                evaluator.policy_for(&position, Move::CENTER),
+                Some(if negative { -32768 } else { 32767 })
+            );
         }
     }
 
