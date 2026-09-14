@@ -330,6 +330,12 @@ impl UiText {
                 }
             });
         match (self.language, search.origin) {
+            (UiLanguage::English, SearchOrigin::OpeningBook) => {
+                "Result: empirical opening book".into()
+            }
+            (UiLanguage::SimplifiedChinese, SearchOrigin::OpeningBook) => {
+                "结果来源：经验开局库".into()
+            }
             (UiLanguage::English, SearchOrigin::Analysis) => "Analysis only".into(),
             (UiLanguage::SimplifiedChinese, SearchOrigin::Analysis) => "仅分析".into(),
             (UiLanguage::English, SearchOrigin::Fallback) => "Result: fallback".into(),
@@ -517,6 +523,14 @@ mod tests {
     fn result_origins_and_proof_distances_are_worded_honestly() {
         let english = UiText::new(UiLanguage::English);
         let chinese = UiText::new(UiLanguage::SimplifiedChinese);
+        assert_eq!(
+            english.result_summary(&search_info(SearchOrigin::OpeningBook, None)),
+            "Result: empirical opening book"
+        );
+        assert_eq!(
+            chinese.result_summary(&search_info(SearchOrigin::OpeningBook, None)),
+            "结果来源：经验开局库"
+        );
         assert_eq!(
             english.result_summary(&search_info(SearchOrigin::AlphaBeta, None)),
             "Result: Alpha-Beta"

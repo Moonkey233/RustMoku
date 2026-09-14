@@ -1216,7 +1216,10 @@ indexing; training and inference read only canonical rows.
 LMR V2 separates quiet/protected eligibility, the precomputed depth/index surface,
 and history/continuation adjustment. The latter is measured in half of the
 versioned strong-history threshold and capped by lmr_cut_bonus; policy lower-half
-ranking can add one bounded reduction. Legacy LMR remains unchanged when V2 is
+ranking can add one bounded reduction when `lmr_v2_policy` is enabled. This
+named RMPROFILE3 parameter is independently ablatable; missing fields in old
+profiles retain the previous enabled coupling, but have no effect unless V2
+itself is enabled. Legacy `policy_lmr` remains independent. Legacy LMR remains unchanged when V2 is
 off. TimeManager pressure persists across one stable iteration and decays over
 four subsequent stable iterations; the algorithm identity records hard90.
 
@@ -1237,3 +1240,27 @@ One Windows release smoke measured Scalar/AVX2 at 1913/1440 ns per update,
 integer-nanosecond reporting resolution. These are diagnostics, not strength or
 broad performance evidence. `model-check --backend scalar|auto|avx2` provides an
 explicit cross-language verification path; unsupported explicit AVX2 fails.
+
+
+### W8 scratch lifetime
+
+Workers reuse allocations for the large continuation tables and search scratch.
+Public searches still reset semantic history, including the continuation-table
+memset cost. Cross-move history persistence and lazy generation clearing are not
+enabled. Helper output remains subordinate to the completed principal result.
+
+### W9 offline working data
+
+OpeningDatabase (`RMOPEN01`) contains empirical scored moves, model/profile/build
+identity and the declared search domain. It is distinct from chronological Game
+records and independently verified ProofBooks. The engine supports OrderOnly and
+explicit OpeningBook-origin BookMove; neither imports TT Exact or proof evidence.
+Application-level configuration integration is still pending.
+
+The new `offline` Python package uses SQLite compact working nodes, stable IDs,
+PN/DN, canonical keys and bounded legal-edge lists. A persistent Rust facts worker
+replays every chronological sequence with Core. Disk PN and process-level shards
+never use learned scores as evidence. A merged solved witness is freshly replayed;
+ProvenWin exports must additionally pass the existing fresh native ProofBook
+verifier before atomic publication. Unknown is never a refutation. See
+[OFFLINE_INTELLIGENCE.md](OFFLINE_INTELLIGENCE.md) for current limitations.

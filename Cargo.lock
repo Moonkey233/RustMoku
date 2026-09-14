@@ -2000,6 +2000,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustmoku-book"
+version = "1.0.0-dev"
+dependencies = [
+ "rustmoku-core",
+ "rustmoku-engine",
+]
+
+[[package]]
 name = "rustmoku-core"
 version = "1.0.0-dev"
 

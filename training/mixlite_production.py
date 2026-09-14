@@ -18,11 +18,15 @@ from teacher import validate_comparison, masked_loss
 
 
 class BatchedMixLite(MixLite):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        for band in range(4):
+            self.register_buffer(f'group_{band}', torch.tensor([i for i,g in enumerate(GROUPS) if g == band]), persistent=False)
     def forward(self, keys, centers):
         local = (F.embedding(keys, ste_integer(self.embedding, -128, 127)).sum(-2)
                  + F.embedding(centers, ste_integer(self.center, -128, 127))).clamp(0, 255)
         # Four small reductions; no per-record model calls or whole-board CNN.
-        groups = torch.stack([local[:, [i for i,g in enumerate(GROUPS) if g == band]].sum(1)
+        groups = torch.stack([local.index_select(1, getattr(self, f'group_{band}')).sum(1)
                               for band in range(4)], dim=1)
         pooled = torch.cat([ste_trunc(groups.sum(1)/225)] +
                            [ste_trunc(groups[:,g]/COUNTS[g]) for g in range(4)], dim=-1)
@@ -47,14 +51,15 @@ def hard_example_tags(*, teacher_move, student_order, teacher_value, student_val
         if candidate_universe is not None and teacher_move not in candidate_universe: tags.append('candidate-universe-miss')
     if abs(teacher_value-student_value) > value_error_threshold: tags.append('high-value-error')
     if exact and teacher_value*student_value <= 0 and teacher_value != 0: tags.append('tactical-error')
-    if forced_loss: tags.append('forced-loss-resistance')
+    if exact and forced_loss: tags.append('exact-forced-loss')
     return tags
 
 
 def train(dataset_path, checkpoint_path, *, steps, epochs=1, batch_size=256,
           device='cpu', seed=1, resume=None, learning_rate=.001, checkpoint_every=100,
-          policy_target='soft', exact_weight=4., hard_weight=2., outcome_weight=.25):
+          policy_target='soft', exact_weight=4., hard_weight=2., outcome_weight=.25, mining_every=0):
     if min(steps,epochs,batch_size,checkpoint_every) < 1: raise ValueError('positive training limits required')
+    if type(mining_every) is not int or mining_every < 0: raise ValueError('mining cadence must be nonnegative')
     if policy_target not in ('soft','ranking'): raise ValueError('invalid policy target')
     if not all(math.isfinite(x) and x > 0 for x in (learning_rate,exact_weight,hard_weight)) or not 0 <= outcome_weight <= 1:
         raise ValueError('invalid optimizer/loss configuration')
@@ -71,9 +76,10 @@ def train(dataset_path, checkpoint_path, *, steps, epochs=1, batch_size=256,
         indices = validate_split_manifest(dataset,manifest,seed)['train']
         if not indices: raise ValueError('no training records')
         config = dict(sampler='block-shuffle-v1',batch_size=batch_size,seed=seed,learning_rate=learning_rate,policy_target=policy_target,
-                      exact_weight=exact_weight,hard_weight=hard_weight,outcome_weight=outcome_weight)
-        if previous and previous['production'] != config: raise ValueError('resume training configuration changed')
-        sample = [abs(dataset[i].value) for i in indices[:4096] if not dataset[i].exact]
+                      exact_weight=exact_weight,hard_weight=hard_weight,outcome_weight=outcome_weight,mining_every=mining_every)
+        if previous and {**previous['production'], 'mining_every': previous['production'].get('mining_every',1)} != config: raise ValueError('resume training configuration changed')
+        sample_indices = [indices[j*len(indices)//min(4096,len(indices))] for j in range(min(4096,len(indices)))]
+        sample = [abs(dataset[i].value) for i in sample_indices if not dataset[i].exact]
         scale = previous['score_scale'] if previous else max(1,min(10000000,sorted(sample)[len(sample)//2] if sample else 500))
         model = BatchedMixLite(scale).float().to(selected)
         optimizer = torch.optim.Adam(model.parameters(),lr=learning_rate)
@@ -111,9 +117,10 @@ def train(dataset_path, checkpoint_path, *, steps, epochs=1, batch_size=256,
                 keys = torch.stack([row[5] for row in batch]).to(selected)
                 centers = torch.stack([row[6] for row in batch]).to(selected)
                 wdl,policy,_ = model(keys,centers)
-                # One batched device transfer for mining, never one GPU sync per candidate.
-                rankings = policy.detach().masked_fill(centers != 0, float('-inf')).argsort(dim=1,descending=True,stable=True)[:,:5].cpu().tolist()
-                predictions = (wdl[:,0]-wdl[:,2]).detach().cpu().tolist()
+                do_mining = mining_every > 0 and completed % mining_every == 0
+                if do_mining:
+                    rankings = policy.detach().masked_fill(centers != 0, float('-inf')).argsort(dim=1,descending=True,stable=True)[:,:5].cpu().tolist()
+                    predictions = (wdl[:,0]-wdl[:,2]).detach().cpu().tolist()
                 losses = []
                 for j,(record,board,side,move,symmetry,_,_) in enumerate(batch):
                     q = float((record.value>0)-(record.value<0)) if record.exact else record.value/(scale+abs(record.value))
@@ -134,19 +141,24 @@ def train(dataset_path, checkpoint_path, *, steps, epochs=1, batch_size=256,
                         if any(at not in legal for at in observed): raise ValueError('illegal comparison target')
                         loss = loss+masked_loss(policy[j],observed,comparison['probabilities'],
                             ranking_scores=comparison['scores'] if policy_target=='ranking' else None)
-                        candidate_universe = observed
-                    ranking = [i for i in rankings[j] if i in legal]
-                    tags = hard_example_tags(teacher_move=move,student_order=ranking,teacher_value=q,
-                        student_value=predictions[j],candidate_universe=candidate_universe,
-                        exact=record.exact,forced_loss=record.exact and record.value<0)
+                        # Masked teacher comparisons do not describe the
+                        # production candidate universe; never infer recall here.
+                    tags = []
+                    if do_mining:
+                        ranking = [i for i in rankings[j] if i in legal]
+                        tags = hard_example_tags(teacher_move=move,student_order=ranking,teacher_value=q,
+                            student_value=predictions[j],candidate_universe=candidate_universe,
+                            exact=record.exact,forced_loss=record.exact and record.value<0)
                     weight = exact_weight if record.exact else hard_weight if tags else 1.
-                    losses.append(loss*weight)
+                    losses.append(loss*weight*record.sample_weight)
                 loss = torch.stack(losses).mean()
-                if not torch.isfinite(loss): raise ValueError('nonfinite training loss')
+                if (selected.type == 'cpu' or do_mining or (completed+1)%checkpoint_every==0) and not torch.isfinite(loss):
+                    raise ValueError('nonfinite training loss')
                 optimizer.zero_grad(set_to_none=True); loss.backward(); optimizer.step()
                 cursor += len(batch); completed += 1
                 if completed%checkpoint_every==0: save()
             if cursor == len(order): epoch += 1; cursor = 0
+        if completed > start and not torch.isfinite(loss): raise ValueError('nonfinite final loss')
         validate_split_manifest(dataset,manifest,seed)
         save()
         return completed
@@ -159,6 +171,8 @@ def main():
     p.add_argument('--steps',type=int,required=True); p.add_argument('--epochs',type=int,default=1)
     p.add_argument('--resume',type=Path); p.add_argument('--seed',type=int,default=1)
     p.add_argument('--checkpoint-every',type=int,default=100); p.add_argument('--learning-rate',type=float,default=.001)
+    p.add_argument('--mining-every',type=int,default=0)
+    for name,default in [('exact-weight',4.),('hard-weight',2.),('outcome-weight',.25)]: p.add_argument('--'+name,type=float,default=default)
     p.add_argument('--policy-target',choices=('soft','ranking'),default='soft')
     a=p.parse_args(); options=vars(a); dataset=options.pop('dataset'); output=options.pop('output')
     print('steps=',train(dataset,output,**options))

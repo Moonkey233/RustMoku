@@ -11,6 +11,7 @@ import bisect
 import dataclasses
 import hashlib
 import json
+import math
 import os
 import sqlite3
 from collections import defaultdict, OrderedDict
@@ -172,6 +173,19 @@ class DatasetBundle(Sequence[DataRecord]):
                     if str(local_id) not in shard['games']:
                         raise ValueError('descriptor game coverage mismatch')
                     meta = shard['games'][str(local_id)]
+                    if 'composition_kind' in meta:
+                        if meta['composition_kind'] not in ('selfplay','reanalysis','verified-proof','tactical','opening'):
+                            raise ValueError('unknown composition source')
+                        weight, keep = meta.get('sample_weight',1.), meta.get('sample_keep',1.)
+                        if (not isinstance(weight,(int,float)) or not math.isfinite(weight) or not 0<weight<=100
+                            or not isinstance(keep,(int,float)) or not math.isfinite(keep) or not 0<keep<=1):
+                            raise ValueError('invalid composition sampling controls')
+                        if meta['composition_kind']=='opening' and any(r.exact for r in records):
+                            raise ValueError('opening composition must be empirical')
+                        if meta['composition_kind']=='verified-proof' and (
+                            not meta.get('proof') or shard['teacher'].get('source')!='independently-verified-book'
+                            or any(not r.exact for r in records)):
+                            raise ValueError('verified proof composition lacks exact import provenance')
                     content = trajectory_content(records)
                     if (type(meta['records']) is not int or len(records) != meta['records']
                             or (compact and (type(meta.get('start')) is not int or meta['start'] != start))
@@ -233,6 +247,8 @@ class DatasetBundle(Sequence[DataRecord]):
                 from teacher import validate_comparison
                 comparison = validate_comparison(json.loads(row[0]))
         return dataclasses.replace(record, game_id=game, outcome=value, comparison=comparison,
+                                   sample_weight=meta.get('sample_weight',1.),
+                                   composition_kind=meta.get('composition_kind'), sample_keep=meta.get('sample_keep',1.),
                                    run_id=run, trajectory_id=meta['trajectory_id'],
                                    lineage_id=meta['lineage_id'], opening_family=meta['opening_family'])
 

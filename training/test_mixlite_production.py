@@ -43,5 +43,7 @@ class ProductionTests(unittest.TestCase):
         tags=hard_example_tags(teacher_move=5,student_order=[1,2],teacher_value=-1,student_value=1,
             candidate_universe=[1,2],exact=True,forced_loss=True)
         self.assertEqual(len(tags),6)
+        self.assertIn('exact-forced-loss',tags)
+        self.assertNotIn('forced-loss-resistance',tags)
         ordinary=hard_example_tags(teacher_move=None,student_order=[],teacher_value=-1,student_value=1)
         self.assertNotIn('tactical-error',ordinary)

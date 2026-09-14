@@ -284,7 +284,9 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
         let mut best_score = -SEARCH_INFINITY;
         let (previous, two_back) = resources.heuristics.previous_moves(ply);
         let policy_ranks = (PVS
-            && (self.profile.policy_lmr() || research.policy_pruning || research.lmr_v2)
+            && (self.profile.policy_lmr()
+                || research.policy_pruning
+                || (research.lmr_v2 && research.lmr_v2_policy))
             && scout_node
             && forced_block.is_none())
         .then(|| PolicyRanks::new(state, self.evaluator, &moves));
@@ -422,7 +424,8 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
             if !research.lmr_v2 && reduction > 0 && improving {
                 reduction = reduction.saturating_sub(research.improving_lmr_discount);
             }
-            let policy_reduced = (self.profile.policy_lmr() || research.lmr_v2)
+            let policy_reduced = (self.profile.policy_lmr()
+                || (research.lmr_v2 && research.lmr_v2_policy))
                 && reduction > 0
                 && reduction < child_depth
                 && policy_ranks

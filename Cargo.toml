@@ -5,6 +5,7 @@ members = [
     "apps/rustmoku-data",
     "apps/rustmoku-native",
     "apps/rustmoku-solver",
+    "apps/rustmoku-book",
     "crates/rustmoku-core",
     "crates/rustmoku-engine",
     "crates/rustmoku-simd",

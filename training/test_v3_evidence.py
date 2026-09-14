@@ -47,13 +47,16 @@ class V3Evidence(unittest.TestCase):
             result=promote(root,self.model,root/'champion',self.data)
             self.assertEqual(result['status'],'promoted')  # SYNTHETIC, not champion evidence.
             validate_evidence(Path(result['model']))
-    def test_missing_simd_receipt_fails_closed(self):
+    def test_portable_receipt_is_valid_but_explicit_avx2_target_requires_receipt(self):
+        validate_evidence(self.model)
+        with self.assertRaises(ValueError):
+            validate_evidence(self.model,target_backend_policy='avx2')
         receipt=sidecar(self.model,'integer'); evidence=sidecar(self.model,'evidence')
         original=receipt.read_bytes(); original_evidence=evidence.read_bytes()
         try:
-            value=json.loads(original); value['report']['backends']=['scalar','auto']
+            value=json.loads(original); value['report']['backends']=['scalar']
             receipt.write_text(json.dumps(value),encoding='utf-8'); evidence.unlink(); seal(self.model)
-            with self.assertRaisesRegex(ValueError,'SIMD integer evidence'): validate_evidence(self.model)
+            with self.assertRaisesRegex(ValueError,'portable backend evidence'): validate_evidence(self.model)
         finally:
             receipt.write_bytes(original); evidence.write_bytes(original_evidence)
     def test_no_independent_arena_events_cannot_promote_or_change_pointer(self):

@@ -134,6 +134,7 @@ def filtered_partitions(dataset, manifest):
     result = {}
     with index_database() as database:
         database.execute('CREATE TABLE selected (key BLOB PRIMARY KEY) WITHOUT ROWID')
+        database.execute('CREATE TABLE composition_seen (key BLOB PRIMARY KEY) WITHOUT ROWID')
         for name, indices in partitions(manifest).items():
             database.execute('DELETE FROM selected')
             for i in indices:
@@ -143,8 +144,18 @@ def filtered_partitions(dataset, manifest):
             ranges = []
             for i in indices:
                 record = dataset[i]
+                if name=='train' and dataset.descriptor.get('composition'):
+                    # Sampling happens after lineage-safe splitting. Heldout data
+                    # never influences retention or supplies training labels.
+                    if record.composition_kind=='verified-proof':
+                        digest=hashlib.sha256(str(manifest['seed']).encode()+record.lineage_id.encode()+record.position_key).digest()
+                        if int.from_bytes(digest[:8],'big') >= int(record.sample_keep*(1<<64)):
+                            continue
                 if eligible_label(record) and (record.exact or not database.execute(
                         'SELECT 1 FROM selected WHERE key=?', (record.position_key,)).fetchone()):
+                    if name=='train' and dataset.descriptor.get('composition'):
+                        if not database.execute('INSERT OR IGNORE INTO composition_seen VALUES (?)',(record.position_key,)).rowcount:
+                            continue
                     append_range(ranges, i)
             result[name] = RangeIndices(ranges)
     return result

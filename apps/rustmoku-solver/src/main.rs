@@ -7,6 +7,8 @@ use rustmoku_engine::{
     OfflineSolver, ProofBook, ProofLimits, ProofOutcome, SolverLimits, SolverResult,
 };
 
+mod facts;
+
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -20,6 +22,16 @@ fn main() -> ExitCode {
 fn run() -> Result<(), Box<dyn Error>> {
     let mut args = Arguments::new(env::args().skip(1));
     match args.command()?.as_str() {
+        "facts-worker" => {
+            args.finish()?;
+            facts::worker()
+        }
+        "root-moves" => {
+            let path = args.required("--record")?;
+            args.finish()?;
+            println!("{}", facts::moves_hex(&read_game(&path)?));
+            Ok(())
+        }
         "solve" => solve(args),
         "resume" => resume(args),
         "verify" => verify(args),
@@ -136,7 +148,15 @@ fn query(mut args: Arguments) -> Result<(), Box<dyn Error>> {
 }
 
 fn read_game(path: &str) -> Result<Game, Box<dyn Error>> {
-    Ok(Game::from_record(&fs::read_to_string(path)?)?)
+    use std::io::Read as _;
+    let mut text = String::new();
+    fs::File::open(path)?
+        .take(16_385)
+        .read_to_string(&mut text)?;
+    if text.len() > 16_384 {
+        return Err("record exceeds bounded input limit".into());
+    }
+    Ok(Game::from_record(&text)?)
 }
 
 fn parse_stone(value: &str) -> Result<Stone, Box<dyn Error>> {

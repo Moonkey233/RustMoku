@@ -176,7 +176,7 @@ def seal(model):
         'checks': {kind: file_identity(sidecar(model, kind)) for kind in ('calibration', 'integer')}})
 
 
-def validate_evidence(model, supplied_dataset=None):
+def validate_evidence(model, supplied_dataset=None, *, target_backend_policy='portable'):
     """Re-read the checkpoint-bound corpus; a caller cannot substitute training data."""
     evidence_path = sidecar(model, 'evidence')
     evidence = read_manifest(evidence_path)
@@ -237,9 +237,33 @@ def validate_evidence(model, supplied_dataset=None):
                     raise ValueError('V2 rank or top1 calibration failed')
         else:
             v3 = export['architecture']['architecture_id'] == 4
-            if v3 and check['report'].get('backends') != ['scalar', 'auto', 'avx2']:
-                raise ValueError('V3 requires scalar and SIMD integer evidence')
-            if check['report'].get('checks') != (45 if v3 else 15):
+            report = check['report']
+            portable = v3 and report.get('backend_evidence_version') == 1
+            if portable:
+                cpu = report.get('cpu',{})
+                if (report.get('architecture') != export['architecture'] or report.get('target_backend_policy') != 'portable'
+                    or report.get('backends') != ['scalar','auto'] or cpu.get('avx2') not in ('true','false')
+                    or not isinstance(cpu.get('architecture'),str) or not cpu['architecture']
+                    or (cpu.get('avx2')=='true' and cpu.get('architecture') not in ('x86','x86_64'))
+                    or cpu.get('auto') != ('avx2' if cpu.get('avx2')=='true' else 'scalar')
+                    or report.get('exercised') != {'scalar':'scalar','auto':'avx2' if cpu['avx2']=='true' else 'scalar'}):
+                    raise ValueError('invalid portable backend evidence')
+            elif v3 and report.get('backends') != ['scalar','auto','avx2']:
+                raise ValueError('legacy V3 integer evidence incomplete')
+            if report.get('checks') != (30 if portable else 45 if v3 else 15):
                 raise ValueError('integer differential fixture coverage incomplete')
             inputs[str(check_file(check['engine']))] = check['engine']['sha256']
+    if target_backend_policy not in ('portable','avx2'): raise ValueError('unsupported target backend policy')
+    if target_backend_policy == 'avx2' and export['architecture']['architecture_id'] == 4:
+        target = read_manifest(sidecar(model,'simd-avx2'))
+        report = target['report']
+        if (target.get('kind') != 'simd-avx2' or target.get('status') != 'passed'
+            or target.get('model_sha256') != model_hash or target.get('export_sha256') != evidence['export']['sha256']
+            or report.get('architecture') != export['architecture'] or report.get('target_backend_policy') != 'avx2'
+            or report.get('cpu',{}).get('architecture') not in ('x86','x86_64')
+            or report.get('cpu',{}).get('auto') != 'avx2'
+            or report.get('checks') != 15 or report.get('exercised') != 'avx2' or report.get('cpu',{}).get('avx2') != 'true'):
+            raise ValueError('AVX2 target receipt missing or inconsistent')
+        for identity in (file_identity(sidecar(model,'simd-avx2')), target['engine'], target['producer']):
+            inputs[str(check_file(identity))] = identity['sha256']
     return {'export': export, 'evidence': evidence, 'inputs_sha256': inputs, 'dataset_path': dataset_path, 'resolver': resolver}

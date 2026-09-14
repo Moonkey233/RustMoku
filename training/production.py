@@ -23,6 +23,7 @@ def run(args):
         value=getattr(args,name,None)
         if value is not None: config[name]=value
     output=args.output.resolve(); output.mkdir(parents=True,exist_ok=True)
+    if args.dataset and getattr(args,'opening_db',None):raise ValueError('opening-db is a generation input; cannot relabel an existing dataset identity')
     if args.dataset:
         dataset=args.dataset.resolve()
         with open_dataset(dataset) as data:
@@ -35,15 +36,17 @@ def run(args):
     else:
         generation={key:config[key] for key in ('games','workers','shard_games','depth','nodes','timeout','random_plies','explore_top_k','explore_temperature','explore_plies')}
         dataset=generate(SimpleNamespace(**generation,engine=args.engine,output=output/'data',seed=args.seed,
-                                        model=args.teacher_model,profile=args.teacher_profile))
+                                        model=args.teacher_model,profile=args.teacher_profile,opening_db=getattr(args,'opening_db',None),opening_starts=config.get('opening_starts')))
     # Immutable run identity binds data, teacher inputs, seed and training configuration.
     identity=dict(schema=1,config=config,seed=args.seed,device=args.device,dataset=str(dataset),dataset_sha256=file_hash(dataset),
                   teacher_model_sha256=file_hash(args.teacher_model) if args.teacher_model else None,teacher_profile=args.teacher_profile)
+    if getattr(args,'opening_db',None):identity['opening_db_sha256']=file_hash(args.opening_db)
     save_manifest(output/'production.json',identity)
     checkpoint=output/'checkpoint.pt'
     completed=train(dataset,checkpoint,steps=config['steps'],epochs=config['epochs'],batch_size=config['batch_size'],
         device=args.device,seed=args.seed,resume=args.resume,checkpoint_every=config['checkpoint_every'],
-        learning_rate=config['learning_rate'],policy_target=config['policy_target'])
+        learning_rate=config['learning_rate'],policy_target=config['policy_target'],
+        **{key:config.get(key,default) for key,default in [('exact_weight',4.),('hard_weight',2.),('outcome_weight',.25),('mining_every',0)]})
     model=output/('model-'+file_hash(checkpoint)[:16]+'.rmlp')
     export(checkpoint,dataset,model)
     subprocess.run([sys.executable,str(Path(__file__).with_name('calibrate.py')),'--dataset',str(dataset),
@@ -56,6 +59,7 @@ def run(args):
 def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--config',type=Path,required=True); p.add_argument('--output',type=Path,required=True)
+    p.add_argument('--opening-db',type=Path)
     p.add_argument('--engine',type=Path,required=True); p.add_argument('--dataset',type=Path)
     p.add_argument('--device',default='cpu'); p.add_argument('--batch-size',type=int); p.add_argument('--resume',type=Path)
     p.add_argument('--seed',type=int,default=1); p.add_argument('--teacher-model',type=Path); p.add_argument('--teacher-profile')

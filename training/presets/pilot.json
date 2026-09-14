@@ -16,5 +16,9 @@
   "explore_plies": 80,
   "checkpoint_every": 100,
   "learning_rate": 0.001,
-  "policy_target": "soft"
+  "policy_target": "soft",
+  "exact_weight": 4.0,
+  "hard_weight": 2.0,
+  "outcome_weight": 0.25,
+  "mining_every": 16
 }

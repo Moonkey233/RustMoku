@@ -49,7 +49,7 @@ def promote(experiment, candidate, champion, dataset_path=None):
     a, b = [competition_identity(effective, index, manifest['configuration'].get('process_players')) for index in (0, 1)]
     if a['evaluator'] != 'learned' or a['model_sha256'] != digest:
         raise ValueError('candidate is not the actual Arena player A model')
-    evidence = validate_evidence(candidate, dataset_path)
+    evidence = validate_evidence(candidate, dataset_path, target_backend_policy=manifest['configuration'].get('target_backend_policy','portable'))
     from provenance import sidecar
     receipt = file_identity(sidecar(candidate, 'evidence'))
     if manifest['model_evidence'].get(digest) != receipt:
@@ -105,7 +105,7 @@ def promote(experiment, candidate, champion, dataset_path=None):
     # Keep identical receipts next to the stored model. Their original input
     # references remain auditable; copying is not a new calibration or export.
     from manifest import save_manifest
-    for name in ('export', 'calibration', 'integer', 'evidence'):
+    for name in ('export', 'calibration', 'integer', 'evidence') + (('simd-avx2',) if sidecar(candidate,'simd-avx2').exists() else ()):
         save_manifest(sidecar(model, name), read_manifest(sidecar(candidate, name)))
     result = {'status': 'promoted', 'model_sha256': digest, 'model': str(model.resolve()),
               'experiment_manifest_sha256': file_hash(experiment / 'manifest.json'), 'previous': previous,

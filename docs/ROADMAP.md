@@ -112,7 +112,7 @@ Empirical balance must never be described as proof.
   result-origin presentation.
 - Repaired V0.11 cached Refuted provenance, checkpoint capacity consistency,
   Proof Book verification limits, and per-pass verifier memoization.
-- Safe scalar inference is the V0.12 baseline. SIMD and broad evaluator-margin
+- Safe scalar inference is the oracle; V3 now has an audited AVX2 backend. Broad evaluator-margin
   tuning remain measured V1.0 work; no strength claim follows from smoke data.
 
 Rapfi/Figrid-style learned-evaluation ideas may be studied conceptually, but GPL
@@ -133,7 +133,8 @@ and statistical strength evidence. Current smoke samples are inconclusive.
 Calibrated search profiles, policy LMR, interior proof scheduling, singular
 extension and calibrated experimental ProbCut are implemented research paths.
 Their presence does not establish strength or authorize a default-on promotion.
-Persistent SMP pools and explicit SIMD remain later measured work.
+Worker-owned scratch allocation reuse and isolated AVX2 V3 kernels are implemented.
+Semantic history still resets (including continuation-table memset) every public search; persistent worker threads and history aging remain future measured work.
 
 Work package 1 repairs experiment identity and recovery: Rust-described actual
 player configurations, bound model export/calibration/integer evidence,
@@ -147,8 +148,8 @@ The table below records implementation availability, not validated strength.
 | Area | Current pass status |
 | --- | --- |
 | Compact dataset, split, streaming audit | implemented |
-| Root teacher, exploration, calibrated labels | implemented; broader candidate universe pending |
-| Width-8 integer V2, trainer and evidence | implemented |
+| Root teacher, exploration, calibrated labels | implemented; practical all-legal roots with production descendants; explicit all-legal oracle |
+| V1/V2 and D4 MixLite V3 scalar/AVX2, trainer and evidence | implemented; production scale/strength unvalidated |
 | Search profiles, policy LMR, proof scheduling, singular, ProbCut | implemented, experimental gates retained |
 | Guarded Null Move | experimental/default-off, isolated analysis turn plus real full-depth verification; see Architecture |
 | Application time management and bounded experiments | implemented; clock and budget refinements ongoing |

@@ -1,0 +1,9 @@
+[package]
+name = "rustmoku-book"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+[dependencies]
+rustmoku-core.workspace = true
+rustmoku-engine.workspace = true

@@ -254,7 +254,8 @@ impl std::str::FromStr for SearchProfile {
                 seen |= 1 << index;
                 values[index].1 = value.parse().map_err(|_| "invalid named integer")?;
             }
-            if seen != (1 << values.len()) - 1 {
+            // The new policy switch is optional when reading old named profiles.
+            if seen | (1 << (values.len() - 1)) != (1 << values.len()) - 1 {
                 return Err("missing named parameter");
             }
             return base
@@ -357,6 +358,8 @@ mod tests {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ResearchParameters {
     pub lmr_v2: bool,
+    /// Independent ablation; true preserves legacy V2 profiles that coupled policy.
+    pub lmr_v2_policy: bool,
     pub lmr_divisor: u16,
     pub lmr_cut_bonus: u8,
     pub improving: bool,
@@ -384,6 +387,7 @@ pub struct ResearchParameters {
 impl ResearchParameters {
     pub const OFF: Self = Self {
         lmr_v2: false,
+        lmr_v2_policy: true,
         lmr_divisor: 4,
         lmr_cut_bonus: 1,
         improving: false,
@@ -429,7 +433,7 @@ impl ResearchParameters {
             && (1..=2).contains(&self.policy_max_depth)
             && (1..=20).contains(&self.policy_tail_percent)
     }
-    fn fields(self) -> [(&'static str, i32); 24] {
+    fn fields(self) -> [(&'static str, i32); 25] {
         [
             ("lmr_v2", i32::from(self.lmr_v2)),
             ("lmr_divisor", i32::from(self.lmr_divisor)),
@@ -461,9 +465,10 @@ impl ResearchParameters {
             ("growth_max_q8", i32::from(self.growth_max_q8)),
             ("growth_initial_q8", i32::from(self.growth_initial_q8)),
             ("growth_ema_weight", i32::from(self.growth_ema_weight)),
+            ("lmr_v2_policy", i32::from(self.lmr_v2_policy)),
         ]
     }
-    fn from_fields(values: [(&str, i32); 24]) -> Result<Self, &'static str> {
+    fn from_fields(values: [(&str, i32); 25]) -> Result<Self, &'static str> {
         let value = |name: &str| {
             values
                 .iter()
@@ -478,6 +483,7 @@ impl ResearchParameters {
         };
         Ok(Self {
             lmr_v2: flag("lmr_v2")?,
+            lmr_v2_policy: flag("lmr_v2_policy")?,
             lmr_divisor: u16::try_from(value("lmr_divisor")?)
                 .map_err(|_| "lmr_divisor out of range")?,
             lmr_cut_bonus: u8::try_from(value("lmr_cut_bonus")?)

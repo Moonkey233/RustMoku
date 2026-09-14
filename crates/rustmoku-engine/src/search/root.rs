@@ -111,7 +111,7 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
             side,
             state.patterns(),
             &mut moves,
-            tt_move,
+            tt_move.or(self.opening_hint),
             &resources.heuristics,
             0,
             |at| state.policy_score(self.evaluator, at),

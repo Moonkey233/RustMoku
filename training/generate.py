@@ -35,6 +35,11 @@ def generate(args):
                'descendant_universe': 'production-radius-two',
                'analysis_work_per_move': args.nodes if getattr(args, 'explore_top_k', 0) else 0,
                'seed': args.seed, 'games': args.games, 'shard_games': args.shard_games}
+    opening_db=getattr(args,'opening_db',None)
+    if opening_db:
+        teacher['opening_starts']={'source':'empirical-database-positions-only','sha256':file_hash(opening_db),'min_plies':2,'max_plies':16,'selection':'splitmix64-game-id-canonical-v1'}
+    elif getattr(args,'opening_starts',None)=='builtin':
+        teacher['opening_starts']={'source':'builtin-suite','selection':'splitmix64-game-id-v1'}
     run_id = hashlib.sha256(json.dumps(teacher, sort_keys=True).encode()).hexdigest()
     save_split_manifest(args.output / 'run.json', {'version': 1, 'run_id': run_id, 'teacher': teacher})
     shards = []
@@ -61,6 +66,9 @@ def generate(args):
                 if file_hash(args.model) != teacher['model_sha256']:
                     raise ValueError('teacher model changed during generation')
                 model_args += ['--model', str(args.model.resolve())]
+            if opening_db:
+                if file_hash(opening_db)!=teacher['opening_starts']['sha256']:raise ValueError('opening database changed during generation')
+                model_args += ['--opening-db',str(Path(opening_db).resolve())]
             subprocess.run([str(args.engine.resolve()), 'selfplay', '--games', str(count),
                             '--seed', str(seed), '--first-game', str(first), '--workers', str(args.workers),
                             '--depth', str(args.depth), '--nodes', str(args.nodes),
@@ -114,6 +122,8 @@ def main():
     parser.add_argument('--depth', type=int, default=4)
     parser.add_argument('--nodes', type=int, default=5000)
     parser.add_argument('--random-plies', type=int, default=2)
+    parser.add_argument('--opening-db',type=Path,help='empirical canonical 2..16-ply starts; no book scores imported')
+    parser.add_argument('--opening-starts',choices=['builtin'])
     parser.add_argument('--timeout', type=float, default=60, help='maximum seconds per shard')
     generate(parser.parse_args())
 

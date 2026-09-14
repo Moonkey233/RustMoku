@@ -74,3 +74,8 @@ pub use search::{
 pub use search_control::{CancellationToken, SearchTermination};
 pub use search_profile::{ResearchParameters, ScoreContract, SearchParameters, SearchProfile};
 pub use transposition_table::TranspositionTableStatistics;
+
+mod opening_database;
+pub use opening_database::{
+    OpeningDatabase, OpeningEntry, OpeningIdentity, OpeningMove, OpeningPolicy,
+};

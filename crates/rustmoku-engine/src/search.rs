@@ -188,6 +188,7 @@ pub enum SearchOrigin {
     Vcf,
     Vct,
     ProofBook,
+    OpeningBook,
 }
 
 /// A completed iteration or exact tactical proof, never a partial aspiration PV.
@@ -313,6 +314,7 @@ pub struct AlphaBetaEngine<E = PatternEvaluator> {
     proof_book: Option<Arc<VerifiedProofBook>>,
     scratch: Option<WorkerScratch>,
     helper_scratch: Vec<WorkerScratch>,
+    opening_database: Option<(Arc<crate::OpeningDatabase>, crate::OpeningPolicy)>,
 }
 
 impl<E> AlphaBetaEngine<E> {
@@ -333,6 +335,7 @@ impl<E> AlphaBetaEngine<E> {
             proof_book: None,
             scratch: None,
             helper_scratch: Vec::new(),
+            opening_database: None,
         }
     }
 
@@ -448,6 +451,44 @@ impl<E: Evaluator> SearchEngine for AlphaBetaEngine<E> {
 }
 
 impl<E: Evaluator> AlphaBetaEngine<E> {
+    /// The application supplies its frozen engine/build identity. Model and
+    /// effective profile are checked here and again at every root after changes.
+    pub fn set_opening_database(
+        &mut self,
+        database: Arc<crate::OpeningDatabase>,
+        policy: crate::OpeningPolicy,
+        engine_build: &str,
+    ) -> Result<(), &'static str> {
+        if database.identity().engine_build != engine_build
+            || database.identity().model != self.evaluator.model_fingerprint()
+            || database.identity().profile
+                != self
+                    .config
+                    .effective_profile(self.evaluator.score_contract())
+        {
+            return Err("opening database engine/model/profile mismatch");
+        }
+        self.opening_database = Some((database, policy));
+        Ok(())
+    }
+    pub fn clear_opening_database(&mut self) {
+        self.opening_database = None;
+    }
+    fn opening_hit(
+        &self,
+        position: &Position,
+    ) -> Option<(crate::OpeningMove, crate::OpeningPolicy)> {
+        let (db, policy) = self.opening_database.as_ref()?;
+        if db.identity().model != self.evaluator.model_fingerprint()
+            || db.identity().profile
+                != self
+                    .config
+                    .effective_profile(self.evaluator.score_contract())
+        {
+            return None;
+        }
+        Some((*db.query(position, db.identity())?.moves.first()?, *policy))
+    }
     #[allow(clippy::too_many_arguments)]
     fn search_with_budget(
         &mut self,
@@ -566,6 +607,20 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
                 return completed;
             }
         }
+        if let Some((hit, crate::OpeningPolicy::BookMove)) = self.opening_hit(root_position) {
+            let mut result = search_result(
+                Some(hit.at),
+                hit.score,
+                limits,
+                0,
+                0,
+                vec![hit.at],
+                *statistics,
+            );
+            result.origin = SearchOrigin::OpeningBook;
+            observer.on_info(SearchInfo::from(&result));
+            return result;
+        }
         if self.config.tactical().vcf.enabled() && !forcing_moves(state.patterns(), side).is_empty()
         {
             let proof = state.prove_vcf(&mut self.vcf, side, self.config.vcf_max_plies(), budget);
@@ -668,6 +723,7 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
     ) -> SearchResult {
         let threads = self.config.threads();
         let mut principal = AbContext::new(&self.evaluator, &self.table, self.generation, 0);
+        principal.opening_hint = self.opening_hit(root_position).map(|(hit, _)| hit.at);
         principal.selectivity = self.config.selectivity();
         principal.root_resistance = self.config.root_resistance();
         principal.adaptive_root_candidates = self.config.adaptive_root_candidates();
@@ -1091,6 +1147,7 @@ struct AbContext<'a, E: Evaluator> {
     table: &'a TranspositionTable,
     generation: u8,
     root_rotation: usize,
+    opening_hint: Option<Move>,
     selectivity: crate::SelectivityConfig,
     root_resistance: bool,
     adaptive_root_candidates: bool,
@@ -1136,6 +1193,7 @@ impl<'a, E: Evaluator> AbContext<'a, E> {
             table,
             generation,
             root_rotation,
+            opening_hint: None,
             selectivity: crate::SelectivityConfig::BASELINE,
             root_resistance: false,
             adaptive_root_candidates: false,

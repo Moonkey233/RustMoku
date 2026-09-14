@@ -65,15 +65,73 @@ fn run() -> Result<(), Box<dyn Error>> {
         "record" => generate_record(args),
         "analyze" => analyze_record(args),
         "proof" => generate_proof(args),
+        "opening" => generate_opening(args),
         "selfplay" => generate_selfplay(args),
         "inspect" => inspect(args),
         "model-check" => model_check(args),
+        "backend-info" => {
+            args.finish()?;
+            println!("architecture={}", std::env::consts::ARCH);
+            println!(
+                "auto={}",
+                rustmoku_engine::EvaluatorBackend::detect().name()
+            );
+            println!(
+                "avx2={}",
+                rustmoku_engine::EvaluatorBackend::avx2().is_some()
+            );
+            Ok(())
+        }
         "help" | "--help" | "-h" => {
             usage();
             Ok(())
         }
         other => Err(format!("unknown command {other:?}").into()),
     }
+}
+
+fn generate_opening(mut args: Arguments) -> Result<(), Box<dyn Error>> {
+    let database =
+        rustmoku_engine::OpeningDatabase::read_from_path(args.required("--opening-db")?)?;
+    let output = PathBuf::from(args.required("--output")?);
+    let maximum: usize = args.optional("--max-positions")?.unwrap_or(1000);
+    args.finish()?;
+    if maximum == 0 || maximum > 100_000 {
+        return Err("opening export limit must be 1..100000".into());
+    }
+    let mut records = Vec::new();
+    for (index, key) in database
+        .start_keys(0, 225)
+        .into_iter()
+        .take(maximum)
+        .enumerate()
+    {
+        let game = database.replay_start(key)?;
+        let entry = database
+            .query(game.position(), database.identity())
+            .ok_or("opening query failed")?;
+        let best = entry.moves.first().ok_or("opening has no ranked move")?;
+        records.push(DataRecord {
+            game_id: index as u64,
+            ply: game.position().move_count() as u16,
+            canonical_symmetry: 0,
+            policy_move: Some(best.at),
+            value: best.score,
+            source: SearchOrigin::OpeningBook,
+            exact: false,
+            position: key,
+            quality: Some(LabelQuality {
+                completed_depth: entry.depth,
+                requested_depth: entry.depth,
+                termination: 0,
+                work: entry.work,
+                budget: entry.work,
+            }),
+        });
+    }
+    write_dataset(&output, &records)?;
+    println!("empirical opening records={}", records.len());
+    Ok(())
 }
 
 fn pipe_player(mut args: Arguments) -> Result<(), Box<dyn Error>> {
@@ -394,6 +452,17 @@ fn generate_selfplay(mut args: Arguments) -> Result<(), Box<dyn Error>> {
     let depth = args.optional("--depth")?.unwrap_or(6);
     let nodes = args.optional("--nodes")?.unwrap_or(20_000);
     let random_plies: usize = args.optional("--random-plies")?.unwrap_or(0);
+    let opening_database = args
+        .optional::<PathBuf>("--opening-db")?
+        .map(rustmoku_engine::OpeningDatabase::read_from_path)
+        .transpose()?;
+    let opening_keys = opening_database
+        .as_ref()
+        .map(|db| db.start_keys(2, 16))
+        .unwrap_or_default();
+    if opening_database.is_some() && opening_keys.is_empty() {
+        return Err("opening database has no eligible 2..16-ply starts".into());
+    }
     let explore_top_k: usize = args.optional("--explore-top-k")?.unwrap_or(0);
     let explore_temperature: f64 = args.optional("--explore-temperature")?.unwrap_or(1000.0);
     let explore_plies: usize = args.optional("--explore-plies")?.unwrap_or(80);
@@ -437,6 +506,8 @@ fn generate_selfplay(mut args: Arguments) -> Result<(), Box<dyn Error>> {
         let mut handles = Vec::new();
         for worker in 0..workers {
             let evaluator = evaluator.clone();
+            let opening_database = &opening_database;
+            let opening_keys = &opening_keys;
             handles.push(scope.spawn(move || -> Result<SelfplayBatch, String> {
                 // Independent persistent teacher state: no globally locked
                 // engine and no scheduler-dependent cross-worker TT sharing.
@@ -446,10 +517,15 @@ fn generate_selfplay(mut args: Arguments) -> Result<(), Box<dyn Error>> {
                 for local_game in (worker..games).step_by(workers) {
                     let game_id = first_game + local_game as u64;
                     teacher.clear_transposition_table();
-                    let opening_index = (splitmix64(seed ^ game_id) as usize) % OPENINGS.len();
-                    let mut game = OPENINGS[opening_index]
-                        .game()
-                        .map_err(|error| error.to_string())?;
+                    let choice = splitmix64(seed ^ game_id) as usize;
+                    let mut game = if let Some(db) = opening_database {
+                        db.replay_start(opening_keys[choice % opening_keys.len()])
+                            .map_err(|error| error.to_string())?
+                    } else {
+                        OPENINGS[choice % OPENINGS.len()]
+                            .game()
+                            .map_err(|error| error.to_string())?
+                    };
                     let opening_plies = game.history().len();
                     while game.status() == rustmoku_core::GameStatus::Ongoing {
                         let record = label_position(
@@ -917,6 +993,7 @@ const fn origin_tag(origin: SearchOrigin) -> u8 {
         SearchOrigin::Vcf => 5,
         SearchOrigin::Vct => 6,
         SearchOrigin::ProofBook => 7,
+        SearchOrigin::OpeningBook => 8,
     }
 }
 
@@ -930,6 +1007,7 @@ fn decode_origin(tag: u8) -> Result<SearchOrigin, Box<dyn Error>> {
         5 => SearchOrigin::Vcf,
         6 => SearchOrigin::Vct,
         7 => SearchOrigin::ProofBook,
+        8 => SearchOrigin::OpeningBook,
         _ => return Err("invalid result-source tag".into()),
     })
 }

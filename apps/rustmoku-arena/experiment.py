@@ -250,7 +250,7 @@ def run(configuration, output):
             continue
         model = Path(player['model']['path'])
         if sidecar(model, 'evidence').exists():
-            evidence = validate_evidence(model)
+            evidence = validate_evidence(model,target_backend_policy=configuration.get('target_backend_policy','portable'))
             inputs.update(evidence['inputs_sha256'])
             model_evidence[player['model']['sha256']] = {'path': str(sidecar(model, 'evidence').resolve()),
                                                         'sha256': digest(sidecar(model, 'evidence'))}

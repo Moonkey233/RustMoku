@@ -19,7 +19,7 @@ const BOARD_MARGIN: f32 = 28.0;
 const BOARD_COLOR: Color32 = Color32::from_rgb(216, 171, 103);
 const GRID_COLOR: Color32 = Color32::from_rgb(63, 45, 28);
 const LAST_MOVE_COLOR: Color32 = Color32::from_rgb(210, 48, 42);
-const HISTORY_PANEL_WIDTH: f32 = 260.0;
+const HISTORY_PANEL_WIDTH: f32 = 280.0;
 const NATIVE_DEPTH: u8 = 8;
 const NATIVE_MAX_AUTO_THREADS: usize = 8;
 const NATIVE_TT_MEMORY_MIB: usize = 128;
@@ -71,7 +71,7 @@ fn native_defaults(available_threads: usize) -> NativeDefaults {
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([960.0, 850.0])
+            .with_inner_size([980.0, 850.0])
             .with_min_inner_size([720.0, 650.0]),
         ..Default::default()
     };

@@ -11,7 +11,8 @@ pub struct Position {
     move_count: usize,
     last_move: Option<Move>,
     winner: Option<Stone>,
-    analysis_depth: usize,
+    // Analysis nesting is bounded; keep the counter in Position padding.
+    analysis_depth: u8,
 }
 
 /// Opaque state required to reverse exactly one successful move.
@@ -31,7 +32,7 @@ pub struct MoveUndo {
 pub struct AnalysisTurnUndo {
     side: Stone,
     count: usize,
-    depth: usize,
+    depth: u8,
     last: Option<Move>,
 }
 

@@ -256,24 +256,39 @@ WDL evidence is `max(0, dot/value_divisor)+1`. Q15 win-minus-loss is converted
 through the bounded rational value contract. The independent integer reference
 rebuilds the board; Rust uses bounded incremental updates.
 
-V3 export and integer receipts are scalar research diagnostics. Existing formal
-promotion/calibration evidence admission deliberately remains closed for V3;
-this pipeline does not produce a trained champion or strength evidence. Main
-`train.py` V1/V2 behavior is retained. `mixlite.py` remains the scalar/reference
-trainer and exporter. Its verification compares Python integers with Rust scalar
-and automatic dispatch over 30 outputs. The runtime AVX2 kernels preserve that
-scalar contract; architecture ID 4 uses reversal-canonical lines and D4 rings.
+V3 formal export, calibration and integer evidence now use the common
+architecture-aware admission path. `mixlite.py verify` remains a research-only
+receipt; formal verification uses `verify_integer.py`. A portable V3 model
+requires Python integer == Rust scalar == Rust auto (30 comparisons), with
+architecture, CPU availability and exercised backend recorded. An explicitly
+AVX2 competition target additionally requires the separate `simd-avx2` receipt:
 
-`mixlite_production.py` adds a batched float32 QAT trainer with explicit
-`--device cpu|cuda`, `--batch-size`, `--steps`, `--epochs`, `--resume`,
-`--checkpoint-every`, and soft/ranking targets. Dataset records are loaded lazily;
-lineage splits precede deterministic augmentation. Resume preserves optimizer,
-epoch cursor and configuration. Ordinary labels retain fixed-horizon semantics;
-exact labels and outcomes have separate supervision. Mining tags identify policy,
-candidate, value and tactical misses and forced losses for batch weighting.
-CUDA and large-scale throughput are not yet validated. Formal architecture-aware
-evidence admission and production orchestration scripts remain W7 work in progress;
-do not treat research export receipts as promotion evidence.
+```powershell
+python training/verify_integer.py --engine target/debug/rustmoku-data.exe --model v3.rml
+python training/verify_integer.py --engine target/debug/rustmoku-data.exe --model v3.rml --target-backend-policy avx2
+```
+
+Neither receipt supplies playing-strength evidence. Promotion still requires
+frozen dataset/split/model provenance and independent Arena evidence. ARM and
+non-AVX2 machines can produce valid portable semantic receipts.
+
+`mixlite_production.py` supplies batched float32 QAT with CPU/CUDA device,
+batch size, steps/epochs, checkpoint/resume, soft/ranking and outcome targets.
+The cached D4 group index tensors move with the model. `--mining-every 0`
+disables online hard-example diagnostics; N>0 samples every Nth step, avoiding
+mandatory GPU-to-CPU policy/WDL transfers on ordinary steps. Presets expose
+`exact_weight`, `hard_weight`, `outcome_weight`, and `mining_every`; these are
+frozen on resume. Exact negative labels are tagged `exact-forced-loss`, not
+resistance ties. A teacher comparison mask never asserts production candidate
+coverage. Train-only scale selection samples deterministically across the
+training partition. Feature construction still happens on CPU; CUDA throughput
+and large-scale convergence remain unmeasured.
+
+`scripts/train-production.ps1` offers smoke/pilot/serious/large configurations,
+CUDA/CPU, batch/scale overrides and resume. `scripts/arena-confirm.ps1` freezes
+independent competition evidence; neither training nor verification promotes a
+model automatically. `mixlite.py` remains the independent scalar training/export
+oracle; V1/V2 compatibility is retained.
 
 Teacher JSON v4 declares root/descendant universes, leaf policy, search domain,
 selectivity and score reference scale. Practical distillation is the default;
