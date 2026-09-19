@@ -126,12 +126,12 @@ class DatasetFile(Sequence[DataRecord]):
             raise ValueError(f"record {index} has an invalid symmetry tag")
         if policy != 0xFF and policy >= CELL_COUNT:
             raise ValueError(f"record {index} has an invalid policy move")
-        if source >= 9:
+        if source >= 10:
             raise ValueError(f"record {index} has an invalid result source")
         if exact not in (0, 1):
             raise ValueError(f"record {index} has an invalid exact flag")
-        if source==8 and exact:
-            raise ValueError('empirical opening source cannot carry an exact label')
+        if source in (8,9) and exact:
+            raise ValueError('empirical opening/forced-block value cannot carry an exact label')
         decode_position_key(key)
         quality = (None,) * 5
         if self.version == 2:
@@ -355,6 +355,8 @@ def split_indices(dataset: Sequence[DataRecord], seed: int) -> dict[str, list[in
 def eligible_label(record: DataRecord) -> bool:
     # Analysis and zero-iteration Fallback are never supervision. Legacy AB
     # lacks depth/work details; its provenance remains explicitly legacy.
+    if record.source==9:
+        return False  # Exact move obligation, unknown value; no value supervision.
     if record.source==8:
         return not record.exact and record.completed_depth is not None and record.completed_depth>0
     return record.source in (3, 4, 5, 6, 7) or (

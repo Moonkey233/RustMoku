@@ -105,6 +105,8 @@ pub struct SearchStatistics {
     pub root_resistance_ties: u64,
     pub root_resistance_researches: u64,
     pub root_candidates_added: u64,
+    /// Exact root move obligations returned without a nominal value search.
+    pub root_forced_blocks: u64,
     pub lmr_reductions: u64,
     pub lmr_researches: u64,
     pub policy_lmr_reductions: u64,
@@ -189,6 +191,8 @@ pub enum SearchOrigin {
     Vct,
     ProofBook,
     OpeningBook,
+    /// The move is forced; the post-block static score is not an exact value.
+    ForcedBlock,
 }
 
 /// A completed iteration or exact tactical proof, never a partial aspiration PV.
@@ -531,6 +535,29 @@ impl<E: Evaluator> AlphaBetaEngine<E> {
             observer.on_info(SearchInfo::from(&result));
             return result;
         }
+        if limits.max_depth != 0
+            && let crate::tactical::ImmediateTactic::ForcedBlock(at) =
+                immediate_tactic(state.patterns(), side)
+        {
+            // Own wins and exact double-threat losses were resolved above.
+            // This obligation authorizes a move, never a position-value bound.
+            let undo = state
+                .make_move(at, &self.evaluator)
+                .expect("exact legal block");
+            let score = -state.evaluate(&self.evaluator).clamp(
+                -crate::evaluation::EVALUATION_LIMIT,
+                crate::evaluation::EVALUATION_LIMIT,
+            );
+            state.unmake_move(undo, &self.evaluator);
+            statistics.root_forced_blocks = 1;
+            statistics.static_evaluations = 1;
+            let _ = budget.charge();
+            statistics.work_nodes = budget.work_nodes();
+            let mut result = search_result(Some(at), score, limits, 0, 0, vec![at], *statistics);
+            result.origin = SearchOrigin::ForcedBlock;
+            observer.on_info(SearchInfo::from(&result));
+            return result;
+        }
         // Static fallback is explicitly not a completed nominal search score.
         let fallback = (limits.max_depth != 0)
             .then(|| {
@@ -841,6 +868,7 @@ impl SearchStatistics {
             ("pvs_researches", self.pvs_researches),
             ("root_resistance_ties", self.root_resistance_ties),
             ("root_candidates_added", self.root_candidates_added),
+            ("root_forced_blocks", self.root_forced_blocks),
             (
                 "root_resistance_researches",
                 self.root_resistance_researches,
@@ -1505,6 +1533,7 @@ fn search_result(
 
 #[cfg(test)]
 mod tests {
+    use super::{Duration, SearchOrigin};
     use rustmoku_core::{Move, Position};
 
     use super::{
@@ -2217,13 +2246,62 @@ mod tests {
     }
 
     #[test]
+    fn public_forced_block_is_a_move_fact_without_iterative_value_authority() {
+        let position = fixture(&[107, 108, 0, 109, 2, 110, 15, 111]);
+        let before = position.clone();
+        let mut engine = AlphaBetaEngine::with_config(
+            crate::PatternEvaluator,
+            EngineConfig::new(1).with_threads(4),
+        );
+        for depth in [1, 255] {
+            let result = engine.search(
+                &position,
+                SearchLimits::new(depth).with_move_time(Duration::from_secs(15)),
+            );
+            assert_eq!(result.best_move, Some(Move::CENTER));
+            assert_eq!(result.principal_variation, [Move::CENTER]);
+            assert_eq!(result.origin, SearchOrigin::ForcedBlock);
+            assert_eq!(result.completed_depth, 0);
+            assert!(result.proof.is_none());
+            assert!(result.score.abs() < crate::score::MATE_THRESHOLD);
+            let s = result.statistics;
+            assert_eq!(
+                (s.root_forced_blocks, s.static_evaluations, s.work_nodes),
+                (1, 1, 1)
+            );
+            assert_eq!(
+                (s.nodes, s.qnodes, s.helper_nodes, s.tt_stores, s.tt_probes),
+                (0, 0, 0, 0, 0)
+            );
+            assert_eq!((s.vcf_probes, s.vct_probes, s.proof_book_probes), (0, 0, 0));
+            assert_eq!((s.aspiration_fail_low, s.aspiration_fail_high), (0, 0));
+            assert_eq!(
+                engine.transposition_table_statistics().hashfull_per_mille,
+                0
+            );
+            assert_eq!(position, before);
+        }
+        let win = fixture(&[109, 0, 110, 1, 112, 2, 113, 3]);
+        let result = engine.search(&win, SearchLimits::new(255));
+        assert_eq!(result.origin, SearchOrigin::Immediate);
+        assert_eq!(result.best_move, Some(Move::from_index(111).unwrap()));
+        assert_eq!(result.score, crate::score::MATE_SCORE - 1);
+        let loss = fixture(&[0, 108, 2, 109, 15, 110, 17, 111]);
+        let result = engine.search(&loss, SearchLimits::new(255));
+        assert_eq!(result.origin, SearchOrigin::Immediate);
+        assert_eq!(result.score, -crate::score::MATE_SCORE + 2);
+    }
+
+    #[test]
     fn single_immediate_threat_restricts_normal_and_capped_qsearch_to_block() {
         let position = fixture(&[107, 108, 0, 109, 2, 110, 15, 111]);
         let mut engine =
             AlphaBetaEngine::with_config(crate::PatternEvaluator, EngineConfig::new(1));
         let result = engine.search(&position, SearchLimits::new(1));
         assert_eq!(result.best_move, Some(Move::CENTER));
-        assert_eq!((result.statistics.nodes, result.statistics.qnodes), (2, 1));
+        // Public selection now returns the obligation before ordinary qsearch.
+        assert_eq!(result.origin, SearchOrigin::ForcedBlock);
+        assert_eq!((result.statistics.nodes, result.statistics.qnodes), (0, 0));
         let (score, pv, stats, _) = q_result(&position, super::MAX_QSEARCH_PLY);
         assert_eq!(pv, [Move::CENTER]);
         assert_eq!(score, result.score);

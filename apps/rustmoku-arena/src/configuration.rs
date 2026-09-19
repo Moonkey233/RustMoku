@@ -127,6 +127,31 @@ fn player(
         return Err("ProbCut calibration does not match model/profile/selectivity".into());
     }
     let (vct_probe, vct_total) = engine.interior_vct();
+    let book = if let Some(path) = &config.opening_database {
+        let path = absolute_file(path)?;
+        let mut bytes = Vec::new();
+        File::open(&path)?
+            .take(64 * 1024 * 1024 + 1)
+            .read_to_end(&mut bytes)?;
+        let database = rustmoku_engine::OpeningDatabase::read_from(&mut bytes.as_slice())?;
+        let identity = database.identity();
+        if identity.engine_build != rustmoku_engine::ENGINE_BUILD_ID
+            || identity.model != model_fingerprint
+            || identity.profile != profile
+        {
+            return Err("opening database engine/model/profile mismatch".into());
+        }
+        let hash = format!("{:x}", Sha256::digest(&bytes));
+        inputs.insert(path, hash.clone());
+        let description = json!({"kind": "empirical-opening-v1", "sha256": hash,
+            "policy": format!("{:?}", config.opening_policy.unwrap_or(rustmoku_engine::OpeningPolicy::OrderOnly)),
+            "engine_build": identity.engine_build, "model_fingerprint": identity.model,
+            "profile": identity.profile.to_string(), "generation": identity.generation});
+        config.prepared_book = Some(std::sync::Arc::new(database));
+        description
+    } else {
+        json!(false)
+    };
     Ok(
         json!({"evaluator": evaluator, "model": model, "threads": engine.threads(),
         "tt_mib": engine.tt_memory_mib(), "root_resistance": engine.root_resistance(),
@@ -145,7 +170,7 @@ fn player(
             "selectivity": {"rfp": selection.reverse_futility, "futility": selection.futility,
                 "razor": selection.razoring, "lmp": selection.lmp, "lmr": selection.lmr,
                 "iir": selection.iir, "extension": selection.threat_extension}},
-        "book": false, "tt_policy": "fresh-per-game-warm-between-moves"}),
+        "book": book, "tt_policy": "fresh-per-game-warm-between-moves"}),
     )
 }
 
@@ -199,4 +224,53 @@ pub(super) fn describe(options: &mut Options) -> Result<Value, Box<dyn Error>> {
             "clock_ms": options.clock.map(|time| time.as_millis() as u64),
             "increment_ms": options.increment.as_millis() as u64,
             "time_manager": "completed-stability-pressure-cost-v3-hard90reserve"}, "inputs_sha256": inputs}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn empirical_book_freezes_bytes_and_rejects_each_identity_mismatch() {
+        let path =
+            std::env::temp_dir().join(format!("rustmoku-arena-book-{}.rmopen", std::process::id()));
+        let mut config = PlayerConfig {
+            opening_database: Some(path.clone()),
+            opening_policy: Some(rustmoku_engine::OpeningPolicy::BookMove),
+            ..PlayerConfig::default()
+        };
+        let identity = rustmoku_engine::OpeningIdentity {
+            engine_build: rustmoku_engine::ENGINE_BUILD_ID.into(),
+            model: rustmoku_engine::PatternEvaluator.model_fingerprint(),
+            profile: config.engine.effective_profile(ScoreContract::Pattern),
+            generation: "fixture".into(),
+        };
+        for mismatch in 0..4 {
+            let mut candidate = identity.clone();
+            match mismatch {
+                1 => candidate.engine_build = "wrong-build".into(),
+                2 => candidate.model = None,
+                3 => candidate.profile = candidate.profile.with_policy_lmr(true),
+                _ => (),
+            }
+            rustmoku_engine::OpeningDatabase::new(candidate)
+                .unwrap()
+                .write_to_path(&path)
+                .unwrap();
+            let result = player(&mut config, &mut BTreeMap::new());
+            if mismatch == 0 {
+                let result = result.unwrap();
+                assert_eq!(result["book"]["policy"], "BookMove");
+                assert_eq!(result["book"]["sha256"], hash_file(&path).unwrap());
+                assert!(config.prepared_book.is_some());
+            } else {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("engine/model/profile mismatch")
+                );
+            }
+        }
+        std::fs::remove_file(path).unwrap();
+    }
 }

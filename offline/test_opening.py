@@ -12,7 +12,7 @@ class OpeningCliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory);record=root/'root.rmg'
             record.write_text('RustMoku 1\nrules=freestyle\nmoves=H8 G8\n')
-            common=['--record',str(record),'--engine-build','fixture','--max-plies','2','--top-k','1','--score-margin','0','--depth','1','--nodes','2000']
+            common=['--record',str(record),'--max-plies','2','--top-k','1','--score-margin','0','--depth','1','--nodes','2000']
             def run(*args,ok=True):
                 result=subprocess.run([str(ENGINE),*args],capture_output=True,text=True,timeout=30)
                 self.assertEqual(result.returncode==0,ok,result.stderr)

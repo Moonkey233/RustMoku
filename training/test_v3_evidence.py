@@ -2,7 +2,6 @@
 import contextlib
 import io
 import json
-import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -17,6 +16,7 @@ ROOT = test_promotion.ROOT
 from test_compact import fixture
 import calibrate
 from verify_integer import verify
+from integration_paths import executable
 
 class V3Evidence(unittest.TestCase):
     fixture = test_promotion.PromotionEvidence.fixture
@@ -25,9 +25,8 @@ class V3Evidence(unittest.TestCase):
         torch.set_num_threads(1)
         cls.storage=tempfile.TemporaryDirectory(prefix='synthetic-v3-evidence-')
         cls.root=Path(cls.storage.name)
-        suffix='.exe' if os.name=='nt' else ''
-        cls.arena=ROOT/f'target/debug/rustmoku-arena{suffix}'
-        cls.engine=ROOT/f'target/debug/rustmoku-data{suffix}'
+        cls.arena=executable('rustmoku-arena')
+        cls.engine=executable('rustmoku-data')
         cls.data=cls.root/'data.rmd'; cls.cp=cls.root/'v3.pt'; cls.model=cls.root/'v3.bin'
         fixture(cls.data)
         train(cls.data,cls.cp,steps=1,epochs=2,batch_size=2)

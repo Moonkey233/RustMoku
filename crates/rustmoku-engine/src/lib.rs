@@ -1,5 +1,9 @@
 #![forbid(unsafe_code)]
 
+/// Shared Core/Engine/SIMD source, toolchain, target and build configuration
+/// identity. Application executable hashes are frozen separately by experiments.
+pub const ENGINE_BUILD_ID: &str = env!("RUSTMOKU_ENGINE_BUILD_ID");
+
 /// Explicit opt-in benchmark driver; not part of the normal engine API.
 #[cfg(feature = "bench-internals")]
 #[doc(hidden)]
@@ -58,8 +62,8 @@ pub use learned::{
 };
 pub use nonlinear::{NONLINEAR_WIDTH, NonlinearEvaluator, NonlinearModel, NonlinearState};
 pub use offline::{
-    MAX_PERSISTED_SOLVER_NODES, OfflineSolver, ProofOutcome, SolverError, SolverLimits,
-    SolverResult, SolverStatistics, SolverTermination,
+    MAX_PERSISTED_SOLVER_NODES, OfflineLeafResult, OfflineSolver, ProofOutcome, SolverError,
+    SolverLimits, SolverResult, SolverStatistics, SolverTermination,
 };
 pub use pattern_state::{PatternDelta, PatternState};
 pub use probcut::{ProbCutBucket, ProbCutCalibration};

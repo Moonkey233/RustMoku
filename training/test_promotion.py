@@ -21,6 +21,7 @@ from promote import promote
 import export
 import calibrate
 from verify_integer import verify
+from integration_paths import executable
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'apps/rustmoku-arena'))
@@ -33,11 +34,8 @@ class PromotionEvidence(unittest.TestCase):
         torch.set_num_threads(1)
         cls.storage = tempfile.TemporaryDirectory(prefix='synthetic promotion only ')
         cls.root = Path(cls.storage.name)
-        suffix = '.exe' if os.name == 'nt' else ''
-        cls.arena = ROOT / f'target/release/rustmoku-arena{suffix}'
-        cls.data_engine = ROOT / f'target/release/rustmoku-data{suffix}'
-        if not cls.arena.is_file() or not cls.data_engine.is_file():
-            raise RuntimeError('build --release -p rustmoku-data -p rustmoku-arena before evidence tests')
+        cls.arena = executable('rustmoku-arena')
+        cls.data_engine = executable('rustmoku-data')
         cls.data = cls.root / 'training.rmd'
         payload = bytearray(DATA_HEADER.pack(DATA_MAGIC, 1, 0, 8))
         for game in range(8):

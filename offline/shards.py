@@ -27,6 +27,7 @@ def frontier(db,output,*,shards,limit=256):
 def validate(manifest,engine):
     if manifest.get('version')!=1 or manifest.get('protocol')!='rustmoku-exact-frontier-v1':raise ValueError('unsupported shard protocol')
     config=manifest['config']
+    if config.get('version')!=2 or 'root_ply' not in config or 'max_additional_plies' not in config:raise ValueError('shards require relative-depth configuration v2')
     if config['engine_sha256']!=fingerprint(engine) or config['attacker'] not in (0,1) or config['rules']!='freestyle':raise ValueError('incompatible frozen shard engine/rules')
     jobs=manifest['jobs'];shards=manifest['shards']
     if not 1<=shards<=256 or len(jobs)>4096:raise ValueError('invalid shard counts')
@@ -55,9 +56,12 @@ def solve_batch(manifest,engine,output,*,shard,workers,work,seconds,cache_bytes,
                 if facts['key']!=job['key']:raise ValueError('shard replay/key mismatch')
                 with db.transaction():root=db.intern(bytes.fromhex(job['key']),moves)
                 solver=DiskSolver(db,native,config['attacker'])
-                result=solver.solve(root,work=work,seconds=seconds,max_depth=config['max_depth'])
+                result=solver.solve(root,work=work,seconds=seconds,max_additional_plies=config['max_additional_plies'])
                 if result['outcome']!='Unknown':result['outcome']=solver.verify_witness(root,max_nodes=work,seconds=seconds)
+                result['statistics']=solver.telemetry()
         except ResourceStop as stop:result={'outcome':'Unknown','reason':str(stop)}
+        result['resources']={'sqlite_cache_bytes':cache_bytes,'disk_budget_bytes':max_disk_bytes,'work_budget':work,
+            'wall_budget':seconds,'scope':'per-job-search; separate bounded witness verification','rss_enforced':False}
         value={'version':1,'job':job,'config':worker_config(manifest,job),'result':result}
         publish(artifact,value);return value
     # Each thread owns a separate native process and SQLite connection.
@@ -89,11 +93,14 @@ def merge(db,manifest,engine,directories,*,work,seconds,cache_bytes,max_disk_byt
                 with db.transaction():
                     for source_id,outcome in source.connection.execute('SELECT id,outcome FROM certificates ORDER BY id'):
                         node=source.node(source_id);target=db.intern(node.key,node.moves)
+                        existing=db.node(target)
+                        if existing.outcome not in (0,outcome):
+                            raise ValueError('conflicting coordinator/shard witness')
                         edges=[]
                         for move,child_id in source.children(source_id):
                             child=source.node(child_id);edges.append((move,db.intern(child.key,child.moves)))
                         if node.expanded:db.expand(target,edges)
-                        coordinator.result(target,outcome,0 if outcome==1 else (1<<62)-1,0 if outcome==2 else (1<<62)-1)
+                        coordinator.result(target,outcome,0 if outcome==1 else (1<<62)-1,0 if outcome==2 else (1<<62)-1,evidence=node.evidence)
                     coordinator.propagate()
                 merged+=1
     return merged
@@ -105,8 +112,8 @@ def main():
     p.add_argument('--output');p.add_argument('--inputs',nargs='+');p.add_argument('--resume',action='store_true')
     p.add_argument('--shards',type=int,default=1);p.add_argument('--shard',type=int,default=0);p.add_argument('--workers',type=int,default=1)
     p.add_argument('--limit',type=int,default=256);p.add_argument('--nodes',type=int,default=1000);p.add_argument('--seconds',type=float,default=60)
-    p.add_argument('--ram-mib',type=int,default=32);p.add_argument('--disk-mib',type=int,default=1024)
-    args=p.parse_args();options={'cache_bytes':args.ram_mib*1024*1024,'max_disk_bytes':args.disk_mib*1024*1024}
+    p.add_argument('--sqlite-cache-mib','--ram-mib',dest='sqlite_cache_mib',type=int,default=32);p.add_argument('--disk-mib',type=int,default=1024)
+    args=p.parse_args();options={'cache_bytes':args.sqlite_cache_mib*1024*1024,'max_disk_bytes':args.disk_mib*1024*1024}
     try:
         if args.command=='solve-batch':
             if not args.output:raise ValueError('--output required')

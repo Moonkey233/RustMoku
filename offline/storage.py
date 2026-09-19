@@ -11,7 +11,7 @@ import json
 import sqlite3
 from pathlib import Path
 
-VERSION=1
+VERSION=2
 INFINITY=(1<<62)-1
 SCHEMA=(
     'CREATE TABLE metadata (id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER NOT NULL, config BLOB NOT NULL)',
@@ -20,7 +20,7 @@ SCHEMA=(
     'CREATE INDEX frontier ON nodes(outcome,expanded,id)',
     'CREATE INDEX parents ON edges(child,parent)',
     'CREATE TABLE dirty (id INTEGER PRIMARY KEY REFERENCES nodes(id))',
-    'CREATE TABLE certificates (id INTEGER PRIMARY KEY REFERENCES nodes(id), outcome INTEGER NOT NULL CHECK(outcome IN (1,2)), distance INTEGER NOT NULL CHECK(distance BETWEEN 0 AND 225), action INTEGER NOT NULL CHECK(action BETWEEN -1 AND 225))',
+    'CREATE TABLE certificates (id INTEGER PRIMARY KEY REFERENCES nodes(id), outcome INTEGER NOT NULL CHECK(outcome IN (1,2)), distance INTEGER NOT NULL CHECK(distance BETWEEN 0 AND 225), action INTEGER NOT NULL CHECK(action BETWEEN -1 AND 226))',
 )
 
 @dataclasses.dataclass(frozen=True)
@@ -40,6 +40,7 @@ class ResourceStop(Exception):
 class DiskNodes:
     def __init__(self,path,config,*,cache_bytes=4*1024*1024,max_disk_bytes=1024*1024*1024,resume=False):
         if cache_bytes<4096 or max_disk_bytes<65536: raise ResourceStop('insufficient working storage budget')
+        self.transactions=0
         self.path=Path(path)
         encoded=json.dumps(config,sort_keys=True,separators=(',',':'),allow_nan=False).encode()
         if len(encoded)>65536: raise ValueError('working config exceeds limit')
@@ -77,6 +78,7 @@ class DiskNodes:
     def transaction(self):
         try:
             with self.connection:yield self
+            self.transactions+=1
         except sqlite3.OperationalError as e:
             if 'full' in str(e).lower() or 'memory' in str(e).lower(): raise ResourceStop(str(e)) from e
             raise

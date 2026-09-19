@@ -53,6 +53,10 @@ pub(super) enum TextKey {
     ResearchProfile,
     BaselineProfile,
     LoadModel,
+    EmpiricalBook,
+    LoadBook,
+    ClearBook,
+    BookDisabled,
     UsePattern,
     CurrentMove,
     Time,
@@ -142,6 +146,14 @@ impl UiText {
             (UiLanguage::English, TextKey::BaselineProfile) => "Baseline research options",
             (UiLanguage::English, TextKey::ModelPath) => "Model:",
             (UiLanguage::English, TextKey::LoadModel) => "Load model",
+            (UiLanguage::English, TextKey::EmpiricalBook) => {
+                "Empirical opening database (not proof)"
+            }
+            (UiLanguage::English, TextKey::LoadBook) => "Load book",
+            (UiLanguage::English, TextKey::ClearBook) => "Disable book",
+            (UiLanguage::English, TextKey::BookDisabled) => {
+                "No active book; reload after model/profile changes"
+            }
             (UiLanguage::English, TextKey::UsePattern) => "Use Pattern",
             (UiLanguage::English, TextKey::CurrentMove) => "Current move",
             (UiLanguage::English, TextKey::Time) => "Time",
@@ -207,6 +219,12 @@ impl UiText {
             (UiLanguage::SimplifiedChinese, TextKey::BaselineProfile) => "基线研究选项",
             (UiLanguage::SimplifiedChinese, TextKey::ModelPath) => "模型：",
             (UiLanguage::SimplifiedChinese, TextKey::LoadModel) => "载入模型",
+            (UiLanguage::SimplifiedChinese, TextKey::EmpiricalBook) => "经验开局库（不是精确证明）",
+            (UiLanguage::SimplifiedChinese, TextKey::LoadBook) => "载入开局库",
+            (UiLanguage::SimplifiedChinese, TextKey::ClearBook) => "停用开局库",
+            (UiLanguage::SimplifiedChinese, TextKey::BookDisabled) => {
+                "未启用开局库；模型或配置变更后须重新载入"
+            }
             (UiLanguage::SimplifiedChinese, TextKey::UsePattern) => "使用模式评估",
             (UiLanguage::SimplifiedChinese, TextKey::CurrentMove) => "本手用时",
             (UiLanguage::SimplifiedChinese, TextKey::Time) => "用时",
@@ -330,6 +348,12 @@ impl UiText {
                 }
             });
         match (self.language, search.origin) {
+            (UiLanguage::English, SearchOrigin::ForcedBlock) => {
+                "Forced block · heuristic value".into()
+            }
+            (UiLanguage::SimplifiedChinese, SearchOrigin::ForcedBlock) => {
+                "唯一必挡点 · 分数仅为静态估值".into()
+            }
             (UiLanguage::English, SearchOrigin::OpeningBook) => {
                 "Result: empirical opening book".into()
             }

@@ -71,6 +71,49 @@ fn response(encoded: &str) -> Result<String, Box<dyn Error>> {
     Ok(output)
 }
 
+fn leaf_response(request: &str) -> Result<String, Box<dyn Error>> {
+    use rustmoku_engine::{OfflineSolver, ProofLimits, ProofOutcome, SolverLimits};
+    let parts: Vec<_> = request.split('|').collect();
+    if parts.len() != 8 || parts[0] != "L" {
+        return Err("invalid leaf request".into());
+    }
+    let attacker = match parts[1] {
+        "0" => Stone::Black,
+        "1" => Stone::White,
+        _ => return Err("invalid leaf attacker".into()),
+    };
+    let game = replay(parts[7])?;
+    let limits = SolverLimits::new(parts[6].parse()?)
+        .with_vcf(ProofLimits::new(parts[2].parse()?, parts[3].parse()?))
+        .with_vct(ProofLimits::new(parts[4].parse()?, parts[5].parse()?));
+    let mut solver = OfflineSolver::new(&game, attacker)?;
+    let result = solver.probe_leaf(limits)?;
+    let mut certificate = Vec::new();
+    if result.outcome == ProofOutcome::ProvenWin {
+        // Export independently rechecks tactical evidence under declared limits.
+        solver.export_proof_book()?.write_to(&mut certificate)?;
+        if certificate.len() > 4096 {
+            return Err("oversized tactical leaf certificate".into());
+        }
+    }
+    let stats = result.statistics;
+    Ok(format!(
+        "{{\"version\":1,\"key\":\"{}\",\"outcome\":\"{:?}\",\"book\":\"{}\",\"terminal\":{},\"immediate_hits\":{},\"vcf_attempts\":{},\"vcf_proven\":{},\"vcf_work\":{},\"vct_attempts\":{},\"vct_proven\":{},\"vct_work\":{},\"work\":{}}}",
+        hex(CanonicalPosition::new(game.position()).key().as_bytes()),
+        result.outcome,
+        hex(&certificate),
+        game.status() != rustmoku_core::GameStatus::Ongoing,
+        u8::from(result.immediate_hit),
+        stats.vcf_attempts,
+        stats.vcf_proven,
+        result.vcf_work,
+        stats.vct_attempts,
+        stats.vct_proven,
+        result.vct_work,
+        stats.work_nodes
+    ))
+}
+
 pub fn worker() -> Result<(), Box<dyn Error>> {
     let input = io::stdin();
     let mut input = input.lock();
@@ -78,14 +121,20 @@ pub fn worker() -> Result<(), Box<dyn Error>> {
     let mut output = output.lock();
     loop {
         let mut line = String::new();
-        let count = input.by_ref().take(453).read_line(&mut line)?;
+        let count = input.by_ref().take(1025).read_line(&mut line)?;
         if count == 0 {
             return Ok(());
         }
-        if count > 452 || !line.ends_with('\n') {
+        if count > 1024 || !line.ends_with('\n') {
             return Err("oversized or truncated facts request".into());
         }
-        writeln!(output, "{}", response(line.trim_end_matches(['\r', '\n']))?)?;
+        let request = line.trim_end_matches(['\r', '\n']);
+        let reply = if request.starts_with("L|") {
+            leaf_response(request)?
+        } else {
+            response(request)?
+        };
+        writeln!(output, "{reply}")?;
         output.flush()?;
     }
 }

@@ -26,6 +26,7 @@ enum Command {
     Search(Box<SearchRequest>),
     Reconfigure(Box<EngineConfig>),
     ReplaceEvaluator(RuntimeEvaluator),
+    OpeningBook(Option<(std::path::PathBuf, rustmoku_engine::OpeningPolicy)>),
     Shutdown,
 }
 
@@ -47,12 +48,14 @@ pub(super) struct SearchWorker {
     handle: Option<JoinHandle<()>>,
     request_id: u64,
     cancellation: Option<CancellationToken>,
+    book_status: mpsc::Receiver<Result<Option<String>, String>>,
 }
 
 impl SearchWorker {
     pub(super) fn new(config: EngineConfig) -> io::Result<Self> {
         let (requests, incoming) = mpsc::channel();
         let (outgoing, events) = mpsc::channel();
+        let (book_outgoing, book_status) = mpsc::channel();
         let handle = thread::Builder::new()
             .name("rustmoku-search".into())
             .spawn(move || {
@@ -97,9 +100,42 @@ impl SearchWorker {
                                 break;
                             }
                         }
-                        Command::Reconfigure(config) => engine.reconfigure(*config),
+                        Command::Reconfigure(config) => {
+                            engine.clear_opening_database();
+                            engine.reconfigure(*config);
+                            let _ = book_outgoing.send(Ok(None));
+                        }
                         Command::ReplaceEvaluator(evaluator) => {
+                            engine.clear_opening_database();
                             engine.replace_evaluator(evaluator);
+                            let _ = book_outgoing.send(Ok(None));
+                        }
+                        Command::OpeningBook(request) => {
+                            // Failed replacement disables the old empirical book.
+                            engine.clear_opening_database();
+                            let result = request
+                                .map(|(path, policy)| {
+                                    let database =
+                                        rustmoku_engine::OpeningDatabase::read_from_path(&path)
+                                            .map_err(|error| error.to_string())?;
+                                    let status = format!(
+                                        "{} | {:?} | {} entries | {}",
+                                        path.display(),
+                                        policy,
+                                        database.len(),
+                                        database.identity().engine_build
+                                    );
+                                    engine
+                                        .set_opening_database(
+                                            std::sync::Arc::new(database),
+                                            policy,
+                                            rustmoku_engine::ENGINE_BUILD_ID,
+                                        )
+                                        .map_err(str::to_owned)?;
+                                    Ok(status)
+                                })
+                                .transpose();
+                            let _ = book_outgoing.send(result);
                         }
                         Command::Shutdown => break,
                     }
@@ -111,6 +147,7 @@ impl SearchWorker {
             handle: Some(handle),
             request_id: 0,
             cancellation: None,
+            book_status,
         })
     }
 
@@ -170,6 +207,20 @@ impl SearchWorker {
         self.events.try_recv()
     }
 
+    pub(super) fn opening_book(
+        &mut self,
+        request: Option<(std::path::PathBuf, rustmoku_engine::OpeningPolicy)>,
+    ) -> Result<(), &'static str> {
+        self.invalidate();
+        self.requests
+            .send(Command::OpeningBook(request))
+            .map_err(|_| "Search worker disconnected.")
+    }
+
+    pub(super) fn poll_book_status(&self) -> Option<Result<Option<String>, String>> {
+        self.book_status.try_iter().last()
+    }
+
     /// Central admission gate for *every* event, including completed results.
     pub(super) fn accept(&mut self, event: &SearchEvent) -> bool {
         let id = match event {
@@ -199,6 +250,65 @@ impl Drop for SearchWorker {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn empirical_book_replacement_failure_and_reconfiguration_disable_it() {
+        use rustmoku_engine::{
+            Evaluator, OpeningDatabase, OpeningIdentity, OpeningPolicy, ScoreContract,
+        };
+        let path = std::env::temp_dir().join(format!(
+            "rustmoku-native-book-{}.rmopen",
+            std::process::id()
+        ));
+        let config = EngineConfig::new(0);
+        let identity = OpeningIdentity {
+            engine_build: rustmoku_engine::ENGINE_BUILD_ID.into(),
+            model: RuntimeEvaluator::Pattern.model_fingerprint(),
+            profile: config.effective_profile(ScoreContract::Pattern),
+            generation: "fixture".into(),
+        };
+        OpeningDatabase::new(identity.clone())
+            .unwrap()
+            .write_to_path(&path)
+            .unwrap();
+        let mut worker = SearchWorker::new(config).unwrap();
+        worker
+            .opening_book(Some((path.clone(), OpeningPolicy::BookMove)))
+            .unwrap();
+        assert!(
+            worker
+                .book_status
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap()
+                .is_some()
+        );
+        worker.reconfigure(config).unwrap();
+        assert!(
+            worker
+                .book_status
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap()
+                .is_none()
+        );
+        let mut wrong = identity;
+        wrong.engine_build = "wrong".into();
+        OpeningDatabase::new(wrong)
+            .unwrap()
+            .write_to_path(&path)
+            .unwrap();
+        worker
+            .opening_book(Some((path.clone(), OpeningPolicy::BookMove)))
+            .unwrap();
+        assert!(
+            worker
+                .book_status
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .is_err()
+        );
+        std::fs::remove_file(path).unwrap();
+    }
     use super::*;
 
     #[test]

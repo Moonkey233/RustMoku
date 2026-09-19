@@ -19,7 +19,7 @@ const BOARD_MARGIN: f32 = 28.0;
 const BOARD_COLOR: Color32 = Color32::from_rgb(216, 171, 103);
 const GRID_COLOR: Color32 = Color32::from_rgb(63, 45, 28);
 const LAST_MOVE_COLOR: Color32 = Color32::from_rgb(210, 48, 42);
-const HISTORY_PANEL_WIDTH: f32 = 280.0;
+const HISTORY_PANEL_WIDTH: f32 = 300.0;
 const NATIVE_DEPTH: u8 = 8;
 const NATIVE_MAX_AUTO_THREADS: usize = 8;
 const NATIVE_TT_MEMORY_MIB: usize = 128;
@@ -71,7 +71,7 @@ fn native_defaults(available_threads: usize) -> NativeDefaults {
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([980.0, 850.0])
+            .with_inner_size([1080.0, 880.0])
             .with_min_inner_size([720.0, 650.0]),
         ..Default::default()
     };
@@ -147,6 +147,9 @@ struct RustMokuApp {
     loaded_contract: ScoreContract,
     loaded_model: Option<String>,
     loaded_identity: String,
+    book_path: String,
+    book_policy: rustmoku_engine::OpeningPolicy,
+    book_status: Option<String>,
 }
 
 impl RustMokuApp {
@@ -198,6 +201,9 @@ impl RustMokuApp {
             loaded_contract: ScoreContract::Pattern,
             loaded_model: None,
             loaded_identity: evaluator_identity(&RuntimeEvaluator::Pattern),
+            book_path: String::from("openings.rmob"),
+            book_policy: rustmoku_engine::OpeningPolicy::OrderOnly,
+            book_status: None,
         }
     }
 
@@ -648,6 +654,54 @@ impl RustMokuApp {
             });
         });
         let previous_threads = self.engine_config.threads();
+        if let Some(status) = self.worker.poll_book_status() {
+            match status {
+                Ok(status) => self.book_status = status,
+                Err(error) => {
+                    self.book_status = None;
+                    self.message = Some(error);
+                }
+            }
+        }
+        ui.collapsing(text.get(TextKey::EmpiricalBook), |ui| {
+            ui.horizontal(|ui| {
+                ui.text_edit_singleline(&mut self.book_path);
+                ui.selectable_value(
+                    &mut self.book_policy,
+                    rustmoku_engine::OpeningPolicy::OrderOnly,
+                    "OrderOnly",
+                );
+                ui.selectable_value(
+                    &mut self.book_policy,
+                    rustmoku_engine::OpeningPolicy::BookMove,
+                    "BookMove",
+                );
+                if ui.button(text.get(TextKey::LoadBook)).clicked() {
+                    self.book_status = None;
+                    if let Err(error) = self
+                        .worker
+                        .opening_book(Some((self.book_path.clone().into(), self.book_policy)))
+                    {
+                        self.message = Some(error.into());
+                    }
+                    self.last_search = None;
+                    self.play_ai_if_needed();
+                }
+                if ui.button(text.get(TextKey::ClearBook)).clicked() {
+                    self.book_status = None;
+                    if let Err(error) = self.worker.opening_book(None) {
+                        self.message = Some(error.into());
+                    }
+                    self.last_search = None;
+                    self.play_ai_if_needed();
+                }
+            });
+            ui.label(
+                self.book_status
+                    .as_deref()
+                    .unwrap_or(text.get(TextKey::BookDisabled)),
+            );
+        });
         let previous_auto = self.threads_auto;
         let previous_tt_memory = self.engine_config.tt_memory_mib();
         let mut tt_memory_mib = previous_tt_memory;
@@ -1018,7 +1072,7 @@ impl eframe::App for RustMokuApp {
         }
         // Stable panel sizes isolate board geometry from PV/proof/history text.
         egui::Panel::top("controls")
-            .exact_size(270.0)
+            .exact_size(300.0)
             .resizable(false)
             .show(ui, |ui| {
                 egui::ScrollArea::vertical()

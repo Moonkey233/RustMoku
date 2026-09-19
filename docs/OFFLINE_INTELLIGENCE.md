@@ -1,7 +1,7 @@
 # Offline intelligence development interface
 
-Run these commands from the repository root. W9 is still in progress; commands
-below exercise the current disk baseline, not a validated production proof farm.
+Run these commands from the repository root. W9 provides bounded offline tooling; million-node throughput and a production
+proof farm have not been validated.
 OpeningDatabase is empirical. GameRecord is chronological. Only a fresh parsed
 and independently verified ProofBook has runtime exact authority.
 
@@ -16,7 +16,9 @@ target/release/rustmoku-book query --output opening.rmopen --record root.rmg
 ```
 
 `-Model` and `-Profile` select the frozen evaluator/profile. The script hashes
-the actual executable; the database binds model fingerprint, effective profile,
+the actual executable before/after generation; the database binds shared
+Core/Engine/SIMD source, compiler, target and build configuration identity,
+model fingerprint, effective profile,
 generation settings and canonical root. Incompatible resume fails. The opening
 builder normalizes each offline position before analysis and reuses the stored
 canonical ranking on both fresh and resumed paths. A two-ply fixture verifies
@@ -31,18 +33,18 @@ If the frontier cap is reached, resume with a larger cap to progress beyond it.
 One-minute work slice (verification can add time, as described below):
 
 ```powershell
-scripts/solve-proof.ps1 -Record root.rmg -Attacker black -Checkpoint proof.db -Output proof.rmp -Nodes 1000 -Seconds 60 -RamMiB 32 -DiskMiB 1024
+scripts/solve-proof.ps1 -Record root.rmg -Attacker black -Checkpoint proof.db -Output proof.rmp -Nodes 1000 -Seconds 60 -SqliteCacheMiB 32 -DiskMiB 1024
 ```
 
 Manual one-hour and overnight examples, **not executed during development**:
 
 ```powershell
-scripts/solve-proof.ps1 -Record root.rmg -Attacker black -Checkpoint proof.db -Output proof.rmp -Nodes 1000000 -Seconds 3600 -RamMiB 64 -DiskMiB 16384 -Resume
-scripts/solve-proof.ps1 -Record root.rmg -Attacker black -Checkpoint proof.db -Output proof.rmp -Nodes 10000000 -Seconds 28800 -RamMiB 64 -DiskMiB 65536 -Resume
+scripts/solve-proof.ps1 -Record root.rmg -Attacker black -Checkpoint proof.db -Output proof.rmp -Nodes 1000000 -Seconds 3600 -SqliteCacheMiB 64 -DiskMiB 16384 -Resume
+scripts/solve-proof.ps1 -Record root.rmg -Attacker black -Checkpoint proof.db -Output proof.rmp -Nodes 10000000 -Seconds 28800 -SqliteCacheMiB 64 -DiskMiB 65536 -Resume
 ```
 
 The database freezes the executable SHA256, replayed root, attacker, rules and
-maximum tree depth; resource budgets may change on resume. A matching small
+root ply, additional proof plies and tactical leaf budgets; resource budgets may change on resume. A matching small
 `proof.db.config.json` supports frontier creation. SQLite stores stable NodeIds,
 canonical exact/transposition keys, chronological replay moves, PN/DN, outcome,
 legal edges and a persisted dirty/frontier index. Transactions preserve logical
@@ -59,18 +61,27 @@ Current limits are important:
 
 - The new path has no 100k explored-node ceiling. The original native in-memory
   solver retains its separate 100k checkpoint ceiling.
-- RamMiB currently bounds the SQLite page cache, **not whole-process RSS**.
+- SqliteCacheMiB (legacy RamMiB alias) bounds the SQLite page cache, **not whole-process RSS**.
   Python, native replay and at most one board-depth verification stack add fixed
   overhead. DiskMiB reserves half the database quota for rollback pages; proof
   exports, JSON artifacts and multiple worker directories need separate space.
-- Nodes currently counts PN expansions, not all native D4/child operations.
-  Seconds is checked between expansions. Witness verification gets a separate
-  bounded allowance; native final verification uses its existing limits.
-  Strict aggregate work/wall/RSS accounting remains unfinished.
-- Native replay does all-legal child canonicalization. VCF/VCT accelerators and
-  learned ordering are not yet connected to this disk path. Use existing native
-  `solve/resume --vcf-plies ... --vcf-nodes ... --vct-plies ... --vct-nodes ...`
-  for the bounded in-memory reference; no tactical failure is a disproof.
+- Nodes counts PN expansions plus tactical probe search visits, not every native
+  replay/D4 operation. MaxAdditionalPlies is relative to the frozen proof root,
+  never absolute game ply. Tactical plies are capped by the remaining horizon.
+- Seconds is a cooperative search-phase budget checked between expansions/native
+  calls, not a hard whole-job deadline. Witness verification has separate node,
+  tactical-work and wall allowances. Native leaf certificate replay and final
+  fresh verification are additionally bounded by their declared verifier limits.
+  A verifier cannot borrow an untrusted database's larger probe allowance.
+- Exact leaves run terminal/immediate, then VCF, then VCT before all-legal PN
+  expansion. Use -VcfPlies/-VcfNodes/-VctPlies/-VctNodes to configure them; these
+  semantics are frozen on resume. Exhaustion/NotProven always remains Unknown.
+- Reports expose native calls, replayed plies, generated children, request/response
+  bytes, native roundtrip/JSON time, SQLite transactions, witness nodes/tactical
+  work and leaf hits. No whole-process RSS enforcement or measurement is claimed.
+- A release 16-expansion baseline measured 0.347s total, 0.030s native roundtrip,
+  0.0023s JSON parsing and 3810 generated children. Native/JSON did not dominate;
+  no new IPC protocol was justified. This is a diagnostic, not scale evidence.
 - Only tiny fixtures have run. Million-node throughput, power-loss behavior on
   target filesystems and multi-machine operational recovery are not established.
 
@@ -148,3 +159,29 @@ Serious/large presets use the already supported built-in opening suite and zero
 random prefix; an explicit opening DB replaces that suite. Random prefixes remain
 an available generation ablation. Native/Arena BookMove configuration is still
 pending, independently of these training interfaces.
+
+## Runtime empirical opening use
+
+Build book, Native and Arena from the same source/toolchain/build configuration.
+`rustmoku-book build-identity` prints their shared engine identity; it is distinct
+from each executable's SHA256. Old books using the book executable hash must be
+rebuilt. Model/profile/build mismatch rejects loading; no identity-independent
+fallback is enabled. Source/feature/target changes deliberately invalidate books.
+
+Native has an **Empirical opening database (not proof)** section with a path,
+OrderOnly/BookMove, load/disable and status. Reconfiguring the engine or changing
+the evaluator disables the loaded book until it is loaded and validated again.
+
+```powershell
+.\target\release\rustmoku-arena.exe --describe --a-opening-db opening.rmopen --a-opening-policy order-only --b-opening-db opening.rmopen --b-opening-policy book-move
+```
+
+Supply matching `--a-profile`/`--b-profile` strings and models as needed. Arena
+freezes the exact loaded bytes (SHA256), policy, model fingerprint, profile,
+generation and shared engine identity in EFFECTIVE_CONFIG and experiment inputs.
+OrderOnly still searches. BookMove reports OpeningBook, has no proof or TT Exact
+value, and never overrides immediate wins, exact losses or a unique forced block.
+
+SQLite schema/config version 2 rejects old incompatible checkpoints rather than
+silently reinterpreting their depth or leaf semantics. Budget increases are
+allowed on resume; semantic horizon/tactical limits are not changed silently.

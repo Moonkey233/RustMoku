@@ -9,6 +9,19 @@ from offline.storage import DiskNodes
 ENGINE=Path(__file__).resolve().parents[1]/('target/debug/rustmoku-solver.exe' if os.name=='nt' else 'target/debug/rustmoku-solver')
 
 class DiskSolveTests(unittest.TestCase):
+    def test_midgame_horizon_is_relative_to_the_frozen_root(self):
+        with tempfile.TemporaryDirectory() as directory, NativeFacts(ENGINE) as native:
+            moves=bytes([105,0,106,2,107,4,108,6])
+            config={'version':2,'root_ply':len(moves),'max_additional_plies':1}
+            path=Path(directory)/'nodes.db'
+            with DiskNodes(path,config,cache_bytes=4096) as db:
+                with db.transaction():root=db.intern(bytes.fromhex(native.facts(moves)['key']),moves)
+                result=DiskSolver(db,native,0).solve(root,work=1,seconds=10,max_additional_plies=1)
+                self.assertEqual(result['outcome'],'UnverifiedWin')
+                self.assertEqual(result['work'],1)
+            with self.assertRaises(ValueError):
+                DiskNodes(path,{**config,'max_additional_plies':2},resume=True)
+
     def test_native_win_export_and_missing_mapping_rejected(self):
         with tempfile.TemporaryDirectory() as directory, NativeFacts(ENGINE) as native:
             with DiskNodes(Path(directory)/'nodes.db',{},cache_bytes=4096) as db:

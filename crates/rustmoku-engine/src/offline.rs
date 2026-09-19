@@ -37,6 +37,16 @@ const CHECKPOINT_VERSION: u16 = 1;
 /// variable move/child buffers are counted.
 pub const MAX_PERSISTED_SOLVER_NODES: usize = 100_000;
 
+/// Root-only exact accelerators for the disk coordinator. No PN child expansion.
+#[derive(Clone, Copy, Debug)]
+pub struct OfflineLeafResult {
+    pub outcome: ProofOutcome,
+    pub immediate_hit: bool,
+    pub vcf_work: u64,
+    pub vct_work: u64,
+    pub statistics: SolverStatistics,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ProofOutcome {
     ProvenWin,
@@ -241,6 +251,43 @@ pub struct OfflineSolver {
 }
 
 impl OfflineSolver {
+    /// Probe a fresh root using existing exact contracts. Incomplete tactical
+    /// searches leave Unknown; they can never manufacture a refutation.
+    pub fn probe_leaf(&mut self, limits: SolverLimits) -> Result<OfflineLeafResult, SolverError> {
+        if self.nodes.len() != 1 || self.statistics.work_nodes != 0 {
+            return Err(SolverError::Invalid("leaf probe requires a fresh root"));
+        }
+        let start = Instant::now();
+        let cancellation = CancellationToken::new();
+        let mut immediate_hit = false;
+        let mut vcf_work = 0;
+        let mut vct_work = 0;
+        if self.nodes[0].outcome == ProofOutcome::Unknown && limits.max_work_nodes > 0 {
+            self.statistics.work_nodes = 1;
+            immediate_hit = self.apply_immediate(0);
+            if !immediate_hit {
+                let before = self.statistics.work_nodes;
+                let vcf_limits = limits.with_vct(ProofLimits::new(0, 0));
+                let proven = self.try_tactical(0, vcf_limits, &cancellation, start, 0);
+                vcf_work = self.statistics.work_nodes - before;
+                if !proven {
+                    let before = self.statistics.work_nodes;
+                    let vct_limits = limits.with_vcf(ProofLimits::new(0, 0));
+                    self.try_tactical(0, vct_limits, &cancellation, start, 0);
+                    vct_work = self.statistics.work_nodes - before;
+                }
+            }
+        }
+        self.refresh_statistics();
+        Ok(OfflineLeafResult {
+            outcome: self.nodes[0].outcome,
+            immediate_hit,
+            vcf_work,
+            vct_work,
+            statistics: self.statistics,
+        })
+    }
+
     pub fn new(game: &Game, attacker: Stone) -> Result<Self, SolverError> {
         if game.position().rules() != RuleSet::Freestyle {
             return Err(SolverError::Invalid("only Freestyle is supported"));

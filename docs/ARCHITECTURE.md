@@ -1264,3 +1264,18 @@ never use learned scores as evidence. A merged solved witness is freshly replaye
 ProvenWin exports must additionally pass the existing fresh native ProofBook
 verifier before atomic publication. Unknown is never a refutation. See
 [OFFLINE_INTELLIGENCE.md](OFFLINE_INTELLIGENCE.md) for current limitations.
+
+## Final pre-training AB closure
+
+Normal positive-depth gameplay returns an exact unique forced block without
+iterative deepening. `ForcedBlock` means an exact move obligation, not an exact
+position value: completed depth is zero, score is bounded static/UI-only, proof
+is absent, and the result cannot write an ordinary TT Exact entry. Dataset source
+9 is backward-compatible in the existing source-tag encoding, always nonexact,
+and excluded from value supervision. Explicit teacher analysis still searches.
+
+Native/Arena empirical opening integration and disk tactical leaves are described
+in [OFFLINE_INTELLIGENCE.md](OFFLINE_INTELLIGENCE.md). Offline paired ablations and
+staged resumable SPSA are in [SEARCH_TUNING.md](SEARCH_TUNING.md). No research flag
+has earned a strength claim merely by being implemented. Large-scale storage and
+independent strength/evidence collection remain separate work. MCTS is untouched.

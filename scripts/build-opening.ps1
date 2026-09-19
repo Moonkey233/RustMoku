@@ -10,10 +10,12 @@ $ErrorActionPreference = 'Stop'
 if ($Workers -ne 1) { throw 'Opening generation currently supports one worker. Proof sharding is a separate command.' }
 if (!$Engine) { $Engine = Join-Path (Split-Path -Parent $PSScriptRoot) 'target/release/rustmoku-book.exe' }
 $frozenEngine = (Get-FileHash -LiteralPath $Engine -Algorithm SHA256).Hash.ToLowerInvariant()
+$engineIdentity = & $Engine build-identity
+if ($LASTEXITCODE -ne 0) { throw 'Cannot identify engine build.' }
 $frozenModel = if ($Model) { (Get-FileHash -LiteralPath $Model -Algorithm SHA256).Hash } else { $null }
 $command = if ($Resume) { 'resume' } else { 'build' }
 $arguments = @($command, '--record', $Record, '--output', $Output,
-    '--engine-build', $frozenEngine, '--max-plies', "$MaxOpeningPlies", '--top-k', "$TopK",
+    '--engine-build', $engineIdentity, '--max-plies', "$MaxOpeningPlies", '--top-k', "$TopK",
     '--score-margin', "$ScoreMargin", '--depth', "$Depth", '--nodes', "$Nodes",
     '--max-positions', "$MaxPositions", '--max-frontier', "$MaxFrontier")
 if ($Model) { $arguments += @('--model', $Model) }

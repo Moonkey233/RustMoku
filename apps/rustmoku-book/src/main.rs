@@ -18,6 +18,10 @@ fn main() {
 fn run() -> Result<(), Box<dyn Error>> {
     let mut args = std::env::args().skip(1);
     let command = args.next().ok_or("build|resume|inspect|query|merge")?;
+    if command == "build-identity" && args.next().is_none() {
+        println!("{}", rustmoku_engine::ENGINE_BUILD_ID);
+        return Ok(());
+    }
     let mut options = BTreeMap::new();
     while let Some(key) = args.next() {
         let value = args.next().ok_or("missing option value")?;
@@ -62,7 +66,14 @@ fn run() -> Result<(), Box<dyn Error>> {
                 &mut options,
                 "--record",
             )?)?)?;
-            let engine_build = required(&mut options, "--engine-build")?;
+            let engine_build = options
+                .remove("--engine-build")
+                .unwrap_or_else(|| rustmoku_engine::ENGINE_BUILD_ID.to_owned());
+            if engine_build != rustmoku_engine::ENGINE_BUILD_ID {
+                return Err(
+                    "engine-build must match this executable's shared engine identity".into(),
+                );
+            }
             let max_plies: usize = required(&mut options, "--max-plies")?.parse()?;
             let top_k: usize = required(&mut options, "--top-k")?.parse()?;
             let margin: i32 = required(&mut options, "--score-margin")?.parse()?;

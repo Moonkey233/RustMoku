@@ -34,6 +34,9 @@ struct PlayerConfig {
     external_inputs: Vec<PathBuf>,
     external_memory: Option<u64>,
     prepared_model: Option<RuntimeEvaluator>,
+    opening_database: Option<PathBuf>,
+    opening_policy: Option<rustmoku_engine::OpeningPolicy>,
+    prepared_book: Option<std::sync::Arc<rustmoku_engine::OpeningDatabase>>,
 }
 
 struct Options {
@@ -120,6 +123,18 @@ impl Options {
                         "external-input" => config.external_inputs.push(value.into()),
                         "external-memory-bytes" => config.external_memory = Some(value.parse()?),
                         "model" => declared_models[player] = Some(value.into()),
+                        "opening-db" => config.opening_database = Some(value.into()),
+                        "opening-policy" => {
+                            config.opening_policy = Some(match value.as_str() {
+                                "order-only" => rustmoku_engine::OpeningPolicy::OrderOnly,
+                                "book-move" => rustmoku_engine::OpeningPolicy::BookMove,
+                                _ => {
+                                    return Err(
+                                        "opening-policy must be order-only or book-move".into()
+                                    );
+                                }
+                            })
+                        }
                         "probcut" => config.engine = config.engine.with_probcut(value.parse()?),
                         "profile" => {
                             config.engine = config.engine.with_search_profile(value.parse()?)
@@ -240,6 +255,9 @@ impl Options {
             return Err("--depth must be positive; depth zero is analysis-only".into());
         }
         for player in &options.players {
+            if player.opening_policy.is_some() && player.opening_database.is_none() {
+                return Err("opening-policy requires opening-db".into());
+            }
             if matches!(player.evaluator, EvaluatorConfig::External(_))
                 && (options.limits.move_time.is_none() || options.limits.max_nodes.is_some())
             {
@@ -269,7 +287,7 @@ enum Player {
 
 impl Player {
     fn new(config: &PlayerConfig, clock: Option<Duration>) -> Result<Self, Box<dyn Error>> {
-        Ok(match &config.evaluator {
+        let mut player = match &config.evaluator {
             EvaluatorConfig::External(path) => Self::External(external::ExternalPlayer::start(
                 path,
                 &config.external_args,
@@ -303,7 +321,45 @@ impl Player {
                     RuntimeEvaluator::Pattern => unreachable!("model reader cannot select Pattern"),
                 }
             }
-        })
+        };
+        if let Some(database) = &config.prepared_book {
+            let policy = config
+                .opening_policy
+                .unwrap_or(rustmoku_engine::OpeningPolicy::OrderOnly);
+            match &mut player {
+                Self::Pattern(e) => e.set_opening_database(
+                    database.clone(),
+                    policy,
+                    rustmoku_engine::ENGINE_BUILD_ID,
+                )?,
+                Self::Classical(e) => e.set_opening_database(
+                    database.clone(),
+                    policy,
+                    rustmoku_engine::ENGINE_BUILD_ID,
+                )?,
+                Self::Learned(e) => e.set_opening_database(
+                    database.clone(),
+                    policy,
+                    rustmoku_engine::ENGINE_BUILD_ID,
+                )?,
+                Self::Nonlinear(e) => e.set_opening_database(
+                    database.clone(),
+                    policy,
+                    rustmoku_engine::ENGINE_BUILD_ID,
+                )?,
+                Self::MixLite(e) => e.set_opening_database(
+                    database.clone(),
+                    policy,
+                    rustmoku_engine::ENGINE_BUILD_ID,
+                )?,
+                Self::External(_) => {
+                    return Err("empirical database requires internal engine".into());
+                }
+            }
+        } else if config.opening_database.is_some() {
+            return Err("opening database was not frozen by configuration admission".into());
+        }
+        Ok(player)
     }
     fn search(
         &mut self,
@@ -376,6 +432,7 @@ struct GameResult {
     record: String,
     clocks_ms: [Option<u128>; 2],
     move_clocks: Vec<serde_json::Value>,
+    search_counters: [std::collections::BTreeMap<&'static str, u64>; 2],
 }
 
 #[cfg(test)]
@@ -409,6 +466,8 @@ fn play_game(
     }
     let mut clocks = [clock; 2];
     let mut move_clocks = Vec::new();
+    let mut search_counters: [std::collections::BTreeMap<&'static str, u64>; 2] =
+        std::array::from_fn(|_| Default::default());
     // Fresh per game, persistent between its moves. Paired legs cannot inherit
     // asymmetric ordinary TT history from one another.
     let mut players = Vec::with_capacity(2);
@@ -429,6 +488,7 @@ fn play_game(
                     record: game.to_record(),
                     clocks_ms: clocks.map(|time| time.map(|time| time.as_millis())),
                     move_clocks,
+                    search_counters,
                     winner: if index == 0 { Winner::B } else { Winner::A },
                     plies: game.position().move_count(),
                     moves: 0,
@@ -451,6 +511,7 @@ fn play_game(
                 record: game.to_record(),
                 clocks_ms: clocks.map(|time| time.map(|time| time.as_millis())),
                 move_clocks,
+                search_counters,
                 winner,
                 plies: game.position().move_count(),
                 moves,
@@ -466,6 +527,7 @@ fn play_game(
         let mut move_limits = limits;
         move_limits.move_time = hard_limit.map(|time| time.saturating_sub(time / 20));
         let start = Instant::now();
+        let mut search_trace = serde_json::Value::Null;
         let choice = match &mut players[player] {
             Player::External(external) => external
                 .choose(
@@ -481,6 +543,13 @@ fn play_game(
                     move_limits,
                     time_manager::TimeManager::new(clocks[player], increment, limits.move_time),
                 );
+                search_trace = serde_json::json!({"completed_depth": result.completed_depth,
+                    "origin": format!("{:?}", result.origin),
+                    "work_nodes": result.statistics.work_nodes});
+                for (name, value) in result.statistics.counters() {
+                    let counter = search_counters[player].entry(name).or_default();
+                    *counter = counter.saturating_add(value);
+                }
                 result
                     .best_move
                     .map(|at| (at, result.statistics.work_nodes))
@@ -511,6 +580,7 @@ fn play_game(
                     record: game.to_record(),
                     clocks_ms: clocks.map(|time| time.map(|time| time.as_millis())),
                     move_clocks,
+                    search_counters,
                 });
             }
         };
@@ -519,6 +589,7 @@ fn play_game(
             *remaining = remaining.saturating_sub(elapsed).saturating_add(increment);
         }
         move_clocks.push(serde_json::json!({"move": at.index(), "player": player, "elapsed_ms": elapsed.as_millis(),
+            "elapsed_us": elapsed.as_micros(), "search": search_trace,
             "clocks_ms": clocks.map(|time| time.map(|time| time.as_millis()))}));
         work += used_work;
         moves += 1;
@@ -663,7 +734,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             eprintln!(
                 "GAME_RECORD {}",
                 serde_json::json!({"schema":1,"pair":pair+1,"leg":leg+1,
-                "record":result.record,"clocks_ms":result.clocks_ms,"move_clocks":result.move_clocks,
+                "record":result.record,"clocks_ms":result.clocks_ms,"move_clocks":result.move_clocks,"search_counters":result.search_counters,
                 "termination":result.failure.as_deref().unwrap_or("terminal"),"winner":result.winner.label()})
             );
             summary.record(&result);
@@ -714,6 +785,7 @@ mod tests {
             record: String::new(),
             clocks_ms: [None; 2],
             move_clocks: Vec::new(),
+            search_counters: std::array::from_fn(|_| Default::default()),
             plies: 225,
             moves: 0,
             work: 0,

@@ -295,3 +295,14 @@ selectivity and score reference scale. Practical distillation is the default;
 all-descendant oracle analysis is explicit. `DomainExact` never means solved
 Gomoku. Exploration temperatures use reference units and comparisons retain the
 actual raw-unit temperature for exact distribution validation.
+
+## Offline search tuning and CI executables
+
+See [Search tuning](../docs/SEARCH_TUNING.md) for frozen independent suites,
+paired feature ablations, staged SPSA, deterministic resume and confirmation.
+These tools do not automatically enable research features or promote a model.
+
+Integration tests resolve `RUSTMOKU_DATA_EXE` / `RUSTMOKU_ARENA_EXE` when explicitly
+set; otherwise they require `target/release/rustmoku-data[.exe]` and
+`target/release/rustmoku-arena[.exe]`. Missing files fail clearly. There is no
+fallback to stale debug binaries and tests do not compile another build profile.

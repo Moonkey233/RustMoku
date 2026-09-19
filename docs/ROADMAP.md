@@ -153,7 +153,8 @@ The table below records implementation availability, not validated strength.
 | Search profiles, policy LMR, proof scheduling, singular, ProbCut | implemented, experimental gates retained |
 | Guarded Null Move | experimental/default-off, isolated analysis turn plus real full-depth verification; see Architecture |
 | Application time management and bounded experiments | implemented; clock and budget refinements ongoing |
-| Integrated validation and adversarial review | pending after implementation |
+| Final AB tooling closure | forced-root obligation, disk tactical leaves, Native/Arena empirical books, paired ablation/SPSA infrastructure implemented |
+| Integrated validation and adversarial review | see CODEX_PROGRESS.md for actual checks and remaining scale evidence |
 | Independent strength, hosted Windows/Linux CI, release | external-gate-pending |
 
 Experimentally evaluate rather than automatically retain:

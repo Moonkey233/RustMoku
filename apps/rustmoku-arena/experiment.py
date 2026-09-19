@@ -290,7 +290,9 @@ def run(configuration, output):
                 'logical_cpus': os.cpu_count(), 'python': sys.version,
                 'concurrent_games': 1, 'engine_threads': threads,
                 'rules': '15x15-freestyle', 'paired_colors': True,
-                'tt_policy': 'fresh-per-game-warm-between-moves', 'book': False,
+                'tt_policy': 'fresh-per-game-warm-between-moves',
+                'book': ([player.get('book', False) for player in effective['players']]
+                         if any(player.get('book') for player in effective['players']) else False),
                 'duplicate_cluster_policy': 'first-pair-only',
                 'failures': 'Rust player failure forfeits; runner failure halts experiment'}
     output.mkdir(parents=True, exist_ok=True)

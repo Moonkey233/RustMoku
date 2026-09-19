@@ -10,6 +10,9 @@ rustmoku-core.workspace = true
 rustmoku-simd.workspace = true
 sha2 = "0.10"
 
+[build-dependencies]
+sha2 = "0.10"
+
 # Only the explicit memory-model test build substitutes instrumented atomics.
 [target.'cfg(loom)'.dependencies]
 loom = "0.7.2"

@@ -307,8 +307,44 @@ fn analysis_json(
                 candidate.score == first.score && production.contains(candidate.at)
             })
         });
+        let recalls = [1, 3, 8].map(|k| {
+            let count = k.min(ranked.len());
+            let hits = ranked
+                .iter()
+                .take(count)
+                .filter(|c| production.contains(c.at))
+                .count();
+            if count == 0 {
+                "null".to_owned()
+            } else {
+                format!("{}", hits as f64 / count as f64)
+            }
+        });
+        let miss_distance = ranked
+            .first()
+            .filter(|c| !production.contains(c.at))
+            .and_then(|c| {
+                Move::all()
+                    .filter(|&at| game.position().cell(at).is_some())
+                    .map(|at| {
+                        (at.index() / 15)
+                            .abs_diff(c.at.index() / 15)
+                            .max((at.index() % 15).abs_diff(c.at.index() % 15))
+                    })
+                    .min()
+            })
+            .map_or_else(|| "null".to_owned(), |distance| distance.to_string());
+        let ply = game.position().move_count();
+        let phase = if ply < 16 {
+            "opening"
+        } else if ply < 80 {
+            "midgame"
+        } else {
+            "late"
+        };
         format!(
-            r#"{{"best_in_production":{best},"canonical_best_in_production":{canonical_best},"top_k":{count},"top_k_hits":{hits},"top_k_tie_break":"move-index"}}"#
+            r#"{{"best_in_production":{best},"canonical_best_in_production":{canonical_best},"top1_recall":{},"top3_recall":{},"top8_recall":{},"recall_denominator":"min(k,legal-roots)","best_miss_chebyshev_distance":{miss_distance},"ply":{ply},"phase":"{phase}","top_k":{count},"top_k_hits":{hits},"top_k_tie_break":"move-index"}}"#,
+            recalls[0], recalls[1], recalls[2]
         )
     } else {
         "null".to_owned()
@@ -994,6 +1030,7 @@ const fn origin_tag(origin: SearchOrigin) -> u8 {
         SearchOrigin::Vct => 6,
         SearchOrigin::ProofBook => 7,
         SearchOrigin::OpeningBook => 8,
+        SearchOrigin::ForcedBlock => 9,
     }
 }
 
@@ -1008,6 +1045,7 @@ fn decode_origin(tag: u8) -> Result<SearchOrigin, Box<dyn Error>> {
         6 => SearchOrigin::Vct,
         7 => SearchOrigin::ProofBook,
         8 => SearchOrigin::OpeningBook,
+        9 => SearchOrigin::ForcedBlock,
         _ => return Err("invalid result-source tag".into()),
     })
 }
@@ -1094,6 +1132,38 @@ fn usage() {
 mod tests {
     use super::*;
     use rustmoku_core::RuleSet;
+
+    #[test]
+    fn recall_telemetry_requires_a_completed_common_horizon() {
+        let game = Game::default();
+        let engine = AlphaBetaEngine::with_config(RuntimeEvaluator::Pattern, EngineConfig::new(0));
+        for (work, completed) in [(1, false), (2000, true)] {
+            let result = engine
+                .analyze_root(
+                    game.position(),
+                    SearchLimits::new(1).with_max_nodes(work),
+                    8,
+                    rustmoku_engine::CancellationToken::new(),
+                )
+                .unwrap();
+            let json = analysis_json(&game, &result, 1, work, 8);
+            assert_eq!(result.completed_depth > 0, completed);
+            if completed {
+                for name in [
+                    "top1_recall",
+                    "top3_recall",
+                    "top8_recall",
+                    "best_miss_chebyshev_distance",
+                    "canonical_best_in_production",
+                ] {
+                    assert!(json.contains(name));
+                }
+                assert!(json.contains("\"phase\":\"opening\""));
+            } else {
+                assert!(json.contains("\"production_recall\":null"));
+            }
+        }
+    }
 
     #[test]
     fn selfplay_bytes_ignore_worker_partition_and_shard_boundaries() {
