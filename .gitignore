@@ -30,3 +30,7 @@ models/
 
 # Python tooling bytecode
 __pycache__/
+
+.venv-train
+runs
+datasets
