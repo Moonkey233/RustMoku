@@ -71,3 +71,41 @@ class TeacherTests(unittest.TestCase):
         analysis['leaf_policy'] = 'unknown'
         with self.assertRaisesRegex(ValueError, 'search domain'):
             comparison(analysis, 1)
+
+    def test_comparison_is_candidate_order_invariant(self):
+        metadata = dict(
+            version=4,
+            root_universe='all-legal',
+            descendant_universe='production-radius-two',
+            leaf_policy='four-q6-immediate-v1',
+            search_domain='distillation',
+            selectivity='candidate-domain-only-no-depth-pruning',
+            perspective='root-side-to-move',
+            completed_depth=3,
+        )
+        candidates = [
+            dict(move=100, score=300, completed_depth=3,
+                nominal_depth_valid=True, bound='DomainExact',
+                source='AlphaBeta'),
+            dict(move=20, score=100, completed_depth=3,
+                nominal_depth_valid=True, bound='DomainExact',
+                source='AlphaBeta'),
+            dict(move=50, score=200, completed_depth=3,
+                nominal_depth_valid=True, bound='DomainExact',
+                source='AlphaBeta'),
+        ]
+
+        import itertools
+        import math
+        from teacher import validate_comparison
+
+        expected = comparison(dict(metadata, candidates=candidates), 1000)
+        self.assertEqual(expected['moves'], [20, 50, 100])
+        self.assertEqual(expected['scores'], [100, 200, 300])
+        weights = [math.exp(-.2), math.exp(-.1), 1.0]
+        for probability, weight in zip(expected['probabilities'], weights, strict=True):
+            self.assertAlmostEqual(probability, weight / sum(weights))
+        for order in itertools.permutations(candidates):
+            actual = comparison(dict(metadata, candidates=order), 1000)
+            self.assertEqual(validate_comparison(actual), expected)
+            self.assertEqual(explore(actual, 123), explore(expected, 123))

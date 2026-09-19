@@ -45,6 +45,7 @@ def comparison(analysis, temperature):
             accepted.append((at, candidate['score']))
     if len(accepted) < 2:
         return None
+    accepted.sort(key=lambda item: item[0])
     maximum = max(score for _, score in accepted)
     weights = [math.exp((score - maximum) / temperature) for _, score in accepted]
     total = sum(weights)
