@@ -306,3 +306,29 @@ Integration tests resolve `RUSTMOKU_DATA_EXE` / `RUSTMOKU_ARENA_EXE` when explic
 set; otherwise they require `target/release/rustmoku-data[.exe]` and
 `target/release/rustmoku-arena[.exe]`. Missing files fail clearly. There is no
 fallback to stale debug binaries and tests do not compile another build profile.
+
+## Float checkpoint evaluation (V1/V2/V3)
+
+```powershell
+python -X utf8 training/evaluate.py --dataset runs/pilot/dataset/dataset.json --checkpoint runs/pilot/model.pt --split validation --device cpu
+# Use --split test or --split opening_heldout for the corresponding frozen partition.
+```
+
+Use the actual dataset/checkpoint paths from your run. Evaluation validates the
+checkpoint's immutable dataset/split identity, never resplits or augments heldout
+positions, and errors if the requested partition is unavailable/empty.
+
+MixLite V3 uses `mixlite.features(board, side)`, its full-board policy forward,
+and `value = W - L`. Teacher value MAE uses the existing rational/exact target.
+Policy top1/top3/top5 rank only legal empty cells, with stable move-index ties;
+occupied logits never compete. Output includes overall, source and phase strata
+(opening <20 plies, middle <80, late otherwise).
+
+V3 `wdl_brier` is the sum of three squared probability errors against an observed
+`record.outcome` (W/D/L order, side-to-move, range 0..2). `wdl_accuracy` and
+`mean_wdl` accompany it. `teacher_wdl_brier` is reported separately against the
+existing training target `[max(q,0), 1-abs(q), max(-q,0)]`; this is not observed
+outcome calibration. Missing outcome/policy targets yield null metrics and zero
+sample counts. V1/V2 retain their value/policy evaluation and scalar-outcome
+Brier; they do not acquire a fabricated WDL head. Metrics are unweighted offline
+diagnostics and do not change training weights, data encoding or model tensors.
