@@ -1,4 +1,5 @@
 import unittest
+from contextlib import closing
 import torch
 from teacher import comparison, explore, masked_loss
 
@@ -109,3 +110,96 @@ class TeacherTests(unittest.TestCase):
             actual = comparison(dict(metadata, candidates=order), 1000)
             self.assertEqual(validate_comparison(actual), expected)
             self.assertEqual(explore(actual, 123), explore(expected, 123))
+
+class SidecarConflictTests(unittest.TestCase):
+    @staticmethod
+    def analysis(key, depth=3, scores=(100, 200), moves=(100, 101)):
+        return dict(version=4, position_key=key, perspective='root-side-to-move',
+                    root_universe='all-legal', descendant_universe='production-radius-two',
+                    leaf_policy='four-q6-immediate-v1', search_domain='distillation',
+                    selectivity='candidate-domain-only-no-depth-pruning', completed_depth=depth,
+                    candidates=[dict(move=at, score=score, completed_depth=depth,
+                        nominal_depth_valid=True, bound='DomainExact', source='AlphaBeta')
+                        for at,score in zip(moves,scores,strict=True)])
+
+    @staticmethod
+    def write_rows(path, rows):
+        import json
+        path.write_text(''.join(json.dumps(row)+'\n' for row in rows), encoding='utf-8')
+        return path
+
+    def test_identical_payload_is_deduplicated(self):
+        import json
+        import sqlite3
+        import tempfile
+        from pathlib import Path
+        from teacher import build_sidecar
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); key=bytes(58).hex(); row=self.analysis(key)
+            source=self.write_rows(root/'rows.jsonl',[row,row,row])
+            output=root/'comparisons.sqlite'
+            metadata=build_sidecar([source],output,1000)
+            self.assertEqual(metadata['conflicted_positions'],0)
+            with closing(sqlite3.connect(output)) as connection:
+                rows=connection.execute('SELECT position,payload FROM comparisons').fetchall()
+                self.assertEqual(len(rows),1)
+                self.assertEqual(rows[0][0],key)
+                self.assertEqual(json.loads(rows[0][1]),comparison(row,1000))
+                self.assertEqual(connection.execute('SELECT count(*) FROM conflicts').fetchone()[0],0)
+
+    def test_conflict_is_permanent_across_files_and_bundle_keeps_hard_labels(self):
+        import dataclasses
+        import json
+        import sqlite3
+        import tempfile
+        from pathlib import Path
+        from common import DatasetFile
+        from dataset import DatasetBundle, describe_shard
+        from teacher import build_sidecar
+        from test_compact import fixture
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); raw=root/'data.rmd';fixture(raw,games=1,plies=3)
+            raw_before=raw.read_bytes()
+            with DatasetFile(raw) as records:
+                conflicted,unrelated=records[1].position_key.hex(),records[2].position_key.hex()
+            first=self.analysis(conflicted)
+            second=self.analysis(conflicted,depth=4,scores=(150,250))
+            other=self.analysis(unrelated)
+            paths=[self.write_rows(root/'first.jsonl',[first,first,other]),
+                   self.write_rows(root/'second.jsonl',[second,other]),
+                   self.write_rows(root/'later.jsonl',[first,second,first,other])]
+            metadata=build_sidecar(paths,root/'comparisons.sqlite',1000)
+            self.assertEqual(metadata['conflicted_positions'],1)
+            with closing(sqlite3.connect(metadata['path'])) as connection:
+                self.assertEqual(connection.execute('SELECT position FROM conflicts').fetchall(),[(conflicted,)])
+                self.assertEqual(connection.execute('SELECT position FROM comparisons').fetchall(),[(unrelated,)])
+            descriptor={'version':2,'shards':[describe_shard(raw,{},'fixture',compact=True)]}
+            baseline=root/'baseline.json'; baseline.write_text(json.dumps(descriptor))
+            attached=root/'dataset.json'; attached.write_text(json.dumps({**descriptor,'comparisons':metadata}))
+            with DatasetBundle(baseline) as before, DatasetBundle(attached) as after:
+                self.assertIsNone(after[1].comparison)
+                self.assertEqual(after[1],before[1])
+                self.assertEqual(after[2].comparison,comparison(other,1000))
+                self.assertEqual(dataclasses.replace(after[2],comparison=None),before[2])
+            self.assertEqual(raw.read_bytes(),raw_before)
+
+    def test_invalid_rows_are_not_hidden_by_a_conflict(self):
+        import tempfile
+        from pathlib import Path
+        from teacher import build_sidecar
+        key=bytearray(58);key[0]=64;key[-1]=1;key=bytes(key).hex()
+        first=self.analysis(key);second=self.analysis(key,depth=4,scores=(150,250))
+        invalids=[(self.analysis(key,moves=(0,101)),'legal empty'),
+                  (self.analysis(key,moves=(100,100)),'duplicate candidate'),
+                  (self.analysis(key,depth=256),'invalid teacher comparison'),
+                  ({**first,'leaf_policy':'bad'},'search domain'),
+                  ({**first,'position_key':'00','candidates':[]},'key length'),
+                  ({**first,'position_key':key[:-2]+'02'},'invalid side')]
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            for index,(bad,message) in enumerate(invalids):
+                with self.subTest(message=message):
+                    source=self.write_rows(root/f'{index}.jsonl',[first,second,bad])
+                    output=root/f'{index}.sqlite'
+                    with self.assertRaisesRegex(ValueError,message):build_sidecar([source],output,1000)
+                    self.assertFalse(output.exists())

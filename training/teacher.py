@@ -102,11 +102,13 @@ def build_sidecar(paths, destination, temperature):
     import tempfile
     from pathlib import Path
     from dataset import publish_shard, file_hash
+    from common import decode_position_key
     with tempfile.TemporaryDirectory(dir=destination.parent) as directory:
         temporary = Path(directory) / 'comparisons.sqlite'
         with contextlib.closing(sqlite3.connect(temporary)) as connection:
             connection.execute('PRAGMA cache_size=-4096')
             connection.execute('CREATE TABLE comparisons(position TEXT PRIMARY KEY, payload TEXT NOT NULL)')
+            connection.execute('CREATE TABLE conflicts(position TEXT PRIMARY KEY)')
             for path in paths:
                 with Path(path).open(encoding='utf-8') as stream:
                     while True:
@@ -116,17 +118,31 @@ def build_sidecar(paths, destination, temperature):
                         if len(line) > 65536:
                             raise ValueError('teacher candidate row exceeds size limit')
                         analysis = json.loads(line)
+                        key_bytes = bytes.fromhex(analysis['position_key'])
+                        board, _ = decode_position_key(key_bytes)
+                        key = key_bytes.hex()
                         value = comparison(analysis, temperature)
                         if value is None:
                             continue
+                        validate_comparison(value)
+                        if any(board[at] != 0 for at in value['moves']):
+                            raise ValueError('comparison move is not a legal empty cell')
                         payload = json.dumps(value, sort_keys=True)
-                        key = analysis['position_key']
-                        if len(bytes.fromhex(key)) != 58:
-                            raise ValueError('invalid comparison position identity')
+                        # Validate even tombstoned occurrences: conflicts must not
+                        # hide malformed input or allow later rows to resurrect it.
+                        if connection.execute('SELECT 1 FROM conflicts WHERE position=?', (key,)).fetchone():
+                            continue
                         old = connection.execute('SELECT payload FROM comparisons WHERE position=?', (key,)).fetchone()
                         if old is not None and old[0] != payload:
-                            raise ValueError('inconsistent comparison for repeated position')
+                            # Fixed-work analysis can rarely finish different common
+                            # horizons for the same board. Omit ambiguous optional
+                            # soft-policy supervision instead of selecting a label.
+                            connection.execute('INSERT INTO conflicts VALUES (?)', (key,))
+                            connection.execute('DELETE FROM comparisons WHERE position=?', (key,))
+                            continue
                         connection.execute('INSERT OR IGNORE INTO comparisons VALUES (?,?)', (key, payload))
                 connection.commit()
+            conflicted_positions = connection.execute('SELECT count(*) FROM conflicts').fetchone()[0]
         publish_shard(temporary, destination)
-    return {'path': str(destination.resolve()), 'sha256': file_hash(destination)}
+    return {'path': str(destination.resolve()), 'sha256': file_hash(destination),
+            'conflicted_positions': conflicted_positions}
