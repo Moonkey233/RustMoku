@@ -75,6 +75,9 @@ fn player(
                 .take(4 * 1024 * 1024 + 1)
                 .read_to_end(&mut bytes)?;
             let model = RuntimeEvaluator::from_model_bytes(&bytes)?;
+            if config.v3_mode.is_some() && !matches!(model, RuntimeEvaluator::MixLite(_)) {
+                return Err("v3-mode requires a V3 model".into());
+            }
             let hash = format!("{:x}", Sha256::digest(&bytes));
             let (metadata, score_scale) = match &model {
                 RuntimeEvaluator::Learned(model) => (model.model().metadata(), None),
@@ -102,10 +105,22 @@ fn player(
     let tactical = engine.tactical();
     let (probe, total) = engine.interior_vcf();
     let selection = engine.selectivity();
-    let contract = config
-        .prepared_model
-        .as_ref()
-        .map_or(ScoreContract::Pattern, Evaluator::score_contract);
+    let diagnostic = match &config.prepared_model {
+        Some(RuntimeEvaluator::MixLite(model)) => Some(super::diagnostic::DiagnosticEvaluator {
+            model: model.clone(),
+            mode: config.v3_mode.unwrap_or_default(),
+        }),
+        _ => None,
+    };
+    let contract = diagnostic.as_ref().map_or_else(
+        || {
+            config
+                .prepared_model
+                .as_ref()
+                .map_or(ScoreContract::Pattern, Evaluator::score_contract)
+        },
+        Evaluator::score_contract,
+    );
     let profile = engine.effective_profile(contract);
     if engine
         .search_profile()
@@ -113,10 +128,17 @@ fn player(
     {
         return Err("selected search profile does not match evaluator score contract".into());
     }
-    let model_fingerprint = config.prepared_model.as_ref().map_or_else(
-        || match config.evaluator {
-            EvaluatorConfig::Pattern => rustmoku_engine::PatternEvaluator.model_fingerprint(),
-            _ => None,
+    let model_fingerprint = diagnostic.as_ref().map_or_else(
+        || {
+            config.prepared_model.as_ref().map_or_else(
+                || match config.evaluator {
+                    EvaluatorConfig::Pattern => {
+                        rustmoku_engine::PatternEvaluator.model_fingerprint()
+                    }
+                    _ => None,
+                },
+                Evaluator::model_fingerprint,
+            )
         },
         Evaluator::model_fingerprint,
     );
@@ -153,7 +175,8 @@ fn player(
         json!(false)
     };
     Ok(
-        json!({"evaluator": evaluator, "model": model, "threads": engine.threads(),
+        json!({"evaluator": evaluator, "model": model, "v3_mode": diagnostic.as_ref().map(|e| e.mode.name()),
+        "evaluator_fingerprint": model_fingerprint, "threads": engine.threads(),
         "tt_mib": engine.tt_memory_mib(), "root_resistance": engine.root_resistance(),
         "adaptive_root_candidates": engine.adaptive_root_candidates(),
         "model_version": config.prepared_model.as_ref().and_then(|model| model.model_format_version()),

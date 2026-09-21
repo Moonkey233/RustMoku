@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod configuration;
+mod diagnostic;
 mod external;
 #[path = "../../time_manager.rs"]
 mod time_manager;
@@ -34,6 +35,7 @@ struct PlayerConfig {
     external_inputs: Vec<PathBuf>,
     external_memory: Option<u64>,
     prepared_model: Option<RuntimeEvaluator>,
+    v3_mode: Option<diagnostic::Mode>,
     opening_database: Option<PathBuf>,
     opening_policy: Option<rustmoku_engine::OpeningPolicy>,
     prepared_book: Option<std::sync::Arc<rustmoku_engine::OpeningDatabase>>,
@@ -123,6 +125,7 @@ impl Options {
                         "external-input" => config.external_inputs.push(value.into()),
                         "external-memory-bytes" => config.external_memory = Some(value.parse()?),
                         "model" => declared_models[player] = Some(value.into()),
+                        "v3-mode" => config.v3_mode = Some(diagnostic::Mode::parse(&value)?),
                         "opening-db" => config.opening_database = Some(value.into()),
                         "opening-policy" => {
                             config.opening_policy = Some(match value.as_str() {
@@ -255,6 +258,10 @@ impl Options {
             return Err("--depth must be positive; depth zero is analysis-only".into());
         }
         for player in &options.players {
+            if player.v3_mode.is_some() && !matches!(player.evaluator, EvaluatorConfig::Learned(_))
+            {
+                return Err("v3-mode requires a V3 learned model".into());
+            }
             if player.opening_policy.is_some() && player.opening_database.is_none() {
                 return Err("opening-policy requires opening-db".into());
             }
@@ -281,7 +288,7 @@ enum Player {
     Classical(AlphaBetaEngine<ClassicalEvaluator>),
     Learned(AlphaBetaEngine<LearnedEvaluator>),
     Nonlinear(AlphaBetaEngine<NonlinearEvaluator>),
-    MixLite(AlphaBetaEngine<rustmoku_engine::MixLiteEvaluator>),
+    MixLite(AlphaBetaEngine<diagnostic::DiagnosticEvaluator>),
     External(external::ExternalPlayer),
 }
 
@@ -308,6 +315,9 @@ impl Player {
                 } else {
                     RuntimeEvaluator::read_from_path(path)?
                 };
+                if config.v3_mode.is_some() && !matches!(model, RuntimeEvaluator::MixLite(_)) {
+                    return Err("v3-mode requires a V3 model".into());
+                }
                 match model {
                     RuntimeEvaluator::Learned(model) => {
                         Self::Learned(AlphaBetaEngine::with_config(model, config.engine))
@@ -316,7 +326,13 @@ impl Player {
                         Self::Nonlinear(AlphaBetaEngine::with_config(model, config.engine))
                     }
                     RuntimeEvaluator::MixLite(model) => {
-                        Self::MixLite(AlphaBetaEngine::with_config(model, config.engine))
+                        Self::MixLite(AlphaBetaEngine::with_config(
+                            diagnostic::DiagnosticEvaluator {
+                                model,
+                                mode: config.v3_mode.unwrap_or_default(),
+                            },
+                            config.engine,
+                        ))
                     }
                     RuntimeEvaluator::Pattern => unreachable!("model reader cannot select Pattern"),
                 }
@@ -659,7 +675,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     if env::args().len() == 2 && env::args().nth(1).as_deref() == Some("--help") {
         println!(
-            "RustMoku research Arena\n--describe validates inputs and prints effective JSON without playing.\n--pairs N --depth N --nodes N --move-ms N --clock-ms N --increment-ms N\nPlayer flags: --a- or --b- followed by evaluator pattern|classical|learned, model FILE, threads N,\ntt-mib N, vcf-plies N, vcf-nodes N, vct-plies N, vct-nodes N, vct-mib N, disable LIST, interior-vcf P:W:T.\nExternal players: external FILE, repeated external-arg ARG and external-input FILE; external-memory-bytes N is advisory.\nExternal threads/TT/proof options are unsupported and rejected.\nDuplicate options and conflicting model/evaluator selections are errors. CSV stdout; effective JSON/summary stderr."
+            "RustMoku research Arena\n--describe validates inputs and prints effective JSON without playing.\n--pairs N --depth N --nodes N --move-ms N --clock-ms N --increment-ms N\nPlayer flags: --a- or --b- followed by evaluator pattern|classical|learned, model FILE, v3-mode normal|value-only|policy-only (V3 only), threads N,\ntt-mib N, vcf-plies N, vcf-nodes N, vct-plies N, vct-nodes N, vct-mib N, disable LIST, interior-vcf P:W:T.\nExternal players: external FILE, repeated external-arg ARG and external-input FILE; external-memory-bytes N is advisory.\nExternal threads/TT/proof options are unsupported and rejected.\nDuplicate options and conflicting model/evaluator selections are errors. CSV stdout; effective JSON/summary stderr."
         );
         return Ok(());
     }
