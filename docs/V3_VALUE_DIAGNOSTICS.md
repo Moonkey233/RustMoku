@@ -208,3 +208,89 @@ Validation: focused Arena lifecycle/contracts test, Arena clippy and release
 build; Python component/reference-loss, deterministic reporting, head-range,
 and interrupted-resume tests. The tiny resumed run matched continuous CPU
 parameters exactly. No full workspace suite or new strength campaign was run.
+
+## Controlled head initialization / optimization matrix
+
+`training/experiment_wdl_head.py` runs fresh A/B/C/D arms with the existing
+value-only objective, one shared read-only corpus validation and the same cache.
+The small-positive head affine-maps the production uniform draws from [1,256]
+to [1,8]; this preserves every other initial tensor and consumes no extra RNG.
+Only C/D use a separate Adam group for the head at .016; all other parameters
+remain at .001. No signed initialization, evidence/QAT change, architecture
+change or production-default change is involved.
+
+```powershell
+.\.venv-train\Scripts\python.exe -u -X utf8 training\experiment_wdl_head.py --dataset datasets\v3-serious-gen0\dataset.json --reference runs\v3-serious-gen0\checkpoint.pt --cache-dir runs\v3-serious-gen0\feature-cache --output runs\v3-head-matrix --device cuda
+```
+
+Use `--resume` only for the same existing output directory and inputs; do not
+launch a concurrent copy. A/B/C/D subdirectories contain independent manifests,
+latest checkpoints and 2k/5k reports. The matrix inventories the original
+descriptor, all shards, comparison sidecar and reference checkpoint before and
+afterward. The completion receipt is written only if their hashes still match.
+Each arm also binds the split/configuration and hashes the actual sequence of
+dataset indices and D4 transforms, allowing direct cross-arm comparison.
+The mining rule/cadence is unchanged; actual hard-example weights can differ
+because the arms make different predictions. They are not artificially frozen.
+
+Reports add pre-ReLU evidence (after the declared integer truncation), each
+class's nonpositive fraction, probability concentration above .8/.9/.95,
+distinct integer head weights, displacement from that arm's initialization,
+and `teacher_value_only` gradient norms separately from counterfactual
+production losses. Nonfinite loss/gradients fail that arm explicitly; the
+matrix continues the other arms without reducing its learning rate.
+`final_batch_objective` is the actual last minibatch loss, not a full-corpus
+objective or a model-selection criterion. Per-arm time is captured when saving
+the milestone, includes earlier reports/writes, and excludes that milestone's
+subsequent report. Matrix wall time includes all reports, shared admission and
+final input-hash verification.
+
+## Head matrix results (2026-09-22)
+
+All four arms completed 2000 and 5000 steps. Each uses 442,098 qualified train records after the existing exact-label filtering. This equals the preceding diagnostic run (the earlier 442,104 summary was not its actual filtered count). No corpus, split or filtering semantics changed.
+
+A = production init / 1x; B = small-positive init / 1x; C = production init / 16x; D = small-positive init / 16x. Each row evaluates the same 2048 train and 2048 opening-heldout records. Sign accuracy uses abs(target) >= .05 and counts zero predictions as incorrect for a nonzero target.
+
+| Arm | Steps | Train MAE / r | Heldout MAE / r | Heldout prediction std | Heldout sign accuracy |
+|---|---:|---:|---:|---:|---:|
+| A | 2000 | 0.5822 / 0.1853 | 0.5788 / 0.2114 | 0.0700 | 53.74% |
+| A | 5000 | 0.5702 / 0.2733 | 0.5685 / 0.2542 | 0.1120 | 54.27% |
+| B | 2000 | 0.5826 / 0.1737 | 0.5755 / 0.1942 | 0.0945 | 39.93% |
+| B | 5000 | 0.5446 / 0.3588 | 0.5424 / 0.3718 | 0.1847 | 36.18% |
+| C | 2000 | 0.5821 / 0.1894 | 0.5780 / 0.2211 | 0.0738 | 53.85% |
+| C | 5000 | 0.5601 / 0.2987 | 0.5533 / 0.3272 | 0.1563 | 58.81% |
+| D | 2000 | 0.5440 / 0.3264 | 0.5413 / 0.3240 | 0.2636 | 42.67% |
+| D | 5000 | 0.4974 / 0.4269 | 0.5097 / 0.3947 | 0.3698 | 44.36% |
+
+Target mean/std: train .01352/.67713; heldout .02858/.67529. At 5000, heldout prediction mean is A .08460, B .07092, C .09987, D .10329. Full moments, quantiles, per-source/exact strata, WDL/evidence distributions, pre-ReLU fractions, loss components and gradient families are in each `runs/v3-head-matrix/{A,B,C,D}/step-{2000,5000}.json`.
+
+### Interpretation and limitations
+
+- Both interventions affect the value path. At 5000, B improves heldout correlation from .2542 to .3718 and C to .3272. D reaches .3947 and the broadest prediction distribution (.3698 std), with the lowest overall heldout MAE (.5097). Initialization/head learning-rate difficulty is therefore not ruled out; the all-arms-stay-compressed outcome did not occur.
+- D is not an unqualified winner. B/D heldout sign accuracy drops to .3618/.4436, compared with A .5427 and C .5881. Both B/D have prediction 25th percentile and median exactly zero. D pre-ReLU nonpositive percentages are win 50.93%, draw 65.63%, loss 69.29%; B gives 41.55%/54.79%/48.78%. The evidence floor and quantized ties remain an important observed tradeoff, despite the strictly positive initialization.
+- Improvements are concentrated in exact/tactical labels. A to D heldout exact MAE improves .9233 -> .6239 and correlation .4721 -> .6798. For non-exact AB labels, MAE barely changes .4863 -> .4833 and correlation .1804 -> .2129; B/C non-exact correlations are .2120/.2224. Broader output range alone has not solved ordinary position-value learning.
+- No nonfinite loss/gradient event occurred, and all saved model tensors are finite. No parameter hits its quantization clamp endpoint. At D-5000, 5.81% of heldout positions have some WDL probability > .8; none exceeds .9 or .95. Other 5k arms have none above .8. This rules out observed extreme probability saturation in these samples, not all possible activation saturation or future instability.
+- At 5000, head displacement from its own initialization is A -2.463..+2.362, B -3.107..+2.789, C -35.774..+37.297, D -16.516..+18.342. Integer negative/zero/positive counts are A 1/0/23, B 2/2/20, C 2/0/22, D 8/1/15; distinct integer counts are 23/9/23/19. Smaller initialization makes similarly sized updates significant relative to initial weights.
+- On the first fixed heldout batch, actual teacher-only ordinary head gradient norms are A .00125, B .02188, C .00132, D .01904. Full context/trunk norms are recorded. These are local pre-Adam measurements, not accumulated optimizer updates.
+- This is one seed and a finite 5k budget. It supports initialization/optimization as contributing factors, but neither proves representational sufficiency nor justifies immediate V4 redesign. Production defaults stay unchanged. No diagnostic checkpoint was exported/promoted or played in Arena.
+
+### Integrity, runtime and validation
+
+The matrix completed in 3904.9 seconds (65.1 minutes), including shared admission and final hash verification. Per-arm recorded training/milestone time was A 782.2 s, B 788.3 s, C 788.3 s, D 786.5 s. Final minibatch objectives were 2.6420, 2.5117, 2.5670, 2.3506 respectively; these are not selection criteria.
+
+All eight reports have matching train/heldout sample hashes listed above. Record/D4 sequence hashes match across all arms at both milestones:
+
+- 2000: `ec972ca3392af50cbfda00a301b45ae792cc3ca3d098f9585326781b23fdd3bd`
+- 5000: `5a837dcd486efccb8cd1d69d7a3c37a0c9ac236177fdb101f6164d2e7236aa60`
+
+Dataset fingerprint remains `58d291d2965853827710a76d59ca02a6913ea7f8d66c635ed6facdbb1021d639`; split-manifest hash is `057274931c2392e09cdb9c21a7c5bf518eaf9708b2b35d021d5986b842a63aeb`. Original checkpoint SHA remains `12513465bb24e3e987bc102ffcd21c8cf657d64ae16aa21358d3ab24145705db`. `matrix.json` inventories all original shard/sidecar/descriptor/reference hashes; `completion.json` confirms identical input bytes, inventory SHA `0f5118b81c2373174f8b3685a22cf8707d9d5c78c4a07f45a3be4ef0a8b71867`.
+
+Arm configuration hashes:
+- A: `f1cd5c67f6478bd060cf187d13a9da2af99de1921e8e82625fead4d73adf0abf`
+- B: `33a3b8df749db64d666be28540bead616cf378a6eda77bd302f00c6df71a7e1e`
+- C: `1d8b02e896711a1ee76ca161ef9b9024955a7f0b30cbe07823a5dc3dbf2663b5`
+- D: `59353dff001022724ba98ddcf5a0ff92b09edc2809eaeeafe31fbf755feb8395`
+
+Both A checkpoints reproduce every tensor of the preceding control experiment exactly. All diagnostic policy head/context tensors remain at initialization; optimizer groups have the requested rates, and diagnostic checkpoints contain no production-resume declaration. Report/checkpoint hashes were verified for all eight artifacts.
+
+Validation: all five targeted value-diagnostic tests passed, including initial trunk equality, head-only LR changes, instrumentation/reference-loss checks, and a D-arm interrupted CPU resume matching continuous parameters exactly. The arm-relative displacement assertion was additionally run after being added. Python compilation and diff whitespace checks passed. No full Rust/Python workspace suite or Arena campaign was run.

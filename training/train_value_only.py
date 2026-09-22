@@ -2,6 +2,8 @@
 import argparse
 import json
 import time
+import hashlib
+import contextlib
 from pathlib import Path
 
 import torch
@@ -14,7 +16,30 @@ from mixlite_cache import FeatureCache
 from mixlite_production import BatchedMixLite
 
 
-def run(args):
+def json_hash(value):
+    return hashlib.sha256(json.dumps(value,sort_keys=True,separators=(',',':'),allow_nan=False).encode()).hexdigest()
+
+
+def initialize_model(scale,seed,head_init='production'):
+    torch.manual_seed(seed)
+    model=BatchedMixLite(scale).float()
+    if head_init=='small-positive':
+        # Affine-map the same uniform draws. No additional RNG consumption and
+        # every non-head tensor remains bit-identical to the production seed.
+        with torch.no_grad():model.wdl_head.sub_(1).mul_(7/255).add_(1)
+    elif head_init!='production':raise ValueError('unknown head initialization')
+    return model
+
+
+def make_optimizer(model,lr,multiplier=1):
+    if multiplier not in (1,16):raise ValueError('head LR multiplier must be 1 or 16')
+    if multiplier==1:return torch.optim.Adam(model.parameters(),lr=lr)
+    return torch.optim.Adam([
+        {'params':[p for name,p in model.named_parameters() if name!='wdl_head'],'lr':lr},
+        {'params':[model.wdl_head],'lr':lr*multiplier}],lr=lr)
+
+
+def run(args,*,admitted=None):
     milestones=sorted(set(args.steps))
     if not milestones or milestones[0]<1 or milestones[-1]>5000:raise ValueError('diagnostic budget must be 1..5000 steps')
     resume=getattr(args,'resume',False)
@@ -23,6 +48,8 @@ def run(args):
     template=load_checkpoint(args.reference)
     if template.get('format')!=FORMAT or not template.get('production'):raise ValueError('reference must be a production V3 checkpoint')
     config=template['production']
+    head_init=getattr(args,'head_init','production')
+    head_lr=getattr(args,'head_lr_multiplier',1)
     if config['sampler']!='block-shuffle-v1' or config['policy_target']!='soft':raise ValueError('unsupported reference training configuration')
     if args.device.startswith('cuda') and not torch.cuda.is_available():raise ValueError('CUDA unavailable')
     args.output.mkdir(parents=True,exist_ok=resume)
@@ -31,15 +58,20 @@ def run(args):
         batch_size=config['batch_size'],learning_rate=config['learning_rate'],outcome_weight=0,
         preserved_weight_semantics='exact/sample weights and production hard-mining cadence; policy predictions only select detached mining weights',
         samples=args.samples,sample_seed=args.sample_seed)
+    if getattr(args,'head_experiment',False) or head_init!='production' or head_lr!=1:
+        identity.update(head_init=head_init,head_lr_multiplier=head_lr,
+            split_manifest_sha256=json_hash(template['split_manifest']),
+            source_configuration_sha256=json_hash(config),score_scale=template['score_scale'])
+        identity['configuration_sha256']=json_hash(identity)
     if resume:
         if json.loads((args.output/'experiment.json').read_text(encoding='utf-8'))!=identity:
             raise ValueError('diagnostic resume identity mismatch')
     else:
         (args.output/'experiment.json').write_text(json.dumps(identity,indent=2)+'\n',encoding='utf-8')
     print('Validating frozen dataset and split...',flush=True)
-    with open_dataset(args.dataset) as dataset:
+    with (contextlib.nullcontext(admitted[0]) if admitted else open_dataset(args.dataset)) as dataset:
         print('Dataset loaded; validating split and qualified indices...',flush=True)
-        partitions=validate_split_manifest(dataset,template['split_manifest'],config['seed'])
+        partitions=admitted[1] if admitted else validate_split_manifest(dataset,template['split_manifest'],config['seed'])
         indices=partitions['train']
         print(f'Frozen split admitted: {len(indices)} qualified training records',flush=True)
         def evaluate(checkpoint,model,label,checkpoint_path):
@@ -50,7 +82,9 @@ def run(args):
                 if saved.get('experiment')!=identity or saved.get('checkpoint_sha256')!=digest:
                     raise ValueError('existing diagnostic report identity mismatch')
                 print(f'Reusing completed report: {label}',flush=True);return
-            report=dict(experiment=identity,checkpoint_sha256=digest,steps=checkpoint['steps'],parameters=parameter_report(model,config['seed']),splits={})
+            initial=initialize_model(template['score_scale'],config['seed'],head_init) if checkpoint.get('diagnostic') else None
+            report=dict(experiment=identity,checkpoint_sha256=digest,steps=checkpoint['steps'],parameters=parameter_report(model,config['seed'],initial=initial),splits={},
+                training_measurements=checkpoint.get('training_measurements'))
             for split in ('train','opening_heldout'):
                 report['splits'][split]=diagnose(model,checkpoint,dataset,partitions[split],split,
                     count=args.samples,seed=args.sample_seed,batch_size=config['batch_size'],device=args.device)
@@ -67,12 +101,12 @@ def run(args):
                 evaluate(checkpoint,model_from(checkpoint,args.device),f'baseline-{number}-step-{checkpoint["steps"]}',path)
         # Reset after diagnostic model constructors so initialization is exactly
         # the production seed. The optimizer is fresh, never restored from template.
-        torch.manual_seed(config['seed'])
-        model=BatchedMixLite(template['score_scale']).float().to(args.device)
-        optimizer=torch.optim.Adam(model.parameters(),lr=config['learning_rate'])
+        model=initialize_model(template['score_scale'],config['seed'],head_init).to(args.device)
+        optimizer=make_optimizer(model,config['learning_rate'],head_lr)
         cache=FeatureCache(args.cache_dir or args.output/'feature-cache',dataset,template['split_manifest'],indices)
         try:
-            completed=epoch=cursor=0;started=time.perf_counter()
+            completed=epoch=cursor=0;started=time.perf_counter();prior_elapsed=0.
+            sequence=hashlib.sha256(b'value-only-record-d4-sequence-v1').hexdigest()
             latest=args.output/'latest.pt'
             if resume and latest.exists():
                 restored=load_checkpoint(latest)
@@ -80,6 +114,8 @@ def run(args):
                     raise ValueError('diagnostic checkpoint identity mismatch')
                 model.load_state_dict(restored['model_state']);optimizer.load_state_dict(restored['optimizer_state'])
                 completed,epoch,cursor=restored['steps'],restored['epoch'],restored['cursor']
+                prior_elapsed=restored.get('training_measurements',{}).get('wall_seconds',0.)
+                sequence=restored.get('training_measurements',{}).get('record_d4_sequence_sha256',sequence)
                 if not 0<=completed<=milestones[-1] or not 0<=cursor<=len(indices) or epoch<0:
                     raise ValueError('invalid diagnostic resume cursor')
                 print(f'Resuming diagnostic step {completed}',flush=True)
@@ -97,6 +133,7 @@ def run(args):
                     local=order[cursor:cursor+config['batch_size']]
                     actual=[indices[i] for i in local]
                     symmetries=[(config['seed']+epoch+i)%8 for i in actual]
+                    sequence=hashlib.sha256(bytes.fromhex(sequence)+json.dumps([actual,symmetries],separators=(',',':')).encode()).hexdigest()
                     rows,k,c,t=batch_inputs(dataset,actual,template['score_scale'],args.device,symmetries,cache.batch(local,symmetries))
                     w,p,_=model(k,c)
                     mining=config.get('mining_every',0)>0 and completed%config['mining_every']==0
@@ -105,7 +142,12 @@ def run(args):
                     # detached input to the unchanged optional hard-mining weights.
                     loss=(-(t['wdl']*w.log()).sum(1)+(w[:,0]-w[:,2]-t['q']).square())
                     loss=(loss*weight).mean()
-                    optimizer.zero_grad(set_to_none=True);loss.backward();optimizer.step()
+                    if not torch.isfinite(loss):raise FloatingPointError(f'nonfinite loss before step {completed+1}')
+                    optimizer.zero_grad(set_to_none=True);loss.backward()
+                    # Diagnostic arms fail explicitly; never silently change LR.
+                    if any(p.grad is not None and not torch.isfinite(p.grad).all() for p in model.parameters()):
+                        raise FloatingPointError(f'nonfinite gradient before step {completed+1}')
+                    optimizer.step()
                     completed+=1;cursor+=len(local)
                     if completed%100==0:
                         if not torch.isfinite(loss):raise ValueError('nonfinite diagnostic loss')
@@ -114,6 +156,9 @@ def run(args):
                         checkpoint=dict(format=FORMAT,model_state=model.state_dict(),optimizer_state=optimizer.state_dict(),
                             score_scale=template['score_scale'],split_manifest=template['split_manifest'],
                             source_production=config,diagnostic=identity,steps=completed,epoch=epoch,cursor=cursor,
+                            training_measurements=dict(wall_seconds=prior_elapsed+time.perf_counter()-started,
+                                final_batch_objective=float(loss.detach()),nonfinite_events=0,
+                                record_d4_sequence_sha256=sequence),
                             configuration=dict(template['configuration'],training='diagnostic-value-only-v1'))
                         atomic_save(latest,checkpoint)
                         if completed in milestones:
@@ -133,6 +178,8 @@ def main():
     p.add_argument('--device',default='cuda');p.add_argument('--steps',type=int,nargs='+',default=[2000,5000])
     p.add_argument('--samples',type=int,default=2048);p.add_argument('--sample-seed',type=int,default=17)
     p.add_argument('--skip-reference-diagnostics',action='store_true')
+    p.add_argument('--head-init',choices=('production','small-positive'),default='production')
+    p.add_argument('--head-lr-multiplier',type=int,choices=(1,16),default=1)
     p.add_argument('--resume',action='store_true',help='resume only this isolated directory with identical inputs/configuration')
     run(p.parse_args())
 

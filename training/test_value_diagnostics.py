@@ -14,7 +14,7 @@ from mixlite_production import BatchedMixLite,reference_loss
 import test_mixlite_hotpath
 from test_compact import fixture
 from mixlite_loss import targets
-from train_value_only import run
+from train_value_only import run,initialize_model,make_optimizer
 from checkpoint import atomic_save,load_checkpoint
 from dataset import DatasetBundle,describe_shard,file_hash
 from common import make_split_manifest
@@ -24,6 +24,28 @@ from mixlite import FORMAT
 class ValueDiagnosticTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):torch.set_num_threads(1)
+
+    def test_head_arms_change_only_head_initialization_and_lr(self):
+        baseline=initialize_model(500,17)
+        for init in ('production','small-positive'):
+            for multiplier in (1,16):
+                model=initialize_model(500,17,init)
+                repeated=initialize_model(500,17,init)
+                displacement=parameter_report(model,17,initial=repeated)['wdl_head']['displacement_from_seeded_initialization']
+                self.assertEqual(displacement['min'],0)
+                self.assertEqual(displacement['max'],0)
+                for name,value in model.state_dict().items():
+                    self.assertTrue(torch.equal(value,repeated.state_dict()[name]))
+                    if name!='wdl_head' or init=='production':
+                        self.assertTrue(torch.equal(value,baseline.state_dict()[name]))
+                if init=='small-positive':
+                    self.assertGreaterEqual(float(model.wdl_head.detach().min()),1)
+                    self.assertLessEqual(float(model.wdl_head.detach().max()),8)
+                    self.assertFalse(torch.equal(model.wdl_head,baseline.wdl_head))
+                optimizer=make_optimizer(model,.001,multiplier)
+                rates={id(p):g['lr'] for g in optimizer.param_groups for p in g['params']}
+                for name,p in model.named_parameters():
+                    self.assertEqual(rates[id(p)],.001*(multiplier if name=='wdl_head' else 1))
 
     def test_nonnegative_head_bound_includes_integer_context_samples(self):
         torch.manual_seed(17);model=BatchedMixLite(500).float();h=model.wdl_head.detach().round().double()
@@ -85,7 +107,8 @@ class ValueDiagnosticTests(unittest.TestCase):
                 configuration={},split_manifest=manifest,steps=0))
             before=file_hash(reference)
             args=Namespace(steps=[1,2],reference=reference,output=root/'experiment',device='cpu',dataset=descriptor,
-                samples=4,sample_seed=17,baseline=[],skip_reference_diagnostics=True,cache_dir=None)
+                samples=4,sample_seed=17,baseline=[],skip_reference_diagnostics=True,cache_dir=None,
+                head_init='small-positive',head_lr_multiplier=16)
             run(args)
             result=load_checkpoint(args.output/'step-2.pt')
             self.assertNotIn('production',result)
@@ -106,6 +129,7 @@ class ValueDiagnosticTests(unittest.TestCase):
                 interrupted.resume=True
                 run(interrupted)
             resumed=load_checkpoint(interrupted.output/'step-2.pt')
+            self.assertEqual(result['training_measurements']['record_d4_sequence_sha256'],resumed['training_measurements']['record_d4_sequence_sha256'])
             for name,value in result['model_state'].items():self.assertTrue(torch.equal(value,resumed['model_state'][name]))
             interrupted.sample_seed+=1
             with self.assertRaisesRegex(ValueError,'resume identity mismatch'):run(interrupted)

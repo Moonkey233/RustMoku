@@ -11,7 +11,7 @@ from torch.nn import functional as F
 from checkpoint import load_checkpoint
 from common import decode_position_key, transform_position, validate_split_manifest
 from dataset import open_dataset, file_hash
-from mixlite import FORMAT
+from mixlite import FORMAT, COUNTS, ste_integer, ste_trunc
 from mixlite_cache import canonical_inputs, transformed_inputs
 from mixlite_loss import targets
 from mixlite_production import BatchedMixLite, hard_example_tags
@@ -95,9 +95,10 @@ def nonnegative_head_range(integer,divisor):
     return [min(0.,(float(ratios.min())*t-1)/(t+1)),max(0.,(float(ratios.max())*t+1)/(t+1))]
 
 
-def parameter_report(model,seed):
-    with torch.random.fork_rng(devices=[]):
-        torch.manual_seed(seed);initial=BatchedMixLite(model.score_scale).float()
+def parameter_report(model,seed,*,initial=None):
+    if initial is None:
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(seed);initial=BatchedMixLite(model.score_scale).float()
     result={}
     for name,p in model.named_parameters():
         x=p.detach().cpu();lo,hi=(-128,127) if name in ('embedding','center','mixing') else ((-1048576,1048576) if name=='bias' else (-32768,32767))
@@ -107,6 +108,7 @@ def parameter_report(model,seed):
                     percent_at_high=float((integer==hi).float().mean()*100),
                     displacement_from_seeded_initialization=statistics((x-getattr(initial,name).detach()).numpy()))
         if name=='wdl_head':
+            item['distinct_integer_weights']=int(integer.unique().numel())
             item['integer_sign_counts']=dict(negative=int((integer<0).sum()),zero=int((integer==0).sum()),positive=int((integer>0).sum()))
             item['integer_weights']=integer.tolist()
             item['conservative_evidence_q_range']=nonnegative_head_range(integer,model.value_divisor)
@@ -127,6 +129,7 @@ def gradient_report(model,rows,keys,centers,target,config):
         weight=weights(rows,w,p,target,config,mining,scale=model.score_scale)
         terms={name:(value*weight*(config['outcome_weight'] if name=='outcome' else 1.)).mean() for name,value in parts.items()}
         terms['value_total']=terms['teacher_wdl_ce']+terms['q_squared']+terms['outcome']
+        terms['teacher_value_only']=terms['teacher_wdl_ce']+terms['q_squared']
         terms['policy_total']=terms['hard_policy_ce']+terms['soft_comparison']
         terms['total']=terms['value_total']+terms['policy_total']
         gradients={name:torch.autograd.grad(loss,tuple(model.parameters()),retain_graph=True,allow_unused=True)
@@ -150,18 +153,32 @@ def value_metrics(target,prediction):
         target=statistics(q),prediction=statistics(v))
 
 
+def pre_relu_evidence(model,keys,centers):
+    """Read-only instrument of the unchanged production QAT value path."""
+    local=(F.embedding(keys,ste_integer(model.embedding,-128,127)).sum(-2)
+           +F.embedding(centers,ste_integer(model.center,-128,127))).clamp(0,255)
+    groups=torch.stack([local.index_select(1,getattr(model,f'group_{g}')).sum(1) for g in range(4)],dim=1)
+    pooled=torch.cat([ste_trunc(groups.sum(1)/225)]+[ste_trunc(groups[:,g]/COUNTS[g]) for g in range(4)],dim=-1)
+    context=ste_trunc((F.linear(pooled,ste_integer(model.mixing,-128,127))+
+                      ste_integer(model.bias,-1048576,1048576))/256).clamp(0,255)
+    return ste_trunc(F.linear(context,ste_integer(model.wdl_head,-32768,32767))/model.value_divisor)
+
+
 def diagnose(model,checkpoint,dataset,indices,split,*,count=2048,seed=17,batch_size=256,device='cpu',gradients=True):
     selected=sample_indices(indices,count,seed)
     if not selected:raise ValueError('empty diagnostic split')
     config=checkpoint.get('production') or checkpoint.get('source_production')
     if not config or config['policy_target']!='soft':raise ValueError('diagnostic components currently require soft production target')
-    groups={};qs=[];predictions=[];probabilities=[];evidence=[];hits=[];losses={};first=None
+    groups={};qs=[];predictions=[];probabilities=[];evidence=[];pre_relu=[];hits=[];losses={};first=None
     cadence=config.get('mining_every',0)
     for start in range(0,len(selected),batch_size):
         rows,k,c,t=batch_inputs(dataset,selected[start:start+batch_size],checkpoint['score_scale'],device)
         if first is None:first=(rows,k,c,t)
         with torch.no_grad():
             w,p,e=model(k,c);parts=components(w,p,t)
+            raw=pre_relu_evidence(model,k,c)
+            if not torch.equal(raw.relu()+1,e):raise ValueError('diagnostic evidence disagrees with production forward')
+            pre_relu.extend(raw.cpu().tolist())
             ordinary=weights(rows,w,p,t,config,False,scale=model.score_scale)
             mined=weights(rows,w,p,t,config,True,scale=model.score_scale) if cadence else ordinary
             rank=p.masked_fill(~t['legal'],float('-inf')).argsort(dim=1,descending=True,stable=True)[:,:5].cpu().tolist()
@@ -191,6 +208,9 @@ def diagnose(model,checkpoint,dataset,indices,split,*,count=2048,seed=17,batch_s
         strata={name:value_metrics(q[ix],v[ix]) for name,ix in groups.items()},
         wdl={name:statistics(np.asarray(probabilities)[:,i]) for i,name in enumerate(('win','draw','loss'))},
         evidence={name:statistics(np.asarray(evidence)[:,i]) for i,name in enumerate(('win','draw','loss'))},
+        pre_relu_evidence={name:dict(statistics=statistics(np.asarray(pre_relu)[:,i]),
+            percent_nonpositive=float((np.asarray(pre_relu)[:,i]<=0).mean()*100)) for i,name in enumerate(('win','draw','loss'))},
+        probability_concentration={str(threshold):float((np.asarray(probabilities).max(1)>threshold).mean()) for threshold in (.8,.9,.95)},
         policy_samples=len(hits),policy={f'top{k}':float(np.asarray(hits)[:,i].mean()) if hits else None for i,k in enumerate((1,3,5))},
         losses=losses,loss_denominator='all sampled records; absent components contribute zero',
         weight_configuration=config,weighted_cadence_note='conditional mining/no-mining weights on this fixed batch; cadence mean is diagnostic expectation, not a replay of historical minibatches')
@@ -210,10 +230,15 @@ def main():
     parser.add_argument('--output',type=Path,required=True);args=parser.parse_args()
     if args.output.exists():raise ValueError('diagnostic output already exists')
     checkpoint=load_checkpoint(args.checkpoint);model=model_from(checkpoint,args.device)
+    seed=checkpoint.get('production',checkpoint.get('source_production',{}))['seed']
+    initial=None
+    if checkpoint.get('diagnostic',{}).get('head_init')=='small-positive':
+        from train_value_only import initialize_model
+        initial=initialize_model(checkpoint['score_scale'],seed,'small-positive')
     with open_dataset(args.dataset) as dataset:
         partitions=validate_split_manifest(dataset,checkpoint['split_manifest'])
         report=dict(checkpoint_sha256=file_hash(args.checkpoint),steps=checkpoint['steps'],
-            parameters=parameter_report(model,checkpoint.get('production',checkpoint.get('source_production',{}))['seed']),
+            parameters=parameter_report(model,seed,initial=initial),
             splits={name:diagnose(model,checkpoint,dataset,partitions[name],name,count=args.samples,seed=args.seed,
                 batch_size=args.batch_size,device=args.device) for name in args.split})
     args.output.parent.mkdir(parents=True,exist_ok=True)
