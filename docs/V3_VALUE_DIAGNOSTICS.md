@@ -294,3 +294,38 @@ Arm configuration hashes:
 Both A checkpoints reproduce every tensor of the preceding control experiment exactly. All diagnostic policy head/context tensors remain at initialization; optimizer groups have the requested rates, and diagnostic checkpoints contain no production-resume declaration. Report/checkpoint hashes were verified for all eight artifacts.
 
 Validation: all five targeted value-diagnostic tests passed, including initial trunk equality, head-only LR changes, instrumentation/reference-loss checks, and a D-arm interrupted CPU resume matching continuous parameters exactly. The arm-relative displacement assertion was additionally run after being added. Python compilation and diff whitespace checks passed. No full Rust/Python workspace suite or Arena campaign was run.
+
+## Source-2 memorization and float-relaxation probe (2026-09-23)
+
+`training/probe_source2_memorization.py` is a diagnostic-only, resumable two-arm experiment. It selected 4096 distinct non-exact source-2 positions from the frozen qualified train partition and a disjoint 2048-position opening-heldout source-2 sample. A disk-backed SQLite selection excluded keys with conflicting raw targets; `runs/v3-source2-memorization/samples.json` contains every exact dataset index and the completed-depth distributions. The train depth counts are 1:420, 2:443, 3:1295, 4:1291, 5:414, 6:233; heldout counts are 1:195, 2:272, 3:634, 4:624, 5:191, 6:132. The source-2 eligible occurrence counts scanned were 359953 train and 40216 opening-heldout.
+
+```powershell
+.\.venv-train\Scripts\python.exe -X utf8 training\probe_source2_memorization.py --dataset datasets\v3-serious-gen0\dataset.json --reference runs\v3-serious-gen0\checkpoint.pt --cache runs\v3-serious-gen0\feature-cache --output runs\v3-source2-memorization --device cuda --resume
+```
+
+Omit `--resume` only for a new output directory. An interrupted arm resumes from its own latest checkpoint; completed milestones are not rerun.
+
+Both arms start with bit-identical V3 learned tensors, small-positive WDL-head initialization, Adam LR .001 for non-head tensors and .016 for the head. They train the same teacher WDL CE plus normalized-q squared-error objective, batch 256, seed 17, identical repeated sample order and D4 transforms. Policy and outcome losses are absent. Online hard mining is off in **both** arms: its prediction-dependent weights would otherwise be a second arm-dependent intervention. All selected records are non-exact; ordinary sample weights remain in the objective. FloatRelaxed uses the same width-32 local features, radial/global 160-feature pooling, 8-context dimensions, WDL evidence topology and ReLU/clamp, removing only parameter rounding and integer truncation from the forward path. This is a memorization comparison, not an exportable model or a production training change.
+
+| Arm | Steps | Train MAE / r / pred. std | Heldout MAE / r / pred. std | Train sign | Heldout sign |
+|---|---:|---:|---:|---:|---:|
+| QAT | 2000 | .4895 / .2773 / .1382 | .5169 / .1472 / .1650 | 50.31% | 47.35% |
+| FloatRelaxed | 2000 | .4889 / .2852 / .1331 | .5187 / .1380 / .1482 | 60.82% | 54.19% |
+| QAT | 5000 | .4220 / .5152 / .2707 | .4898 / .2694 / .2716 | 65.26% | 52.65% |
+| FloatRelaxed | 5000 | .4063 / .5665 / .2725 | .4915 / .2672 / .2840 | 73.83% | 61.41% |
+| QAT | 10000 | .3319 / .7147 / .3726 | .4696 / .3438 / .3592 | 76.50% | 57.83% |
+| FloatRelaxed | 10000 | .3082 / .7654 / .3763 | .4702 / .3456 / .3682 | 85.63% | 64.22% |
+
+The train target has mean -.0107/std .5950; heldout mean -.0004/std .6065. At 10k, FloatRelaxed improves train correlation by .0508 and MAE by .0237 over QAT, but its heldout MAE and correlation are effectively unchanged. Both numerical paths partially memorize the 4096 keys; neither strongly fits them after this bounded budget. The gap implicates discretization as a **contributing** optimization constraint, not the sole failure. FloatRelaxed still has substantial train error and compressed predictions, consistent with a representation or remaining optimization bottleneck. This experiment does not isolate topology from all optimizer/budget effects, prove a feature collision, justify V4 by itself, or establish game strength. No production default/model/checkpoint was changed.
+
+Each milestone JSON in `runs/v3-source2-memorization/{qat,float-relaxed}/step-{2000,5000,10000}.json` contains per-depth metrics, target/prediction quantiles, WDL and raw-evidence distributions, nonpositive pre-ReLU fractions, probability concentration, parameter and fixed-batch gradient statistics, time, objective, and nonfinite count. At 10k, the fixed-batch WDL-head gradient norms were QAT .01113 and FloatRelaxed .01012; neither head reached an integer clamp endpoint. Per-arm recorded training time was 114.4 and 88.7 seconds respectively (excluding the shared frozen-data admission). Both report zero nonfinite events. These are local diagnostics rather than accumulated optimization or wall-time comparisons of the full pipeline.
+
+Input and schedule identity:
+
+- dataset descriptor SHA256 `0d634b7b9592c2b38835508e66ad55f84e55021bfbb4f9238793b13fb367ec1f`; reference checkpoint SHA256 `12513465bb24e3e987bc102ffcd21c8cf657d64ae16aa21358d3ab24145705db`; both unchanged after the run, and all 625 raw shards plus the comparison sidecar still match their frozen descriptor hashes;
+- frozen split SHA256 `057274931c2392e09cdb9c21a7c5bf518eaf9708b2b35d021d5986b842a63aeb`, score scale 78740;
+- selected sample SHA256 `b5fc66fcbad0d1c070cc357bb9cd60e0fe1da91864be66aee0a5e7ef133d39fb`; train index SHA256 `29d3d4407989c5bc4ea8e621f465fc385b1826d9c86c5d1068fbb849f75cf84e`; heldout index SHA256 `92db21bbd1457ec2bca30a096a64d5a778973ff176ca105297fbb97739e26a43`;
+- arm configuration SHA256: QAT `8ffb50de424bb982c09205aa33a16c896ccdaf64e2dbca390d284bc0331502b3`; FloatRelaxed `f0271984562dce445fb8441c8ca4246a151237fafae9f1abbdc9a1d604655a69`;
+- identical record/D4 sequence SHA256 at 2k `e7cd3deb706a5695f1bcee381c3512d24377d987355b7b6c1b7e4f37c4d78e37`, 5k `21775253e85cb58c58da4f4c8d8b367514219cbf6d69093f94a22634aef9c4bc`, 10k `7d17d91b3eecc112b8c00abf072c15bb8dca77ca8ac9bb77c2b76eba52576537`.
+
+The diagnostic checkpoint format is deliberately unsupported by production resume/export loading. Interrupted execution resumed from QAT step 8000 without repeating earlier steps; a focused CPU fixture matched uninterrupted and resumed model tensors exactly for each arm. No Arena, search, regeneration, V4 design or full workspace gate was run.
